@@ -2,9 +2,9 @@ Pod::Spec.new do |s|
   s.name         = "SwiftyDebug"
   s.version      = "0.1.0"
   s.summary      = "In-app debugging tool for iOS."
-  s.homepage     = "https://github.com/user/SwiftyDebug"
+  s.homepage     = "https://github.com/oah2008/SwiftyDebug"
   s.license      = { :type => "MIT", :file => "LICENSE" }
-  s.author       = "Abdulrahman Hariri"
+  s.author       = "Omar Hariri"
   s.platform     = :ios, "15.0"
   s.source       = { :git => "", :tag => s.version.to_s }
 
