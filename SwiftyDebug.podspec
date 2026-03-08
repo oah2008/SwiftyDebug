@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name         = "SwiftyDebug"
-  s.version      = "0.1.0"
+  s.version      = "0.1"
   s.summary      = "In-app debugging tool for iOS."
   s.homepage     = "https://github.com/oah2008/SwiftyDebug"
   s.license      = { :type => "MIT", :file => "LICENSE" }
