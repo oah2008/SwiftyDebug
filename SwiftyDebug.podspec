@@ -8,8 +8,8 @@ Pod::Spec.new do |s|
   s.platform     = :ios, "15.0"
   s.source       = { :git => "", :tag => s.version.to_s }
 
-  s.source_files = "Sources/SwiftyDebug/**/*.{swift,h,m}"
-  s.resources    = "Sources/SwiftyDebug/Resources/**/*"
+  s.source_files = "Sources/**/*.{swift,h,m}"
+  s.resources    = "Sources/Resources/**/*"
   s.library      = "sqlite3"
 
   s.swift_version = "5.9"
