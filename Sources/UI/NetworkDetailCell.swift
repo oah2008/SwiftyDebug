@@ -106,15 +106,19 @@ class NetworkDetailCell: UITableViewCell {
         previewButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         previewButton.layer.cornerRadius = 6
         previewButton.clipsToBounds = true
-        previewButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
-        previewButton.setTitleColor(Self.tealTitle, for: .normal)
         var previewBtnConfig = UIButton.Configuration.plain()
-        previewBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
-        previewBtnConfig.imagePadding = 3
+        previewBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10)
+        previewBtnConfig.imagePadding = 4
+        previewBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 11, weight: .semibold)
+            return attr
+        }
+        previewBtnConfig.baseForegroundColor = Self.tealTitle
         previewButton.configuration = previewBtnConfig
         previewButton.addTarget(self, action: #selector(tapPreview), for: .touchUpInside)
 
-        let previewConfig = UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold)
+        let previewConfig = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
         let previewIcon = UIImage(systemName: "doc.text.magnifyingglass", withConfiguration: previewConfig)?
             .withTintColor(Self.tealTitle, renderingMode: .alwaysOriginal)
         previewButton.setImage(previewIcon, for: .normal)
@@ -139,15 +143,19 @@ class NetworkDetailCell: UITableViewCell {
         showFullButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         showFullButton.layer.cornerRadius = 6
         showFullButton.clipsToBounds = true
-        showFullButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
-        showFullButton.setTitleColor(Self.tealTitle, for: .normal)
         var showFullBtnConfig = UIButton.Configuration.plain()
         showFullBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
-        showFullBtnConfig.imagePadding = 4
+        showFullBtnConfig.imagePadding = 5
+        showFullBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 11, weight: .semibold)
+            return attr
+        }
+        showFullBtnConfig.baseForegroundColor = Self.tealTitle
         showFullButton.configuration = showFullBtnConfig
         showFullButton.addTarget(self, action: #selector(tapPreview), for: .touchUpInside)
 
-        let showFullCfg = UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold)
+        let showFullCfg = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
         let showFullIco = UIImage(systemName: "arrow.down.left.and.arrow.up.right", withConfiguration: showFullCfg)?
             .withTintColor(Self.tealTitle, renderingMode: .alwaysOriginal)
         showFullButton.setImage(showFullIco, for: .normal)
@@ -163,16 +171,24 @@ class NetworkDetailCell: UITableViewCell {
 
         // Bottom constraints (only one active at a time)
         contentBottomConstraint = contentTextView.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -10)
+        contentBottomConstraint.priority = UILayoutPriority(999)
         showFullBottomConstraint = showFullButton.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -10)
+        showFullBottomConstraint.priority = UILayoutPriority(999)
         imageBottomConstraint = imgView.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -4)
+        imageBottomConstraint.priority = UILayoutPriority(999)
         collapsedBottomConstraint = titleLabel.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -10)
+        collapsedBottomConstraint.priority = UILayoutPriority(999)
 
         NSLayoutConstraint.activate([
             // Card inset
             cardView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 8),
             cardView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -8),
             cardView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 3),
-            cardView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -3),
+            {
+                let c = cardView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -3)
+                c.priority = UILayoutPriority(999)
+                return c
+            }(),
 
             // Title
             titleLabel.topAnchor.constraint(equalTo: cardView.topAnchor, constant: 10),
@@ -209,7 +225,9 @@ class NetworkDetailCell: UITableViewCell {
 
         // Switchable copy button trailing constraints
         copyTrailingToPreview = copyButton.trailingAnchor.constraint(equalTo: previewButton.leadingAnchor, constant: -12)
+        copyTrailingToPreview.priority = UILayoutPriority(999)
         copyTrailingToCard = copyButton.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -12)
+        copyTrailingToCard.priority = UILayoutPriority(999)
         copyTrailingToCard.isActive = true
     }
 
@@ -279,8 +297,14 @@ class NetworkDetailCell: UITableViewCell {
 
         // Preview button (top-right) — switch copy button constraint
         previewButton.isHidden = !showPreview
-        copyTrailingToPreview.isActive = showPreview
-        copyTrailingToCard.isActive = !showPreview
+        // Deactivate first to avoid momentary conflict
+        copyTrailingToPreview.isActive = false
+        copyTrailingToCard.isActive = false
+        if showPreview {
+            copyTrailingToPreview.isActive = true
+        } else {
+            copyTrailingToCard.isActive = true
+        }
 
         // Reset showFull button
         showFullButton.isHidden = true
@@ -313,6 +337,7 @@ class NetworkDetailCell: UITableViewCell {
                     let truncated = String(content.prefix(Self.truncateLength)) + "\n..."
                     contentTextView.attributedText = isCurl ? Self.highlightCurl(truncated) : Self.highlightJSON(truncated)
                     contentTextView.textAlignment = .natural
+                    showFullButton.setTitle(isCurl ? "Show Full cURL" : "Show Full Response", for: .normal)
                     showFullButton.isHidden = false
                 } else {
                     // Normal content: full syntax highlighting

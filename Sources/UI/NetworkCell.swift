@@ -252,15 +252,19 @@ class NetworkCell: UITableViewCell {
         curlButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         curlButton.layer.cornerRadius = 6
         curlButton.clipsToBounds = true
-        curlButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
-        curlButton.setTitleColor(.white, for: .normal)
         var curlBtnConfig = UIButton.Configuration.plain()
         curlBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12)
-        curlBtnConfig.imagePadding = 4
+        curlBtnConfig.imagePadding = 5
+        curlBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 11, weight: .semibold)
+            return attr
+        }
+        curlBtnConfig.baseForegroundColor = DebugTheme.accentColor
         curlButton.configuration = curlBtnConfig
         curlButton.addTarget(self, action: #selector(curlButtonTapped), for: .touchUpInside)
 
-        let curlConfig = UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold)
+        let curlConfig = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
         let curlIcon = UIImage(systemName: "terminal", withConfiguration: curlConfig)?
             .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
         curlButton.setImage(curlIcon, for: .normal)

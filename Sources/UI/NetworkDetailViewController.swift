@@ -11,6 +11,7 @@ import UIKit
 class NetworkDetailViewController: UITableViewController {
     
     private var closeItem: UIBarButtonItem!
+    private var pinItem: UIBarButtonItem!
 
     var naviItemTitleLabel: UILabel?
     
@@ -527,8 +528,15 @@ class NetworkDetailViewController: UITableViewController {
         tableView.contentInset.bottom = 16
         tableView.showsVerticalScrollIndicator = false
 
-        // Nav bar: close only
-        navigationItem.rightBarButtonItems = [closeItem]
+        // Pin button
+        let pinImage = (httpModel?.isPinned == true)
+            ? UIImage(systemName: "pin.slash.fill")
+            : UIImage(systemName: "pin.fill")
+        pinItem = UIBarButtonItem(image: pinImage, style: .plain, target: self, action: #selector(togglePin))
+        pinItem.tintColor = DebugTheme.accentColor
+
+        // Nav bar
+        navigationItem.rightBarButtonItems = [closeItem, pinItem]
 
         //header
         headerCell = NetworkCell(style: .default, reuseIdentifier: "NetworkCell")
@@ -591,7 +599,20 @@ class NetworkDetailViewController: UITableViewController {
     @objc func close(_ sender: UIBarButtonItem) {
         self.navigationController?.dismiss(animated: true)
     }
-    
+
+    @objc private func togglePin() {
+        guard let model = httpModel else { return }
+        model.isPinned.toggle()
+        if model.isPinned {
+            model.savePinToDisk()
+        } else {
+            model.removePinFromDisk()
+        }
+        pinItem.image = model.isPinned
+            ? UIImage(systemName: "pin.slash.fill")
+            : UIImage(systemName: "pin.fill")
+    }
+
     @objc func didTapMail(_ sender: UIBarButtonItem) {
 
         let alert = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
@@ -1064,16 +1085,19 @@ final class CurlPreviewViewController: UIViewController {
         copyButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         copyButton.layer.cornerRadius = 6
         copyButton.clipsToBounds = true
-        copyButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
-        copyButton.setTitleColor(DebugTheme.accentColor, for: .normal)
         copyButton.addTarget(self, action: #selector(copyTapped), for: .touchUpInside)
-        if let icon = UIImage(systemName: "doc.on.doc", withConfiguration: UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
+        if let icon = UIImage(systemName: "doc.on.doc", withConfiguration: UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
             copyButton.setImage(icon, for: .normal)
-            copyButton.tintColor = DebugTheme.accentColor
         }
         var copyConfig = UIButton.Configuration.plain()
         copyConfig.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)
-        copyConfig.imagePadding = 4
+        copyConfig.imagePadding = 5
+        copyConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 11, weight: .semibold)
+            return attr
+        }
+        copyConfig.baseForegroundColor = DebugTheme.accentColor
         copyButton.configuration = copyConfig
         copyButton.setTitle("Copy", for: .normal)
         buttonsStack.addArrangedSubview(copyButton)
@@ -1082,16 +1106,19 @@ final class CurlPreviewViewController: UIViewController {
         shareButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         shareButton.layer.cornerRadius = 6
         shareButton.clipsToBounds = true
-        shareButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
-        shareButton.setTitleColor(DebugTheme.accentColor, for: .normal)
         shareButton.addTarget(self, action: #selector(shareTapped), for: .touchUpInside)
-        if let icon = UIImage(systemName: "square.and.arrow.up", withConfiguration: UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
+        if let icon = UIImage(systemName: "square.and.arrow.up", withConfiguration: UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
             shareButton.setImage(icon, for: .normal)
-            shareButton.tintColor = DebugTheme.accentColor
         }
         var shareConfig = UIButton.Configuration.plain()
         shareConfig.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)
-        shareConfig.imagePadding = 4
+        shareConfig.imagePadding = 5
+        shareConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 11, weight: .semibold)
+            return attr
+        }
+        shareConfig.baseForegroundColor = DebugTheme.accentColor
         shareButton.configuration = shareConfig
         shareButton.setTitle("Share", for: .normal)
         buttonsStack.addArrangedSubview(shareButton)

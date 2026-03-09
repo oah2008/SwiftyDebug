@@ -7,7 +7,7 @@
 
 import UIKit
 
-private enum NetworkTab: Int { case app = 0, web = 1 }
+private enum NetworkTab: Int { case app = 0, web = 1, pinned = 2 }
 
 /// Per-tab filter + layout state (includes auto-follow + scroll offset).
 private final class TabFilterState {
@@ -36,11 +36,11 @@ class NetworkViewController: UIViewController {
     // Segment tabs
     private var segmentControl: UISegmentedControl!
     private static var savedTab: NetworkTab = .app
-    private var currentTab: NetworkTab = NetworkViewController.savedTab
-    private var tabStates: [NetworkTab: TabFilterState] = [
-        .app: TabFilterState(), .web: TabFilterState()
+    private static var tabStates: [NetworkTab: TabFilterState] = [
+        .app: TabFilterState(), .web: TabFilterState(), .pinned: TabFilterState()
     ]
-    private var currentTabState: TabFilterState { tabStates[currentTab]! }
+    private var currentTab: NetworkTab = NetworkViewController.savedTab
+    private var currentTabState: TabFilterState { Self.tabStates[currentTab]! }
 
     // Filter + layout toggle (inline with search bar)
     private var filterButton: UIButton!
@@ -56,6 +56,8 @@ class NetworkViewController: UIViewController {
     // Auto-follow (per-tab, accessed via currentTabState)
     private var followButton: UIButton!
     private static let followButtonSize: CGFloat = 40
+
+    private var isShowingDetail = false
 
     // Convenience
     private var isAutoFollowing: Bool {
@@ -108,6 +110,7 @@ class NetworkViewController: UIViewController {
         switch currentTab {
         case .app: allModels = allCacheModels.filter { !$0.isWebViewRequest }
         case .web: allModels = allCacheModels.filter { $0.isWebViewRequest }
+        case .pinned: allModels = allCacheModels.filter { $0.isPinned }
         }
         guard !allModels.isEmpty else { return [] }
 
@@ -211,6 +214,7 @@ class NetworkViewController: UIViewController {
         switch currentTab {
         case .app: models = allCache.filter { !$0.isWebViewRequest }
         case .web: models = allCache.filter { $0.isWebViewRequest }
+        case .pinned: models = allCache.filter { $0.isPinned }
         }
         if pathFilters.isEmpty && hostFilters.isEmpty { return [] }
 
@@ -361,6 +365,7 @@ class NetworkViewController: UIViewController {
         switch currentTab {
         case .app: filtered = cacheModels.filter { !$0.isWebViewRequest }
         case .web: filtered = cacheModels.filter { $0.isWebViewRequest }
+        case .pinned: filtered = cacheModels.filter { $0.isPinned }
         }
 
         // 2. Path / host filters
@@ -523,9 +528,11 @@ class NetworkViewController: UIViewController {
 
         applyFilter()
 
-        if isAutoFollowing {
+        if isAutoFollowing && !isShowingDetail {
             self.tableView.reloadData()
-            self.tableView.layoutIfNeeded()
+            if self.tableView.window != nil {
+                self.tableView.layoutIfNeeded()
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 let actualCount = self.tableView.numberOfRows(inSection: 0)
@@ -537,7 +544,9 @@ class NetworkViewController: UIViewController {
             let savedOffset = self.tableView.contentOffset
             UIView.performWithoutAnimation {
                 self.tableView.reloadData()
-                self.tableView.layoutIfNeeded()
+                if self.tableView.window != nil {
+                    self.tableView.layoutIfNeeded()
+                }
                 self.tableView.contentOffset = savedOffset
             }
         }
@@ -608,7 +617,16 @@ class NetworkViewController: UIViewController {
 
         searchBar.delegate = self
 
+        // Restore saved state from previous debug VC session
+        searchBar.text = currentTabState.searchText.isEmpty ? nil : currentTabState.searchText
+
+        // Hide filter/layout on Pinned tab
+        let isPinned = currentTab == .pinned
+        filterButton.isHidden = isPinned
+        layoutToggleButton.isHidden = isPinned
+
         updateFilterButtonIcon()
+        updateLayoutToggleIcon()
 
         //notification
         NotificationCenter.default.addObserver(forName: .networkRequestCompleted, object: nil, queue: OperationQueue.main) { [weak self] _ in
@@ -633,17 +651,19 @@ class NetworkViewController: UIViewController {
         }
         tableView.showsVerticalScrollIndicator = false
 
+        // Always start at bottom with auto-follow enabled when debug VC opens
+        isAutoFollowing = true
+        setFollowButtonVisible(false, animated: false)
+
         reloadHttp()
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        // Scroll to bottom after layout is fully applied (insets ready)
-        if isAutoFollowing {
-            let count = tableView.numberOfRows(inSection: 0)
-            guard count > 0 else { return }
-            let last = IndexPath(row: count - 1, section: 0)
-            tableView.scrollToRow(at: last, at: .bottom, animated: false)
+        if isShowingDetail {
+            // Returning from detail — don't scroll, just clear flag
+            isShowingDetail = false
+            return
         }
     }
 
@@ -668,6 +688,7 @@ class NetworkViewController: UIViewController {
         segmentControl = UISegmentedControl(items: [
             Self.makeSegmentImage(systemName: "iphone", title: "App"),
             Self.makeSegmentImage(systemName: "globe", title: "Web"),
+            Self.makeSegmentImage(systemName: "pin.fill", title: "Pinned"),
         ])
         segmentControl.translatesAutoresizingMaskIntoConstraints = false
         segmentControl.selectedSegmentIndex = currentTab.rawValue
@@ -902,6 +923,12 @@ class NetworkViewController: UIViewController {
         searchBar.text = newState.searchText
         updateLayoutToggleIcon()
         updateFilterButtonIcon()
+
+        // Hide filter/layout buttons on Pinned tab (not relevant there)
+        let isPinned = currentTab == .pinned
+        filterButton.isHidden = isPinned
+        layoutToggleButton.isHidden = isPinned
+
         applyFilter()
         tableView.reloadData()
         tableView.layoutIfNeeded()
@@ -1053,6 +1080,7 @@ extension NetworkViewController: UITableViewDelegate {
             vc.models = group.models
             vc.groupKey = group.key
             vc.isPathFilter = group.isPathFilter
+            isShowingDetail = true
             navigationController?.pushViewController(vc, animated: true)
         } else {
             reachEnd = false
@@ -1064,10 +1092,20 @@ extension NetworkViewController: UITableViewDelegate {
             let vc = NetworkDetailViewController()
             vc.httpModels = models
             vc.httpModel = models[indexPath.row]
+            isShowingDetail = true
             self.navigationController?.pushViewController(vc, animated: true)
 
             vc.justCancelCallback = { [weak self] in
-                self?.tableView.reloadData()
+                guard let self = self else { return }
+                self.isShowingDetail = false
+                let savedOffset = self.tableView.contentOffset
+                UIView.performWithoutAnimation {
+                    self.tableView.reloadData()
+                    self.tableView.layoutIfNeeded()
+                    if !self.isAutoFollowing {
+                        self.tableView.contentOffset = savedOffset
+                    }
+                }
             }
         }
     }
@@ -1089,7 +1127,13 @@ extension NetworkViewController: UITableViewDelegate {
             } else {
                 model.removePinFromDisk()
             }
-            tableView.reloadRows(at: [indexPath], with: .none)
+            // On the Pinned tab, re-filter so unpinned row disappears
+            if self?.currentTab == .pinned {
+                self?.applyFilter()
+                tableView.reloadData()
+            } else {
+                tableView.reloadRows(at: [indexPath], with: .none)
+            }
             completion(true)
         }
         action.backgroundColor = UIColor(red: 0.16, green: 0.50, blue: 0.47, alpha: 1)
