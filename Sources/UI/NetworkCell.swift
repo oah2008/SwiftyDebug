@@ -445,8 +445,7 @@ class NetworkCell: UITableViewCell {
         pinIcon.isHidden = !model.isPinned
 
         // Intercept indicator
-        let normalizedPath = EndpointNormalizer.normalize(model.url?.path ?? "")
-        interceptIcon.isHidden = !InterceptRuleStore.shared.hasRule(for: normalizedPath)
+        interceptIcon.isHidden = !InterceptRuleStore.shared.hasRule(forPath: model.url?.path ?? "")
 
         // Tagged highlight
         if model.isTag {

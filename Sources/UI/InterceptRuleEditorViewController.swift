@@ -41,8 +41,10 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     // MARK: - State
 
-    private var normalizedEndpoint: String = ""
+    private var requestPath: String = ""
+    private var normalizedPath: String = ""
     private var originalURL: String = ""
+    private var matchMode: EndpointMatchMode = .normalized
     private var isBlocked: Bool = false
     private var headerItems: [EditItem] = []
     private var queryParamItems: [EditItem] = []
@@ -50,6 +52,11 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     private var originalHeaders: [(key: String, value: String)] = []
     private var originalQueryParams: [(key: String, value: String)] = []
+
+    /// The endpoint string displayed based on the current match mode.
+    private var displayedEndpoint: String {
+        matchMode == .exact ? requestPath : normalizedPath
+    }
 
     /// Whether this editor was presented modally (no rules existed) vs pushed from the list.
     private var isPresentedModally: Bool {
@@ -70,7 +77,6 @@ class InterceptRuleEditorViewController: UITableViewController {
         saveItem.tintColor = DebugTheme.accentColor
         navigationItem.rightBarButtonItem = saveItem
 
-        // Show cancel only when presented modally
         if isPresentedModally {
             navigationItem.leftBarButtonItem = UIBarButtonItem(
                 barButtonSystemItem: .cancel, target: self, action: #selector(cancelTapped)
@@ -99,8 +105,9 @@ class InterceptRuleEditorViewController: UITableViewController {
     private func populateFromModel() {
         guard let model = httpModel else { return }
 
+        requestPath = model.url?.path ?? ""
+        normalizedPath = EndpointNormalizer.normalize(requestPath)
         originalURL = model.url?.absoluteString ?? ""
-        normalizedEndpoint = EndpointNormalizer.normalize(model.url?.path ?? "")
 
         // Capture original request values for the picker
         if let headerFields = model.requestHeaderFields as? [String: String] {
@@ -113,11 +120,13 @@ class InterceptRuleEditorViewController: UITableViewController {
 
         // Load existing rule by ID if editing
         if let ruleId = existingRuleId {
-            existingRule = InterceptRuleStore.shared.rules(for: normalizedEndpoint)
-                .first(where: { $0.id == ruleId })
+            // Search across both exact and normalized keys
+            let allMatching = InterceptRuleStore.shared.matchingRules(forPath: requestPath)
+            existingRule = allMatching.first(where: { $0.id == ruleId })
         }
 
         if let rule = existingRule {
+            matchMode = rule.matchMode
             isBlocked = rule.isBlocked
 
             headerItems = rule.headerOverrides.map {
@@ -136,6 +145,7 @@ class InterceptRuleEditorViewController: UITableViewController {
                 queryParamItems.append(EditItem(key: removedKey, value: originalValue, isDropped: true, isKeyEditable: false))
             }
         } else {
+            matchMode = .normalized
             isBlocked = false
             headerItems = []
             queryParamItems = []
@@ -149,9 +159,11 @@ class InterceptRuleEditorViewController: UITableViewController {
     }
 
     @objc private func saveTapped() {
-        var rule = existingRule ?? InterceptRule(normalizedEndpoint: normalizedEndpoint)
+        let matchEndpoint = matchMode == .exact ? requestPath : normalizedPath
+        var rule = existingRule ?? InterceptRule(matchEndpoint: matchEndpoint, matchMode: matchMode)
         rule.isBlocked = isBlocked
         rule.isEnabled = true
+        rule.matchMode = matchMode
 
         rule.headerOverrides = headerItems
             .filter { !$0.isDropped && !$0.key.isEmpty }
@@ -169,6 +181,30 @@ class InterceptRuleEditorViewController: UITableViewController {
             queryParamItems.filter { $0.isDropped && !$0.key.isEmpty }.map { $0.key }
         )
 
+        // Rule must have some effect to be saved
+        let hasEffect = rule.isBlocked
+            || !rule.headerOverrides.isEmpty
+            || !rule.removedHeaderKeys.isEmpty
+            || !rule.queryParamOverrides.isEmpty
+            || !rule.removedQueryParamKeys.isEmpty
+
+        if !hasEffect {
+            let alert = UIAlertController(
+                title: "Empty Rule",
+                message: "This rule has no effect. Add headers/parameters to override or drop, or enable blocking.",
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+            return
+        }
+
+        // If match mode changed on an existing rule, remove the old one first
+        // (it was keyed under a different matchEndpoint).
+        if let existing = existingRule, existing.matchEndpoint != matchEndpoint {
+            InterceptRuleStore.shared.remove(id: existing.id)
+        }
+
         InterceptRuleStore.shared.addOrUpdate(rule)
 
         if isPresentedModally {
@@ -176,6 +212,12 @@ class InterceptRuleEditorViewController: UITableViewController {
         } else {
             navigationController?.popViewController(animated: true)
         }
+    }
+
+    @objc private func matchModeChanged(_ sender: UISegmentedControl) {
+        matchMode = sender.selectedSegmentIndex == 0 ? .normalized : .exact
+        // Reload endpoint cell to show the correct path
+        tableView.reloadRows(at: [IndexPath(row: 0, section: Section.endpoint.rawValue)], with: .none)
     }
 
     @objc private func blockToggleChanged(_ sender: UISwitch) {
@@ -255,8 +297,7 @@ class InterceptRuleEditorViewController: UITableViewController {
         }
 
         for item in available {
-            let displayTitle = "\(item.key): \(item.value.prefix(50))"
-            alert.addAction(UIAlertAction(title: displayTitle, style: .default) { _ in
+            alert.addAction(UIAlertAction(title: item.key, style: .default) { _ in
                 completion(EditItem(key: item.key, value: item.value, isDropped: false, isKeyEditable: false))
             })
         }
@@ -292,7 +333,7 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     private func sectionTitle(for section: Section, count: Int) -> String {
         switch section {
-        case .endpoint:    return "ENDPOINT PATTERN"
+        case .endpoint:    return "ENDPOINT"
         case .action:      return "ACTION"
         case .headers:     return "HEADERS\(count > 0 ? " (\(count))" : "")"
         case .queryParams: return "QUERY PARAMETERS\(count > 0 ? " (\(count))" : "")"
@@ -307,7 +348,7 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
-        case .endpoint:    return 1
+        case .endpoint:    return 2  // match mode selector + endpoint display
         case .action:      return existingRule != nil ? 2 : 1
         case .headers:     return isBlocked ? 0 : headerItems.count
         case .queryParams: return isBlocked ? 0 : queryParamItems.count
@@ -317,20 +358,48 @@ class InterceptRuleEditorViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         switch Section(rawValue: indexPath.section)! {
         case .endpoint:
-            let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "EndpointCell")
-            cell.selectionStyle = .none
-            cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
-            cell.textLabel?.text = normalizedEndpoint
-            cell.textLabel?.font = UIFont(name: "Menlo", size: 13) ?? .monospacedSystemFont(ofSize: 13, weight: .medium)
-            cell.textLabel?.textColor = DebugTheme.accentColor
-            cell.textLabel?.numberOfLines = 3
-            cell.detailTextLabel?.text = originalURL
-            cell.detailTextLabel?.font = .systemFont(ofSize: 10)
-            cell.detailTextLabel?.textColor = UIColor(white: 0.45, alpha: 1)
-            cell.detailTextLabel?.numberOfLines = 2
-            cell.detailTextLabel?.lineBreakMode = .byTruncatingMiddle
-            cell.forceLTR()
-            return cell
+            if indexPath.row == 0 {
+                // Match mode selector
+                let cell = UITableViewCell(style: .default, reuseIdentifier: "MatchModeCell")
+                cell.selectionStyle = .none
+                cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+
+                let seg = UISegmentedControl(items: ["Pattern", "Exact"])
+                seg.selectedSegmentIndex = matchMode == .normalized ? 0 : 1
+                seg.addTarget(self, action: #selector(matchModeChanged(_:)), for: .valueChanged)
+                seg.translatesAutoresizingMaskIntoConstraints = false
+                seg.selectedSegmentTintColor = DebugTheme.accentColor
+                seg.setTitleTextAttributes([.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 12, weight: .semibold)], for: .selected)
+                seg.setTitleTextAttributes([.foregroundColor: UIColor(white: 0.6, alpha: 1), .font: UIFont.systemFont(ofSize: 12, weight: .medium)], for: .normal)
+
+                cell.contentView.addSubview(seg)
+                NSLayoutConstraint.activate([
+                    seg.leadingAnchor.constraint(equalTo: cell.contentView.leadingAnchor, constant: 12),
+                    seg.trailingAnchor.constraint(equalTo: cell.contentView.trailingAnchor, constant: -12),
+                    seg.topAnchor.constraint(equalTo: cell.contentView.topAnchor, constant: 8),
+                    seg.bottomAnchor.constraint(equalTo: cell.contentView.bottomAnchor, constant: -8),
+                    seg.heightAnchor.constraint(equalToConstant: 32),
+                ])
+                cell.forceLTR()
+                return cell
+            } else {
+                // Endpoint display
+                let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "EndpointCell")
+                cell.selectionStyle = .none
+                cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+                cell.textLabel?.text = displayedEndpoint
+                cell.textLabel?.font = UIFont(name: "Menlo", size: 13) ?? .monospacedSystemFont(ofSize: 13, weight: .medium)
+                cell.textLabel?.textColor = matchMode == .exact ? .systemOrange : DebugTheme.accentColor
+                cell.textLabel?.numberOfLines = 3
+                cell.detailTextLabel?.text = matchMode == .exact
+                    ? "Matches only this exact path"
+                    : "Matches all paths with this pattern (IDs replaced)"
+                cell.detailTextLabel?.font = .systemFont(ofSize: 10)
+                cell.detailTextLabel?.textColor = UIColor(white: 0.45, alpha: 1)
+                cell.detailTextLabel?.numberOfLines = 2
+                cell.forceLTR()
+                return cell
+            }
 
         case .action:
             if indexPath.row == 0 {

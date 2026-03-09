@@ -7,14 +7,18 @@
 
 import UIKit
 
-/// Shows all intercept rules for a given endpoint.
+/// Shows all intercept rules that match a given request path (both exact and normalized).
 /// Supports enable/disable, reorder, delete, and creating new rules.
 class InterceptRuleListViewController: UITableViewController {
 
     // MARK: - Input
 
     var httpModel: NetworkTransaction?
-    var normalizedEndpoint: String = ""
+
+    // MARK: - Derived
+
+    private var requestPath: String = ""
+    private var normalizedPath: String = ""
 
     // MARK: - State
 
@@ -27,6 +31,9 @@ class InterceptRuleListViewController: UITableViewController {
 
         title = "Intercept Rules"
         view.backgroundColor = .black
+
+        requestPath = httpModel?.url?.path ?? ""
+        normalizedPath = EndpointNormalizer.normalize(requestPath)
 
         navigationItem.leftBarButtonItem = UIBarButtonItem(
             barButtonSystemItem: .done, target: self, action: #selector(doneTapped)
@@ -60,7 +67,7 @@ class InterceptRuleListViewController: UITableViewController {
     }
 
     private func reloadRules() {
-        ruleList = InterceptRuleStore.shared.rules(for: normalizedEndpoint)
+        ruleList = InterceptRuleStore.shared.matchingRules(forPath: requestPath)
         tableView.reloadData()
     }
 
@@ -127,13 +134,17 @@ class InterceptRuleListViewController: UITableViewController {
         tableView.deleteRows(at: [indexPath], with: .automatic)
     }
 
-    // Reorder
+    // Reorder — only within same matchEndpoint group
     override func tableView(_ tableView: UITableView, canMoveRowAt indexPath: IndexPath) -> Bool { true }
 
     override func tableView(_ tableView: UITableView, moveRowAt sourceIndexPath: IndexPath, to destinationIndexPath: IndexPath) {
         let moved = ruleList.remove(at: sourceIndexPath.row)
         ruleList.insert(moved, at: destinationIndexPath.row)
-        InterceptRuleStore.shared.reorder(ids: ruleList.map(\.id), for: normalizedEndpoint)
+        // Reorder within each matchEndpoint group
+        let grouped = Dictionary(grouping: ruleList, by: \.matchEndpoint)
+        for (endpoint, rules) in grouped {
+            InterceptRuleStore.shared.reorder(ids: rules.map(\.id), for: endpoint)
+        }
     }
 
     // Section header
@@ -144,7 +155,7 @@ class InterceptRuleListViewController: UITableViewController {
         let label = UILabel()
         label.font = UIFont(name: "Menlo", size: 12) ?? .monospacedSystemFont(ofSize: 12, weight: .medium)
         label.textColor = UIColor(white: 0.5, alpha: 1)
-        label.text = normalizedEndpoint
+        label.text = requestPath
         label.numberOfLines = 2
         label.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(label)
@@ -166,6 +177,7 @@ private class InterceptRuleCell: UITableViewCell {
 
     private let cardView = UIView()
     private let indexLabel = UILabel()
+    private let matchModeLabel = UILabel()
     private let summaryLabel = UILabel()
     private let detailLabel = UILabel()
     private let enableSwitch = UISwitch()
@@ -198,6 +210,13 @@ private class InterceptRuleCell: UITableViewCell {
         indexLabel.translatesAutoresizingMaskIntoConstraints = false
         cardView.addSubview(indexLabel)
 
+        matchModeLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+        matchModeLabel.textAlignment = .center
+        matchModeLabel.layer.cornerRadius = 4
+        matchModeLabel.clipsToBounds = true
+        matchModeLabel.translatesAutoresizingMaskIntoConstraints = false
+        cardView.addSubview(matchModeLabel)
+
         summaryLabel.font = .systemFont(ofSize: 14, weight: .semibold)
         summaryLabel.textColor = .white
         summaryLabel.numberOfLines = 1
@@ -225,6 +244,11 @@ private class InterceptRuleCell: UITableViewCell {
             indexLabel.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 14),
             indexLabel.topAnchor.constraint(equalTo: cardView.topAnchor, constant: 10),
 
+            matchModeLabel.leadingAnchor.constraint(equalTo: indexLabel.trailingAnchor, constant: 6),
+            matchModeLabel.centerYAnchor.constraint(equalTo: indexLabel.centerYAnchor),
+            matchModeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 50),
+            matchModeLabel.heightAnchor.constraint(equalToConstant: 16),
+
             summaryLabel.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 14),
             summaryLabel.topAnchor.constraint(equalTo: indexLabel.bottomAnchor, constant: 2),
             summaryLabel.trailingAnchor.constraint(equalTo: enableSwitch.leadingAnchor, constant: -12),
@@ -243,6 +267,18 @@ private class InterceptRuleCell: UITableViewCell {
 
     func configure(with rule: InterceptRule, index: Int) {
         indexLabel.text = "RULE #\(index)"
+
+        // Match mode badge
+        switch rule.matchMode {
+        case .exact:
+            matchModeLabel.text = " EXACT "
+            matchModeLabel.textColor = .systemOrange
+            matchModeLabel.backgroundColor = UIColor.systemOrange.withAlphaComponent(0.15)
+        case .normalized:
+            matchModeLabel.text = " PATTERN "
+            matchModeLabel.textColor = DebugTheme.accentColor
+            matchModeLabel.backgroundColor = DebugTheme.accentColor.withAlphaComponent(0.15)
+        }
 
         if rule.isBlocked {
             summaryLabel.text = "Block Request"

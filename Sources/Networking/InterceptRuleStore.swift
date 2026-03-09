@@ -10,11 +10,14 @@ import Foundation
 /// Thread-safe singleton that stores interception rules in memory and persists them to disk.
 /// Supports multiple rules per endpoint — rules are applied in `order` ascending,
 /// with later rules overriding earlier ones for the same keys.
+///
+/// Rules are keyed by `matchEndpoint`. At lookup time both the exact path and normalized
+/// path are checked so that exact-match and normalized-match rules can coexist.
 class InterceptRuleStore {
 
     static let shared = InterceptRuleStore()
 
-    /// In-memory cache keyed by normalizedEndpoint. Each endpoint maps to an ordered array of rules.
+    /// In-memory cache keyed by `matchEndpoint`. Each key maps to an ordered array of rules.
     private var rules: [String: [InterceptRule]] = [:]
 
     private init() {
@@ -23,38 +26,67 @@ class InterceptRuleStore {
 
     // MARK: - Lookup
 
-    /// Returns all rules for the given endpoint, sorted by `order` ascending.
-    func rules(for normalizedEndpoint: String) -> [InterceptRule] {
+    /// Returns all rules that match the given request path (both exact and normalized matches).
+    func matchingRules(forPath path: String) -> [InterceptRule] {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
-        return (rules[normalizedEndpoint] ?? []).sorted { $0.order < $1.order }
+
+        let normalized = EndpointNormalizer.normalize(path)
+        var result: [InterceptRule] = []
+
+        // Exact-match rules stored under the literal path
+        if let list = rules[path] {
+            result.append(contentsOf: list.filter { $0.matchMode == .exact })
+        }
+        // Normalized-match rules stored under the normalized path
+        if let list = rules[normalized] {
+            result.append(contentsOf: list.filter { $0.matchMode == .normalized })
+        }
+
+        return result.sorted { $0.order < $1.order }
     }
 
-    /// Returns `true` if at least one rule exists for the endpoint.
-    func hasRule(for normalizedEndpoint: String) -> Bool {
+    /// Returns all rules for a specific matchEndpoint key, sorted by order.
+    func rules(for matchEndpoint: String) -> [InterceptRule] {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
-        return !(rules[normalizedEndpoint] ?? []).isEmpty
+        return (rules[matchEndpoint] ?? []).sorted { $0.order < $1.order }
     }
 
-    /// Merges all enabled rules for the endpoint into a single composite rule.
+    /// Returns `true` if at least one rule matches the given request path.
+    func hasRule(forPath path: String) -> Bool {
+        objc_sync_enter(self)
+        defer { objc_sync_exit(self) }
+
+        let normalized = EndpointNormalizer.normalize(path)
+
+        if let list = rules[path], list.contains(where: { $0.matchMode == .exact }) {
+            return true
+        }
+        if let list = rules[normalized], list.contains(where: { $0.matchMode == .normalized }) {
+            return true
+        }
+        return false
+    }
+
+    /// Merges all enabled matching rules for the request path into a single composite rule.
     /// Called from `CustomHTTPProtocol.startLoading()` on every request.
-    /// Returns `nil` if no enabled rules exist.
-    func resolvedRule(for normalizedEndpoint: String) -> InterceptRule? {
+    /// Returns `nil` if no enabled rules match.
+    func resolvedRule(forPath path: String) -> InterceptRule? {
+        let allMatching = matchingRules(forPath: path)
+
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
 
-        guard let list = rules[normalizedEndpoint] else { return nil }
-        let enabled = list.filter { $0.isEnabled }.sorted { $0.order < $1.order }
+        let enabled = allMatching.filter { $0.isEnabled }
         guard !enabled.isEmpty else { return nil }
 
-        var composite = InterceptRule(normalizedEndpoint: normalizedEndpoint)
+        var composite = InterceptRule(matchEndpoint: path)
 
         for rule in enabled {
             if rule.isBlocked {
                 composite.isBlocked = true
             }
-            // Later overrides win for the same key
             for pair in rule.headerOverrides {
                 if let idx = composite.headerOverrides.firstIndex(where: { $0.key.lowercased() == pair.key.lowercased() }) {
                     composite.headerOverrides[idx] = pair
@@ -91,7 +123,7 @@ class InterceptRuleStore {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
 
-        var list = rules[rule.normalizedEndpoint] ?? []
+        var list = rules[rule.matchEndpoint] ?? []
         if let idx = list.firstIndex(where: { $0.id == rule.id }) {
             list[idx] = rule
         } else {
@@ -99,7 +131,7 @@ class InterceptRuleStore {
             newRule.order = list.count
             list.append(newRule)
         }
-        rules[rule.normalizedEndpoint] = list
+        rules[rule.matchEndpoint] = list
         saveToDisk()
     }
 
@@ -116,7 +148,6 @@ class InterceptRuleStore {
         for (endpoint, var list) in rules {
             if let idx = list.firstIndex(where: { $0.id == id }) {
                 list.remove(at: idx)
-                // Re-index order
                 for i in 0..<list.count { list[i].order = i }
                 if list.isEmpty {
                     rules.removeValue(forKey: endpoint)
@@ -129,20 +160,20 @@ class InterceptRuleStore {
         }
     }
 
-    /// Removes all rules for the given endpoint.
-    func remove(normalizedEndpoint: String) {
+    /// Removes all rules for the given matchEndpoint key.
+    func remove(matchEndpoint: String) {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
-        rules.removeValue(forKey: normalizedEndpoint)
+        rules.removeValue(forKey: matchEndpoint)
         saveToDisk()
     }
 
-    /// Reorders rules for an endpoint by the given ordered list of rule IDs.
-    func reorder(ids: [String], for normalizedEndpoint: String) {
+    /// Reorders rules for a matchEndpoint by the given ordered list of rule IDs.
+    func reorder(ids: [String], for matchEndpoint: String) {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
 
-        guard var list = rules[normalizedEndpoint] else { return }
+        guard let list = rules[matchEndpoint] else { return }
         var reordered: [InterceptRule] = []
         for (i, id) in ids.enumerated() {
             if let idx = list.firstIndex(where: { $0.id == id }) {
@@ -151,13 +182,12 @@ class InterceptRuleStore {
                 reordered.append(rule)
             }
         }
-        // Append any rules not in the id list (shouldn't happen, but safe)
         for rule in list where !ids.contains(rule.id) {
             var r = rule
             r.order = reordered.count
             reordered.append(r)
         }
-        rules[normalizedEndpoint] = reordered
+        rules[matchEndpoint] = reordered
         saveToDisk()
     }
 
@@ -201,13 +231,11 @@ class InterceptRuleStore {
               let loaded = try? JSONDecoder().decode([InterceptRule].self, from: data) else {
             return
         }
-        // Group by endpoint
         for rule in loaded {
-            var list = rules[rule.normalizedEndpoint] ?? []
+            var list = rules[rule.matchEndpoint] ?? []
             list.append(rule)
-            rules[rule.normalizedEndpoint] = list
+            rules[rule.matchEndpoint] = list
         }
-        // Sort each list by order, then createdAt as tiebreaker
         for (endpoint, list) in rules {
             rules[endpoint] = list.sorted {
                 if $0.order != $1.order { return $0.order < $1.order }
