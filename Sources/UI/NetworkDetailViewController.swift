@@ -1064,10 +1064,10 @@ final class CurlPreviewViewController: UIViewController {
         copyButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         copyButton.layer.cornerRadius = 6
         copyButton.clipsToBounds = true
-        copyButton.titleLabel?.font = .systemFont(ofSize: 9, weight: .bold)
+        copyButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
         copyButton.setTitleColor(DebugTheme.accentColor, for: .normal)
         copyButton.addTarget(self, action: #selector(copyTapped), for: .touchUpInside)
-        if let icon = UIImage(systemName: "doc.on.doc")?.withRenderingMode(.alwaysTemplate) {
+        if let icon = UIImage(systemName: "doc.on.doc", withConfiguration: UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
             copyButton.setImage(icon, for: .normal)
             copyButton.tintColor = DebugTheme.accentColor
         }
@@ -1082,10 +1082,10 @@ final class CurlPreviewViewController: UIViewController {
         shareButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         shareButton.layer.cornerRadius = 6
         shareButton.clipsToBounds = true
-        shareButton.titleLabel?.font = .systemFont(ofSize: 9, weight: .bold)
+        shareButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
         shareButton.setTitleColor(DebugTheme.accentColor, for: .normal)
         shareButton.addTarget(self, action: #selector(shareTapped), for: .touchUpInside)
-        if let icon = UIImage(systemName: "square.and.arrow.up")?.withRenderingMode(.alwaysTemplate) {
+        if let icon = UIImage(systemName: "square.and.arrow.up", withConfiguration: UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
             shareButton.setImage(icon, for: .normal)
             shareButton.tintColor = DebugTheme.accentColor
         }

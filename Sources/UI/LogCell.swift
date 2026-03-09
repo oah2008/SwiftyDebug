@@ -197,11 +197,17 @@ class LogCell: UITableViewCell {
         showFullButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         showFullButton.layer.cornerRadius = 6
         showFullButton.clipsToBounds = true
-        showFullButton.titleLabel?.font = .systemFont(ofSize: 11, weight: .semibold)
+        showFullButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
         showFullButton.setTitleColor(Self.tealColor, for: .normal)
         var showFullConfig = UIButton.Configuration.plain()
         showFullConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
+        showFullConfig.imagePadding = 4
         showFullButton.configuration = showFullConfig
+
+        let showFullCfg = UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold)
+        let showFullIco = UIImage(systemName: "arrow.down.left.and.arrow.up.right", withConfiguration: showFullCfg)?
+            .withTintColor(Self.tealColor, renderingMode: .alwaysOriginal)
+        showFullButton.setImage(showFullIco, for: .normal)
         showFullButton.setTitle("Show Full JSON", for: .normal)
         showFullButton.addTarget(self, action: #selector(showFullTapped), for: .touchUpInside)
 

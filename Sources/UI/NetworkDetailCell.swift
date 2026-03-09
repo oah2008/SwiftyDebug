@@ -33,6 +33,11 @@ class NetworkDetailCell: UITableViewCell {
     private var imageBottomConstraint: NSLayoutConstraint!
     private var collapsedBottomConstraint: NSLayoutConstraint!
 
+    /// Copy button trailing when preview IS visible
+    private var copyTrailingToPreview: NSLayoutConstraint!
+    /// Copy button trailing when preview is NOT visible
+    private var copyTrailingToCard: NSLayoutConstraint!
+
     // MARK: - Colors
 
     private static let cardColor = UIColor(white: 0.11, alpha: 1)       // #1C1C1C
@@ -96,22 +101,22 @@ class NetworkDetailCell: UITableViewCell {
         copyButton.setImage(copyIcon, for: .normal)
         cardView.addSubview(copyButton)
 
-        // Preview button (compact teal pill)
+        // Preview button (matches Show Full Response style: dark bg + teal text)
         previewButton.translatesAutoresizingMaskIntoConstraints = false
-        previewButton.backgroundColor = UIColor(red: 0.16, green: 0.50, blue: 0.47, alpha: 1)
+        previewButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         previewButton.layer.cornerRadius = 6
         previewButton.clipsToBounds = true
-        previewButton.titleLabel?.font = .systemFont(ofSize: 9, weight: .bold)
-        previewButton.setTitleColor(.white, for: .normal)
+        previewButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
+        previewButton.setTitleColor(Self.tealTitle, for: .normal)
         var previewBtnConfig = UIButton.Configuration.plain()
         previewBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
         previewBtnConfig.imagePadding = 3
         previewButton.configuration = previewBtnConfig
         previewButton.addTarget(self, action: #selector(tapPreview), for: .touchUpInside)
 
-        let previewConfig = UIImage.SymbolConfiguration(pointSize: 7, weight: .semibold)
+        let previewConfig = UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold)
         let previewIcon = UIImage(systemName: "doc.text.magnifyingglass", withConfiguration: previewConfig)?
-            .withTintColor(.white, renderingMode: .alwaysOriginal)
+            .withTintColor(Self.tealTitle, renderingMode: .alwaysOriginal)
         previewButton.setImage(previewIcon, for: .normal)
         previewButton.setTitle("Preview", for: .normal)
         previewButton.isHidden = true
@@ -134,7 +139,7 @@ class NetworkDetailCell: UITableViewCell {
         showFullButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         showFullButton.layer.cornerRadius = 6
         showFullButton.clipsToBounds = true
-        showFullButton.titleLabel?.font = .systemFont(ofSize: 9, weight: .bold)
+        showFullButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
         showFullButton.setTitleColor(Self.tealTitle, for: .normal)
         var showFullBtnConfig = UIButton.Configuration.plain()
         showFullBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
@@ -142,7 +147,7 @@ class NetworkDetailCell: UITableViewCell {
         showFullButton.configuration = showFullBtnConfig
         showFullButton.addTarget(self, action: #selector(tapPreview), for: .touchUpInside)
 
-        let showFullCfg = UIImage.SymbolConfiguration(pointSize: 7, weight: .semibold)
+        let showFullCfg = UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold)
         let showFullIco = UIImage(systemName: "arrow.down.left.and.arrow.up.right", withConfiguration: showFullCfg)?
             .withTintColor(Self.tealTitle, renderingMode: .alwaysOriginal)
         showFullButton.setImage(showFullIco, for: .normal)
@@ -178,7 +183,6 @@ class NetworkDetailCell: UITableViewCell {
             copyButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             copyButton.widthAnchor.constraint(equalToConstant: 28),
             copyButton.heightAnchor.constraint(equalToConstant: 28),
-            copyButton.trailingAnchor.constraint(equalTo: previewButton.leadingAnchor, constant: -12),
 
             // Preview button
             previewButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
@@ -202,6 +206,11 @@ class NetworkDetailCell: UITableViewCell {
             // Default bottom
             contentBottomConstraint,
         ])
+
+        // Switchable copy button trailing constraints
+        copyTrailingToPreview = copyButton.trailingAnchor.constraint(equalTo: previewButton.leadingAnchor, constant: -12)
+        copyTrailingToCard = copyButton.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -12)
+        copyTrailingToCard.isActive = true
     }
 
     // MARK: - Reuse
@@ -225,6 +234,10 @@ class NetworkDetailCell: UITableViewCell {
         imageBottomConstraint.isActive = false
         collapsedBottomConstraint.isActive = false
         contentBottomConstraint.isActive = true
+
+        // Reset copy button position
+        copyTrailingToPreview.isActive = false
+        copyTrailingToCard.isActive = true
     }
 
     // MARK: - Configure
@@ -264,8 +277,10 @@ class NetworkDetailCell: UITableViewCell {
         let isCurlSection = model.title == "REQUEST CURL"
         copyButton.isHidden = !hasContent || isInfo || isCurlSection
 
-        // Preview button (top-right)
+        // Preview button (top-right) — switch copy button constraint
         previewButton.isHidden = !showPreview
+        copyTrailingToPreview.isActive = showPreview
+        copyTrailingToCard.isActive = !showPreview
 
         // Reset showFull button
         showFullButton.isHidden = true
