@@ -36,11 +36,11 @@ class NetworkViewController: UIViewController {
     // Segment tabs
     private var segmentControl: UISegmentedControl!
     private static var savedTab: NetworkTab = .app
-    private var currentTab: NetworkTab = NetworkViewController.savedTab
-    private var tabStates: [NetworkTab: TabFilterState] = [
+    private static var tabStates: [NetworkTab: TabFilterState] = [
         .app: TabFilterState(), .web: TabFilterState(), .pinned: TabFilterState()
     ]
-    private var currentTabState: TabFilterState { tabStates[currentTab]! }
+    private var currentTab: NetworkTab = NetworkViewController.savedTab
+    private var currentTabState: TabFilterState { Self.tabStates[currentTab]! }
 
     // Filter + layout toggle (inline with search bar)
     private var filterButton: UIButton!
@@ -531,7 +531,9 @@ class NetworkViewController: UIViewController {
 
         if isAutoFollowing && !isShowingDetail {
             self.tableView.reloadData()
-            self.tableView.layoutIfNeeded()
+            if self.tableView.window != nil {
+                self.tableView.layoutIfNeeded()
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 let actualCount = self.tableView.numberOfRows(inSection: 0)
@@ -543,7 +545,9 @@ class NetworkViewController: UIViewController {
             let savedOffset = self.tableView.contentOffset
             UIView.performWithoutAnimation {
                 self.tableView.reloadData()
-                self.tableView.layoutIfNeeded()
+                if self.tableView.window != nil {
+                    self.tableView.layoutIfNeeded()
+                }
                 self.tableView.contentOffset = savedOffset
             }
         }
@@ -614,12 +618,16 @@ class NetworkViewController: UIViewController {
 
         searchBar.delegate = self
 
+        // Restore saved state from previous debug VC session
+        searchBar.text = currentTabState.searchText.isEmpty ? nil : currentTabState.searchText
+
         // Hide filter/layout on Pinned tab
         let isPinned = currentTab == .pinned
         filterButton.isHidden = isPinned
         layoutToggleButton.isHidden = isPinned
 
         updateFilterButtonIcon()
+        updateLayoutToggleIcon()
 
         //notification
         NotificationCenter.default.addObserver(forName: .networkRequestCompleted, object: nil, queue: OperationQueue.main) { [weak self] _ in

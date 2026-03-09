@@ -12,6 +12,8 @@ class LogViewController: UIViewController {
     // MARK: - UI
 
     private static var savedSegmentIndex: Int = 0
+    /// Per-segment search text (persists during app session)
+    private static var savedSearchWords: [Int: String] = [:]
     private var segmentControl: UISegmentedControl!
     private var defaultSearchBar: UISearchBar!
     private var deleteItem: UIBarButtonItem!
@@ -183,6 +185,10 @@ class LogViewController: UIViewController {
         // Segment control — restore last selected tab (resets on app relaunch)
         segmentControl.selectedSegmentIndex = Self.savedSegmentIndex
         segmentControl.addTarget(self, action: #selector(segmentChanged(_:)), for: .valueChanged)
+
+        // Restore saved search word for this segment
+        currentSearchWord = Self.savedSearchWords[Self.savedSegmentIndex]
+        defaultSearchBar.text = currentSearchWord
 
         // Default table view (Third Party & Web)
         defaultTableView.register(LogCell.self, forCellReuseIdentifier: "LogCell")
@@ -1014,7 +1020,11 @@ class LogViewController: UIViewController {
 
     @objc func segmentChanged(_ sender: UISegmentedControl) {
         dismissSelection()
+        // Save current segment's search word before switching
+        Self.savedSearchWords[Self.savedSegmentIndex] = currentSearchWord
         Self.savedSegmentIndex = sender.selectedSegmentIndex
+        // Restore new segment's search word
+        currentSearchWord = Self.savedSearchWords[Self.savedSegmentIndex]
         defaultSearchBar.text = currentSearchWord
         updateVisibility()
 
@@ -1054,6 +1064,7 @@ class LogViewController: UIViewController {
             setDefaultFollowButtonVisible(false, animated: false)
             defaultSearchBar.text = nil
             currentSearchWord = nil
+            Self.savedSearchWords[Self.savedSegmentIndex] = nil
             // Set count to 0 now; onCountChanged callback will update with
             // actual remaining count (pinned rows) and trigger rebuild
             defaultTotalCount = 0
@@ -1556,6 +1567,7 @@ extension LogViewController: UISearchBarDelegate {
 
     func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
         currentSearchWord = searchText
+        Self.savedSearchWords[Self.savedSegmentIndex] = searchText.isEmpty ? nil : searchText
 
         if isConsoleTab {
             performConsoleSearch(searchText)

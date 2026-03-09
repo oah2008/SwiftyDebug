@@ -8,11 +8,14 @@
 import UIKit
 
 class SwiftyDebugTabBarController: UITabBarController {
-    
+
+    /// Remembers last selected tab bar index during app session (reset on app kill)
+    static var savedTabIndex: Int = 0
+
     //MARK: - init
     override func viewDidLoad() {
         super.viewDidLoad()
-        
+
         UIApplication.shared.connectedScenes
             .compactMap { ($0 as? UIWindowScene)?.keyWindow }
             .first?.endEditing(true)
@@ -23,9 +26,8 @@ class SwiftyDebugTabBarController: UITabBarController {
         self.delegate = self
 
         setChildControllers()
-        
-        // Always open on Network tab on fresh launch
-        self.selectedIndex = 0
+
+        self.selectedIndex = Self.savedTabIndex
         self.tabBar.tintColor = DebugTheme.accentColor
         
         self.tabBar.isTranslucent = true
@@ -100,6 +102,9 @@ extension SwiftyDebugTabBarController: UITabBarControllerDelegate {
 
     func tabBarController(_ tabBarController: UITabBarController, shouldSelect viewController: UIViewController) -> Bool {
         guard viewController !== selectedViewController else { return true }
+        if let index = viewControllers?.firstIndex(of: viewController) {
+            Self.savedTabIndex = index
+        }
         let transition = CATransition()
         transition.duration = 0.2
         transition.type = .fade

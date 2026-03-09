@@ -171,16 +171,24 @@ class NetworkDetailCell: UITableViewCell {
 
         // Bottom constraints (only one active at a time)
         contentBottomConstraint = contentTextView.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -10)
+        contentBottomConstraint.priority = UILayoutPriority(999)
         showFullBottomConstraint = showFullButton.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -10)
+        showFullBottomConstraint.priority = UILayoutPriority(999)
         imageBottomConstraint = imgView.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -4)
+        imageBottomConstraint.priority = UILayoutPriority(999)
         collapsedBottomConstraint = titleLabel.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -10)
+        collapsedBottomConstraint.priority = UILayoutPriority(999)
 
         NSLayoutConstraint.activate([
             // Card inset
             cardView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 8),
             cardView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -8),
             cardView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 3),
-            cardView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -3),
+            {
+                let c = cardView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -3)
+                c.priority = UILayoutPriority(999)
+                return c
+            }(),
 
             // Title
             titleLabel.topAnchor.constraint(equalTo: cardView.topAnchor, constant: 10),
@@ -217,7 +225,9 @@ class NetworkDetailCell: UITableViewCell {
 
         // Switchable copy button trailing constraints
         copyTrailingToPreview = copyButton.trailingAnchor.constraint(equalTo: previewButton.leadingAnchor, constant: -12)
+        copyTrailingToPreview.priority = UILayoutPriority(999)
         copyTrailingToCard = copyButton.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -12)
+        copyTrailingToCard.priority = UILayoutPriority(999)
         copyTrailingToCard.isActive = true
     }
 
@@ -287,8 +297,14 @@ class NetworkDetailCell: UITableViewCell {
 
         // Preview button (top-right) — switch copy button constraint
         previewButton.isHidden = !showPreview
-        copyTrailingToPreview.isActive = showPreview
-        copyTrailingToCard.isActive = !showPreview
+        // Deactivate first to avoid momentary conflict
+        copyTrailingToPreview.isActive = false
+        copyTrailingToCard.isActive = false
+        if showPreview {
+            copyTrailingToPreview.isActive = true
+        } else {
+            copyTrailingToCard.isActive = true
+        }
 
         // Reset showFull button
         showFullButton.isHidden = true
