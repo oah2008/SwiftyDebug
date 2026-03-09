@@ -557,6 +557,15 @@ class NetworkDetailViewController: UITableViewController {
             }
             self.present(activity, animated: true)
         }
+
+        headerCell?.showInterceptButton = true
+        headerCell?.onInterceptTapped = { [weak self] in
+            guard let self = self, let model = self.httpModel else { return }
+            let editor = InterceptRuleEditorViewController()
+            editor.httpModel = model
+            let nav = SwiftyDebugNavigationController(rootViewController: editor)
+            self.present(nav, animated: true)
+        }
         view.forceLTR()
     }
 

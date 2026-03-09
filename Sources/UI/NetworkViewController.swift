@@ -351,16 +351,7 @@ class NetworkViewController: UIViewController {
     }
 
     static func normalizeEndpoint(_ path: String) -> String {
-        let components = path.components(separatedBy: "/")
-        let normalized = components.map { component -> String in
-            if component.isEmpty { return component }
-            if component.allSatisfy({ $0.isNumber || $0 == "-" }) && component.contains(where: { $0.isNumber }) {
-                return "{id}"
-            }
-            if UUID(uuidString: component) != nil { return "{id}" }
-            return component
-        }
-        return normalized.joined(separator: "/")
+        return EndpointNormalizer.normalize(path)
     }
 
     //MARK: - Filter logic

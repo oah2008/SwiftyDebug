@@ -361,6 +361,45 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
         // HTTPBodyStream. recursiveRequest now has the stream data converted to HTTPBody.
         self.capturedRequestBody = recursiveRequest.httpBody
 
+        // --- Interception: check for matching intercept rules ---
+        if let url = recursiveRequest.url {
+            let normalized = EndpointNormalizer.normalize(url.path)
+            if let rule = InterceptRuleStore.shared.rule(for: normalized), rule.isEnabled {
+                if rule.isBlocked {
+                    let error = NSError(
+                        domain: NSURLErrorDomain,
+                        code: NSURLErrorCancelled,
+                        userInfo: [NSLocalizedDescriptionKey: "Blocked by SwiftyDebug intercept rule"]
+                    )
+                    self.client?.urlProtocol(self, didFailWithError: error)
+                    return
+                }
+                // Apply header overrides
+                for pair in rule.headerOverrides {
+                    recursiveRequest.setValue(pair.value, forHTTPHeaderField: pair.key)
+                }
+                for key in rule.removedHeaderKeys {
+                    recursiveRequest.setValue(nil, forHTTPHeaderField: key)
+                }
+                // Apply query param overrides
+                if var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                    var items = components.queryItems ?? []
+                    items.removeAll { rule.removedQueryParamKeys.contains($0.name) }
+                    for pair in rule.queryParamOverrides {
+                        if let idx = items.firstIndex(where: { $0.name == pair.key }) {
+                            items[idx] = URLQueryItem(name: pair.key, value: pair.value)
+                        } else {
+                            items.append(URLQueryItem(name: pair.key, value: pair.value))
+                        }
+                    }
+                    components.queryItems = items.isEmpty ? nil : items
+                    if let newURL = components.url {
+                        recursiveRequest.url = newURL
+                    }
+                }
+            }
+        }
+
         self.startTime = Date().timeIntervalSince1970
         self.data = NSMutableData()
 
