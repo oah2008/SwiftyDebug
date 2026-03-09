@@ -187,9 +187,10 @@ class NetworkViewController: UIViewController {
     /// Returns the tag label from networkTagMap whose key is a substring of the full URL,
     /// or nil if no custom tag matches.
     private func tagLabel(forURLString urlString: String) -> String? {
-        guard let map = SwiftyDebug.networkTagMap else { return nil }
+        let map = SwiftyDebug._tags
+        guard !map.isEmpty else { return nil }
         let lower = urlString.lowercased()
-        // Direct key lookup first (most common case: onlyURLs key == networkTagMap key)
+        // Direct key lookup first (most common case: urls key == tag keyword)
         if let label = map[urlString] { return label }
         // Substring match fallback
         for (keyword, label) in map where lower.contains(keyword.lowercased()) {
@@ -198,9 +199,10 @@ class NetworkViewController: UIViewController {
         return nil
     }
 
-    /// Returns the tag label from networkTagMap whose key matches the given host, or nil.
+    /// Returns the tag label whose keyword matches the given host, or nil.
     private func tagLabel(forHost host: String) -> String? {
-        guard let map = SwiftyDebug.networkTagMap else { return nil }
+        let map = SwiftyDebug._tags
+        guard !map.isEmpty else { return nil }
         for (keyword, label) in map where host.contains(keyword.lowercased()) {
             return label
         }

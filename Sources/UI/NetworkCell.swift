@@ -450,8 +450,8 @@ class NetworkCell: UITableViewCell {
         let fullURL = (model.url?.absoluteString ?? "").lowercased()
 
         // 1. Custom tags — keyword is a substring of the full URL or the host.
-        if let customMap = SwiftyDebug.networkTagMap {
-            for (keyword, label) in customMap {
+        if !SwiftyDebug._tags.isEmpty {
+            for (keyword, label) in SwiftyDebug._tags {
                 let lowerKeyword = keyword.lowercased()
                 if fullURL.contains(lowerKeyword) || host.contains(lowerKeyword) {
                     let color = Self.colorForTag(keyword)

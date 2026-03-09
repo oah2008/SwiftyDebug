@@ -91,9 +91,9 @@ class AppInfoViewController: UITableViewController {
 
     private static func detectHostTag(urlString: String, host: String, path: String, isWebView: Bool) -> (label: String, color: UIColor)? {
         // Custom tags — check full URL first, then host
-        if let customMap = SwiftyDebug.networkTagMap {
+        if !SwiftyDebug._tags.isEmpty {
             let lowerURL = urlString.lowercased()
-            for (keyword, label) in customMap {
+            for (keyword, label) in SwiftyDebug._tags {
                 let lowerKeyword = keyword.lowercased()
                 if lowerURL.contains(lowerKeyword) || host.contains(lowerKeyword) {
                     return (label, colorForTag(keyword))
