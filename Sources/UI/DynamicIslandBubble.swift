@@ -53,16 +53,6 @@ class DynamicIslandBubble: UIView {
     /// Whether the Dynamic Island-style pill is currently in expanded state
     private var isExpanded = false
 
-    // MARK: - Detection
-
-    /// Returns true if the current device has a Dynamic Island (safe area top >= 55pt)
-    static var deviceHasDynamicIsland: Bool {
-        let safeTop = UIApplication.shared.connectedScenes
-            .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-            .first?.safeAreaInsets.top ?? 0
-        return safeTop >= 55
-    }
-
     // MARK: - Init
 
     override init(frame: CGRect) {
