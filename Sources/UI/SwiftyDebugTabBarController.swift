@@ -18,6 +18,8 @@ class SwiftyDebugTabBarController: UITabBarController {
             .first?.endEditing(true)
 
         overrideUserInterfaceStyle = .dark
+        view.semanticContentAttribute = .forceLeftToRight
+        tabBar.semanticContentAttribute = .forceLeftToRight
         self.delegate = self
 
         setChildControllers()

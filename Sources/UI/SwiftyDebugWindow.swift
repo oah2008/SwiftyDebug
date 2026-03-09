@@ -17,6 +17,7 @@ class SwiftyDebugWindow: UIWindow {
         
         self.backgroundColor = .clear
         self.windowLevel = UIWindow.Level(rawValue: UIWindow.Level.alert.rawValue - 1)
+        self.semanticContentAttribute = .forceLeftToRight
     }
     
     required init?(coder aDecoder: NSCoder) {

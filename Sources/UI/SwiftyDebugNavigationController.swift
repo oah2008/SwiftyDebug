@@ -13,6 +13,8 @@ class SwiftyDebugNavigationController: UINavigationController {
         super.viewDidLoad()
 
         overrideUserInterfaceStyle = .dark
+        view.semanticContentAttribute = .forceLeftToRight
+        navigationBar.semanticContentAttribute = .forceLeftToRight
         navigationBar.tintColor = DebugTheme.accentColor
 
         let titleAttributes: [NSAttributedString.Key: Any] = [
