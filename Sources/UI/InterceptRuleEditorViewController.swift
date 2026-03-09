@@ -317,36 +317,21 @@ class InterceptRuleEditorViewController: UITableViewController {
     // MARK: - Host picker
 
     @objc private func selectHostsTapped() {
-        let alert = UIAlertController(title: "Select Hosts", message: "Choose hosts to intercept", preferredStyle: .actionSheet)
-
-        for host in availableHosts {
-            let isSelected = selectedHosts.contains(host)
-            let prefix = isSelected ? "✓ " : "  "
-            alert.addAction(UIAlertAction(title: prefix + host, style: isSelected ? .destructive : .default) { [weak self] _ in
-                guard let self = self else { return }
-                if isSelected {
-                    self.selectedHosts.removeAll { $0 == host }
-                } else {
-                    self.selectedHosts.append(host)
-                }
-                // Re-show picker to allow multiple selections
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    self.tableView.reloadSections(IndexSet([Section.endpoint.rawValue]), with: .none)
-                    self.selectHostsTapped()
-                }
-            })
+        let picker = HostPickerSheetViewController()
+        picker.hosts = availableHosts
+        picker.selectedHosts = Set(selectedHosts)
+        picker.onApply = { [weak self] applied in
+            guard let self = self else { return }
+            self.selectedHosts = applied
+            self.tableView.reloadSections(IndexSet([Section.endpoint.rawValue]), with: .none)
         }
 
-        alert.addAction(UIAlertAction(title: "Done", style: .cancel) { [weak self] _ in
-            self?.tableView.reloadSections(IndexSet([Section.endpoint.rawValue]), with: .none)
-        })
-
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = view
-            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-            popover.permittedArrowDirections = []
+        if let sheet = picker.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+            sheet.prefersScrollingExpandsWhenScrolledToEdge = true
         }
-        present(alert, animated: true)
+        present(picker, animated: true)
     }
 
     // MARK: - Add picker
@@ -761,7 +746,10 @@ class InterceptRuleEditorViewController: UITableViewController {
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide(_:)), name: UIResponder.keyboardWillHideNotification, object: nil)
     }
 
-    private lazy var dismissKeyboardButton: UIButton = {
+    private var _dismissKeyboardButton: UIButton?
+
+    private var dismissKeyboardButton: UIButton {
+        if let btn = _dismissKeyboardButton { return btn }
         let btn = UIButton(type: .system)
         var config = UIButton.Configuration.filled()
         config.cornerStyle = .capsule
@@ -774,8 +762,9 @@ class InterceptRuleEditorViewController: UITableViewController {
         btn.translatesAutoresizingMaskIntoConstraints = false
         btn.addTarget(self, action: #selector(dismissKeyboardTapped), for: .touchUpInside)
         btn.alpha = 0
+        _dismissKeyboardButton = btn
         return btn
-    }()
+    }
 
     @objc private func keyboardWillShow(_ notification: Notification) {
         guard dismissKeyboardButton.superview == nil else {
@@ -810,7 +799,7 @@ class InterceptRuleEditorViewController: UITableViewController {
     }
 
     deinit {
-        dismissKeyboardButton.removeFromSuperview()
+        _dismissKeyboardButton?.removeFromSuperview()
         NotificationCenter.default.removeObserver(self)
     }
 }
