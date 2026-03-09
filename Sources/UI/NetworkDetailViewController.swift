@@ -524,7 +524,7 @@ class NetworkDetailViewController: UITableViewController {
         tableView.separatorStyle = .none
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 100
-        tableView.contentInset.bottom = 16  // padding so sticky header doesn't cover last row
+        tableView.contentInset.bottom = 16
         tableView.showsVerticalScrollIndicator = false
 
         // Nav bar: close only
@@ -633,14 +633,21 @@ class NetworkDetailViewController: UITableViewController {
 extension NetworkDetailViewController {
     
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        return detailModels.count
+        // +1 for the header cell at row 0
+        return detailModels.count + 1
     }
-    
+
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        guard indexPath.row < detailModels.count else {
+        // Row 0: header cell (non-sticky)
+        if indexPath.row == 0 {
+            return headerCell ?? UITableViewCell()
+        }
+
+        let detailIndex = indexPath.row - 1
+        guard detailIndex < detailModels.count else {
             return tableView.dequeueReusableCell(withIdentifier: "NetworkDetailCell", for: indexPath)
         }
-        let model = detailModels[indexPath.row]
+        let model = detailModels[detailIndex]
 
         // Similar Requests row — horizontal card scroll
         if let similar = model.similarRequests, !similar.isEmpty {
@@ -685,29 +692,18 @@ extension NetworkDetailViewController {
 extension NetworkDetailViewController {
     
     override func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
-        guard indexPath.row < detailModels.count else { return 0 }
+        // Row 0: header cell
+        if indexPath.row == 0 {
+            return UITableView.automaticDimension
+        }
 
-        // Row 0 (URL placeholder) — hidden
-        if detailModels[indexPath.row].title == "URL" { return 0 }
+        let detailIndex = indexPath.row - 1
+        guard detailIndex < detailModels.count else { return 0 }
+
+        // URL placeholder — hidden
+        if detailModels[detailIndex].title == "URL" { return 0 }
 
         return UITableView.automaticDimension
-    }
-    
-    
-    override func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
-        return headerCell?.contentView
-    }
-    
-    
-    override func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
-        guard let cell = headerCell else { return 0 }
-        let targetSize = CGSize(width: tableView.bounds.width, height: UIView.layoutFittingCompressedSize.height)
-        let size = cell.contentView.systemLayoutSizeFitting(
-            targetSize,
-            withHorizontalFittingPriority: .required,
-            verticalFittingPriority: .fittingSizeLevel
-        )
-        return size.height
     }
 }
 

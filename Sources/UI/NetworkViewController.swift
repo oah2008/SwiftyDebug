@@ -864,17 +864,22 @@ class NetworkViewController: UIViewController {
     //MARK: - target action
     @objc func tapTrashButton(_ sender: UIBarButtonItem) {
         NetworkRequestStore.shared.reset()
-        models = []
-        cacheModels = []
+
+        // Reload from store so pinned requests remain visible
+        let remaining = (NetworkRequestStore.shared.httpModels as NSArray as? [NetworkTransaction]) ?? []
+        cacheModels = remaining
         groupedModels = []
         // DO NOT clear filters — they persist across clears
         isAutoFollowing = true
         setFollowButtonVisible(false, animated: false)
 
+        applyFilter()
         self.tableView.reloadData()
-        self.naviItemTitleLabel?.text = "\u{1f680}[0]"
 
-        NotificationCenter.default.post(name: .allLogsCleared, object: nil, userInfo: nil)
+        let pinnedCount = remaining.count
+        self.naviItemTitleLabel?.text = "\u{1f680}[\(pinnedCount)]"
+
+        NotificationCenter.default.post(name: .allLogsCleared, object: nil, userInfo: ["pinnedCount": pinnedCount])
     }
 
     @objc func didTapView() {

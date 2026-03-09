@@ -94,8 +94,8 @@ class Bubble: UIView {
         nc.addObserver(forName: .networkRequestCompleted, object: nil, queue: .main) { [weak self] notification in
             self?.handleNetworkRequest(notification)
         }
-        nc.addObserver(forName: .allLogsCleared, object: nil, queue: .main) { [weak self] _ in
-            self?.handleLogsCleared()
+        nc.addObserver(forName: .allLogsCleared, object: nil, queue: .main) { [weak self] notification in
+            self?.handleLogsCleared(notification)
         }
         nc.addObserver(forName: .forceShowDebugger, object: nil, queue: .main) { [weak self] _ in
             self?.refreshBubbleState()
@@ -198,8 +198,9 @@ class Bubble: UIView {
         updateCounter(requestCount + 1)
     }
 
-    private func handleLogsCleared() {
-        updateCounter(0)
+    private func handleLogsCleared(_ notification: Notification) {
+        let pinnedCount = (notification.userInfo?["pinnedCount"] as? Int) ?? 0
+        updateCounter(pinnedCount)
     }
 
     /// Toggles visibility twice to force-refresh the bubble presenter.
@@ -216,7 +217,8 @@ class Bubble: UIView {
 
     @objc private func handleLongPress() {
         NetworkRequestStore.shared.reset()
-        NotificationCenter.default.post(name: .allLogsCleared, object: nil)
+        let pinnedCount = NetworkRequestStore.shared.httpModels.count
+        NotificationCenter.default.post(name: .allLogsCleared, object: nil, userInfo: ["pinnedCount": pinnedCount])
     }
 
     @objc private func handlePan(_ panner: UIPanGestureRecognizer) {

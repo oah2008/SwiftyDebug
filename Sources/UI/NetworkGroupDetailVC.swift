@@ -298,8 +298,9 @@ class NetworkGroupDetailVC: UIViewController {
 
     @objc private func didTapDelete() {
         NetworkRequestStore.shared.reset()
+        let pinnedCount = NetworkRequestStore.shared.httpModels.count
         NotificationCenter.default.post(name: .networkRequestCompleted, object: nil)
-        NotificationCenter.default.post(name: .allLogsCleared, object: nil)
+        NotificationCenter.default.post(name: .allLogsCleared, object: nil, userInfo: ["pinnedCount": pinnedCount])
         navigationController?.popViewController(animated: true)
     }
 
