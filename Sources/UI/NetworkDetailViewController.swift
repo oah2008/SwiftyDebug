@@ -1065,15 +1065,15 @@ final class CurlPreviewViewController: UIViewController {
         copyButton.layer.cornerRadius = 6
         copyButton.clipsToBounds = true
         copyButton.addTarget(self, action: #selector(copyTapped), for: .touchUpInside)
-        if let icon = UIImage(systemName: "doc.on.doc", withConfiguration: UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
+        if let icon = UIImage(systemName: "doc.on.doc", withConfiguration: UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
             copyButton.setImage(icon, for: .normal)
         }
         var copyConfig = UIButton.Configuration.plain()
         copyConfig.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)
-        copyConfig.imagePadding = 4
+        copyConfig.imagePadding = 5
         copyConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
             var attr = attr
-            attr.font = .systemFont(ofSize: 7, weight: .bold)
+            attr.font = .systemFont(ofSize: 11, weight: .semibold)
             return attr
         }
         copyConfig.baseForegroundColor = DebugTheme.accentColor
@@ -1086,15 +1086,15 @@ final class CurlPreviewViewController: UIViewController {
         shareButton.layer.cornerRadius = 6
         shareButton.clipsToBounds = true
         shareButton.addTarget(self, action: #selector(shareTapped), for: .touchUpInside)
-        if let icon = UIImage(systemName: "square.and.arrow.up", withConfiguration: UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
+        if let icon = UIImage(systemName: "square.and.arrow.up", withConfiguration: UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold))?.withRenderingMode(.alwaysTemplate) {
             shareButton.setImage(icon, for: .normal)
         }
         var shareConfig = UIButton.Configuration.plain()
         shareConfig.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)
-        shareConfig.imagePadding = 4
+        shareConfig.imagePadding = 5
         shareConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
             var attr = attr
-            attr.font = .systemFont(ofSize: 7, weight: .bold)
+            attr.font = .systemFont(ofSize: 11, weight: .semibold)
             return attr
         }
         shareConfig.baseForegroundColor = DebugTheme.accentColor

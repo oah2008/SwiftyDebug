@@ -107,18 +107,18 @@ class NetworkDetailCell: UITableViewCell {
         previewButton.layer.cornerRadius = 6
         previewButton.clipsToBounds = true
         var previewBtnConfig = UIButton.Configuration.plain()
-        previewBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
-        previewBtnConfig.imagePadding = 3
+        previewBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10)
+        previewBtnConfig.imagePadding = 4
         previewBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
             var attr = attr
-            attr.font = .systemFont(ofSize: 7, weight: .bold)
+            attr.font = .systemFont(ofSize: 11, weight: .semibold)
             return attr
         }
         previewBtnConfig.baseForegroundColor = Self.tealTitle
         previewButton.configuration = previewBtnConfig
         previewButton.addTarget(self, action: #selector(tapPreview), for: .touchUpInside)
 
-        let previewConfig = UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold)
+        let previewConfig = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
         let previewIcon = UIImage(systemName: "doc.text.magnifyingglass", withConfiguration: previewConfig)?
             .withTintColor(Self.tealTitle, renderingMode: .alwaysOriginal)
         previewButton.setImage(previewIcon, for: .normal)
@@ -145,17 +145,17 @@ class NetworkDetailCell: UITableViewCell {
         showFullButton.clipsToBounds = true
         var showFullBtnConfig = UIButton.Configuration.plain()
         showFullBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
-        showFullBtnConfig.imagePadding = 4
+        showFullBtnConfig.imagePadding = 5
         showFullBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
             var attr = attr
-            attr.font = .systemFont(ofSize: 7, weight: .bold)
+            attr.font = .systemFont(ofSize: 11, weight: .semibold)
             return attr
         }
         showFullBtnConfig.baseForegroundColor = Self.tealTitle
         showFullButton.configuration = showFullBtnConfig
         showFullButton.addTarget(self, action: #selector(tapPreview), for: .touchUpInside)
 
-        let showFullCfg = UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold)
+        let showFullCfg = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
         let showFullIco = UIImage(systemName: "arrow.down.left.and.arrow.up.right", withConfiguration: showFullCfg)?
             .withTintColor(Self.tealTitle, renderingMode: .alwaysOriginal)
         showFullButton.setImage(showFullIco, for: .normal)
