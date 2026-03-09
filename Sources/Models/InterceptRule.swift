@@ -103,4 +103,20 @@ struct InterceptRule: Codable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
     }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(matchEndpoint, forKey: .matchEndpoint)
+        try c.encode(matchMode, forKey: .matchMode)
+        try c.encode(matchHosts, forKey: .matchHosts)
+        try c.encode(isBlocked, forKey: .isBlocked)
+        try c.encode(headerOverrides, forKey: .headerOverrides)
+        try c.encode(queryParamOverrides, forKey: .queryParamOverrides)
+        try c.encode(removedHeaderKeys, forKey: .removedHeaderKeys)
+        try c.encode(removedQueryParamKeys, forKey: .removedQueryParamKeys)
+        try c.encode(isEnabled, forKey: .isEnabled)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(order, forKey: .order)
+    }
 }

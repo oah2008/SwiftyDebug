@@ -21,6 +21,8 @@ class InterceptRuleEditorViewController: UITableViewController {
     var existingRuleId: String?
     /// Set before presenting to pre-select the match mode (.normalized, .exact, or .host).
     var initialMatchMode: EndpointMatchMode?
+    /// Set directly when editing from the App tab (no httpModel needed).
+    var ruleToEdit: InterceptRule?
 
     // MARK: - Sections
 
@@ -104,6 +106,7 @@ class InterceptRuleEditorViewController: UITableViewController {
         tableView.estimatedRowHeight = 44
         tableView.keyboardDismissMode = .interactive
 
+        setupKeyboardDismissButton()
         populateFromModel()
         view.forceLTR()
     }
@@ -111,35 +114,48 @@ class InterceptRuleEditorViewController: UITableViewController {
     // MARK: - Populate
 
     private func populateFromModel() {
-        guard let model = httpModel else { return }
-
-        requestPath = model.url?.path ?? ""
-        normalizedPath = EndpointNormalizer.normalize(requestPath)
-        requestHost = (model.url?.host ?? "").lowercased()
-        originalURL = model.url?.absoluteString ?? ""
-
         // Build available hosts from SwiftyDebug.urls
         availableHosts = Self.extractHosts(from: SwiftyDebug.urls)
-        // Ensure the current request's host is included
-        if !requestHost.isEmpty && !availableHosts.contains(requestHost) {
-            availableHosts.insert(requestHost, at: 0)
-        }
 
-        // Capture original request values for the picker
-        if let headerFields = model.requestHeaderFields as? [String: String] {
-            originalHeaders = headerFields.sorted(by: { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending })
-        }
-        if let url = model.url, let components = URLComponents(url: url as URL, resolvingAgainstBaseURL: false),
-           let items = components.queryItems {
-            originalQueryParams = items.map { (key: $0.name, value: $0.value ?? "") }
-        }
+        if let model = httpModel {
+            requestPath = model.url?.path ?? ""
+            normalizedPath = EndpointNormalizer.normalize(requestPath)
+            requestHost = (model.url?.host ?? "").lowercased()
+            originalURL = model.url?.absoluteString ?? ""
 
-        // Load existing rule by ID if editing
-        if let ruleId = existingRuleId {
-            if let url = model.url as URL? {
-                existingRule = InterceptRuleStore.shared.matchingRules(forURL: url)
-                    .first(where: { $0.id == ruleId })
+            // Ensure the current request's host is included
+            if !requestHost.isEmpty && !availableHosts.contains(requestHost) {
+                availableHosts.insert(requestHost, at: 0)
             }
+
+            // Capture original request values for the picker
+            if let headerFields = model.requestHeaderFields as? [String: String] {
+                originalHeaders = headerFields.sorted(by: { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending })
+            }
+            if let url = model.url, let components = URLComponents(url: url as URL, resolvingAgainstBaseURL: false),
+               let items = components.queryItems {
+                originalQueryParams = items.map { (key: $0.name, value: $0.value ?? "") }
+            }
+
+            // Load existing rule by ID if editing
+            if let ruleId = existingRuleId {
+                if let url = model.url as URL? {
+                    existingRule = InterceptRuleStore.shared.matchingRules(forURL: url)
+                        .first(where: { $0.id == ruleId })
+                }
+            }
+        } else if let rule = ruleToEdit {
+            // Editing from App tab without an httpModel
+            existingRule = rule
+            existingRuleId = rule.id
+            if rule.matchMode == .host {
+                selectedHosts = rule.matchHosts
+            } else {
+                requestPath = rule.matchEndpoint
+                normalizedPath = rule.matchEndpoint
+            }
+        } else if initialMatchMode == .host {
+            // Creating host rule from App tab — no model needed
         }
 
         if let rule = existingRule {
@@ -408,32 +424,28 @@ class InterceptRuleEditorViewController: UITableViewController {
         caseInsensitive: Bool,
         completion: @escaping (EditItem) -> Void
     ) {
-        let alert = UIAlertController(title: title, message: nil, preferredStyle: .actionSheet)
-
         let available = originalItems.filter { item in
             let k = caseInsensitive ? item.key.lowercased() : item.key
             return !existingKeys.contains(k)
         }
 
-        for item in available {
-            alert.addAction(UIAlertAction(title: item.key, style: .default) { _ in
-                completion(EditItem(key: item.key, value: item.value, isDropped: false, isKeyEditable: false))
-            })
+        let picker = KeyPickerSheetViewController()
+        picker.sheetTitle = title
+        picker.items = available
+        picker.onItemSelected = { item in
+            completion(EditItem(key: item.key, value: item.value, isDropped: false, isKeyEditable: false))
         }
-
-        alert.addAction(UIAlertAction(title: "Add Custom", style: .default) { _ in
+        picker.onCustomSelected = {
             completion(EditItem(key: "", value: "", isDropped: false, isKeyEditable: true))
-        })
-
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = view
-            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-            popover.permittedArrowDirections = []
         }
 
-        present(alert, animated: true)
+        let nav = SwiftyDebugNavigationController(rootViewController: picker)
+        if let sheet = nav.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+            sheet.prefersScrollingExpandsWhenScrolledToEdge = true
+        }
+        present(nav, animated: true)
     }
 
     private func reloadSectionHeader(_ section: Section) {
@@ -740,5 +752,65 @@ class InterceptRuleEditorViewController: UITableViewController {
     @objc private func endpointModeChanged(_ sender: UISegmentedControl) {
         matchMode = sender.selectedSegmentIndex == 0 ? .normalized : .exact
         tableView.reloadRows(at: [IndexPath(row: 1, section: Section.endpoint.rawValue)], with: .none)
+    }
+
+    // MARK: - Keyboard dismiss
+
+    private func setupKeyboardDismissButton() {
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillShow(_:)), name: UIResponder.keyboardWillShowNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide(_:)), name: UIResponder.keyboardWillHideNotification, object: nil)
+    }
+
+    private lazy var dismissKeyboardButton: UIButton = {
+        let btn = UIButton(type: .system)
+        var config = UIButton.Configuration.filled()
+        config.cornerStyle = .capsule
+        config.baseBackgroundColor = UIColor(white: 0.22, alpha: 1)
+        config.baseForegroundColor = UIColor(white: 0.7, alpha: 1)
+        config.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16)
+        let iconConfig = UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+        config.image = UIImage(systemName: "keyboard.chevron.compact.down", withConfiguration: iconConfig)
+        btn.configuration = config
+        btn.translatesAutoresizingMaskIntoConstraints = false
+        btn.addTarget(self, action: #selector(dismissKeyboardTapped), for: .touchUpInside)
+        btn.alpha = 0
+        return btn
+    }()
+
+    @objc private func keyboardWillShow(_ notification: Notification) {
+        guard dismissKeyboardButton.superview == nil else {
+            UIView.animate(withDuration: 0.2) { self.dismissKeyboardButton.alpha = 1 }
+            return
+        }
+        guard let window = view.window else { return }
+        window.addSubview(dismissKeyboardButton)
+
+        guard let info = notification.userInfo,
+              let kbFrame = (info[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else {
+            NSLayoutConstraint.activate([
+                dismissKeyboardButton.centerXAnchor.constraint(equalTo: window.centerXAnchor),
+                dismissKeyboardButton.bottomAnchor.constraint(equalTo: window.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+            ])
+            UIView.animate(withDuration: 0.25) { self.dismissKeyboardButton.alpha = 1 }
+            return
+        }
+        NSLayoutConstraint.activate([
+            dismissKeyboardButton.centerXAnchor.constraint(equalTo: window.centerXAnchor),
+            dismissKeyboardButton.bottomAnchor.constraint(equalTo: window.topAnchor, constant: kbFrame.origin.y - 12),
+        ])
+        UIView.animate(withDuration: 0.25) { self.dismissKeyboardButton.alpha = 1 }
+    }
+
+    @objc private func keyboardWillHide(_ notification: Notification) {
+        UIView.animate(withDuration: 0.2) { self.dismissKeyboardButton.alpha = 0 }
+    }
+
+    @objc private func dismissKeyboardTapped() {
+        view.endEditing(true)
+    }
+
+    deinit {
+        dismissKeyboardButton.removeFromSuperview()
+        NotificationCenter.default.removeObserver(self)
     }
 }

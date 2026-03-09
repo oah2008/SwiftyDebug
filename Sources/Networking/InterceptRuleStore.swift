@@ -83,14 +83,14 @@ class InterceptRuleStore {
         return (rules[matchEndpoint] ?? []).sorted { $0.order < $1.order }
     }
 
-    /// Returns `true` if at least one rule matches the given URL.
+    /// Returns `true` if at least one **enabled** rule matches the given URL.
     func hasRule(forURL url: URL) -> Bool {
-        return !matchingRules(forURL: url).isEmpty
+        return matchingRules(forURL: url).contains { $0.isEnabled }
     }
 
-    /// Returns `true` if at least one rule matches the given path (no host check).
+    /// Returns `true` if at least one **enabled** rule matches the given path (no host check).
     func hasRule(forPath path: String) -> Bool {
-        return !matchingRules(forPath: path).isEmpty
+        return matchingRules(forPath: path).contains { $0.isEnabled }
     }
 
     /// Merges all enabled matching rules for the URL into a single composite rule.
