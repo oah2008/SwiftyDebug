@@ -57,6 +57,9 @@ class NetworkViewController: UIViewController {
     private var followButton: UIButton!
     private static let followButtonSize: CGFloat = 40
 
+    private var isFirstAppear = true
+    private var isShowingDetail = false
+
     // Convenience
     private var isAutoFollowing: Bool {
         get { currentTabState.isAutoFollowing }
@@ -526,7 +529,7 @@ class NetworkViewController: UIViewController {
 
         applyFilter()
 
-        if isAutoFollowing {
+        if isAutoFollowing && !isShowingDetail {
             self.tableView.reloadData()
             self.tableView.layoutIfNeeded()
             DispatchQueue.main.async { [weak self] in
@@ -646,12 +649,20 @@ class NetworkViewController: UIViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        // Scroll to bottom after layout is fully applied (insets ready)
-        if isAutoFollowing {
-            let count = tableView.numberOfRows(inSection: 0)
-            guard count > 0 else { return }
-            let last = IndexPath(row: count - 1, section: 0)
-            tableView.scrollToRow(at: last, at: .bottom, animated: false)
+        if isShowingDetail {
+            // Returning from detail — don't scroll, just clear flag
+            isShowingDetail = false
+            return
+        }
+        // Only scroll to bottom on first appear
+        if isFirstAppear {
+            isFirstAppear = false
+            if isAutoFollowing {
+                let count = tableView.numberOfRows(inSection: 0)
+                guard count > 0 else { return }
+                let last = IndexPath(row: count - 1, section: 0)
+                tableView.scrollToRow(at: last, at: .bottom, animated: false)
+            }
         }
     }
 
@@ -1068,6 +1079,7 @@ extension NetworkViewController: UITableViewDelegate {
             vc.models = group.models
             vc.groupKey = group.key
             vc.isPathFilter = group.isPathFilter
+            isShowingDetail = true
             navigationController?.pushViewController(vc, animated: true)
         } else {
             reachEnd = false
@@ -1079,10 +1091,20 @@ extension NetworkViewController: UITableViewDelegate {
             let vc = NetworkDetailViewController()
             vc.httpModels = models
             vc.httpModel = models[indexPath.row]
+            isShowingDetail = true
             self.navigationController?.pushViewController(vc, animated: true)
 
             vc.justCancelCallback = { [weak self] in
-                self?.tableView.reloadData()
+                guard let self = self else { return }
+                self.isShowingDetail = false
+                let savedOffset = self.tableView.contentOffset
+                UIView.performWithoutAnimation {
+                    self.tableView.reloadData()
+                    self.tableView.layoutIfNeeded()
+                    if !self.isAutoFollowing {
+                        self.tableView.contentOffset = savedOffset
+                    }
+                }
             }
         }
     }
