@@ -229,6 +229,8 @@ class NetworkDetailCell: UITableViewCell {
         copyTrailingToCard = copyButton.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -12)
         copyTrailingToCard.priority = UILayoutPriority(999)
         copyTrailingToCard.isActive = true
+
+        forceLTR()
     }
 
     // MARK: - Reuse

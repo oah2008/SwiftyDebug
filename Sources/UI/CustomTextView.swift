@@ -12,11 +12,13 @@ class CustomTextView: UITextView {
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)
         self.inputView = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        semanticContentAttribute = .forceLeftToRight
     }
 
     required init(coder aDecoder: NSCoder) {
         super.init(coder: aDecoder)!
         self.inputView = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        semanticContentAttribute = .forceLeftToRight
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {

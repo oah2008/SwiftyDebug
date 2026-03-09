@@ -656,6 +656,7 @@ class NetworkViewController: UIViewController {
         setFollowButtonVisible(false, animated: false)
 
         reloadHttp()
+        view.forceLTR()
     }
 
     override func viewDidAppear(_ animated: Bool) {

@@ -43,5 +43,6 @@ class SwiftyDebugNavigationController: UINavigationController {
             navigationBar.standardAppearance = appearance
             navigationBar.scrollEdgeAppearance = appearance
         }
+        view.forceLTR()
     }
 }

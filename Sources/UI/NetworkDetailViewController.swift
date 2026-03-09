@@ -557,8 +557,9 @@ class NetworkDetailViewController: UITableViewController {
             }
             self.present(activity, animated: true)
         }
+        view.forceLTR()
     }
-    
+
     private var hasPerformedInitialReload = false
 
     override func viewDidLayoutSubviews() {
@@ -894,6 +895,7 @@ final class JSONViewerViewController: UIViewController, WKNavigationDelegate {
         ])
 
         webView.loadHTMLString(initialHTML, baseURL: nil)
+        view.forceLTR()
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -1016,6 +1018,7 @@ final class DemoJSONViewerHostController: UIViewController {
         // Render JSON passed as STRING
 
         viewer.render(jsonString: jsonString)
+        view.forceLTR()
     }
 }
 
@@ -1148,6 +1151,7 @@ final class CurlPreviewViewController: UIViewController {
             buttonsStack.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -12),
             buttonsStack.heightAnchor.constraint(equalToConstant: 36),
         ])
+        view.forceLTR()
     }
 
     @objc private func copyTapped() {

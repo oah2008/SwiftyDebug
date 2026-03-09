@@ -12,6 +12,7 @@ import UIKit
 private final class FilterSubtitleCell: UITableViewCell {
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: .subtitle, reuseIdentifier: reuseIdentifier)
+        forceLTR()
     }
     required init?(coder: NSCoder) { fatalError() }
 }
@@ -51,6 +52,7 @@ class NetworkFilterSheetController: UIViewController, UITableViewDataSource, UIT
         setupTopBar()
         setupTableView()
         refreshEndpoints()
+        view.forceLTR()
     }
 
     private func setupTopBar() {

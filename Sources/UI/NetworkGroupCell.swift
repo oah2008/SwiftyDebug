@@ -164,6 +164,8 @@ class NetworkGroupCell: UITableViewCell {
             mainStack.topAnchor.constraint(equalTo: cardView.topAnchor, constant: 10),
             mainStack.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -10),
         ])
+
+        forceLTR()
     }
 
     // MARK: - Configure

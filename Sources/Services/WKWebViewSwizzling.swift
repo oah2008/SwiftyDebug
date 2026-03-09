@@ -231,15 +231,6 @@ extension WKWebView {
     // MARK: - Swizzled init
 
     @objc func replaced_init(frame: CGRect, configuration: WKWebViewConfiguration) -> WKWebView {
-        // Log WKWebView init
-        LogEntryBuilder.handleLog(
-            file: "[WKWebView]",
-            function: "",
-            line: 0,
-            message: "----------------------------------- init -----------------------------------",
-            color: DebugTheme.accentColor,
-            type: .none
-        )
 
         let handler = WKWebViewScriptHandler()
 
@@ -257,14 +248,7 @@ extension WKWebView {
     // MARK: - Swizzled dealloc
 
     @objc func replaced_dealloc() {
-        LogEntryBuilder.handleLog(
-            file: "[WKWebView]",
-            function: "",
-            line: 0,
-            message: "-------------------------------- dealloc --------------------------------",
-            color: .red,
-            type: .none
-        )
+        
     }
 
     // MARK: - willDealloc (added dynamically)

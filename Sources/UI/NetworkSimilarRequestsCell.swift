@@ -107,6 +107,8 @@ final class NetworkSimilarRequestsCell: UITableViewCell {
             stackView.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
             stackView.heightAnchor.constraint(equalTo: scrollView.heightAnchor),
         ])
+
+        forceLTR()
     }
 
     // MARK: - Reuse
@@ -188,6 +190,7 @@ final class NetworkSimilarRequestsCell: UITableViewCell {
         card.isUserInteractionEnabled = true
         let tap = UITapGestureRecognizer(target: self, action: #selector(cardTapped(_:)))
         card.addGestureRecognizer(tap)
+        card.forceLTR()
 
         return card
     }

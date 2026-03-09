@@ -293,6 +293,7 @@ class LogViewController: UIViewController {
         if !isConsoleTab {
             rebuildDefaultEntries()
         }
+        view.forceLTR()
     }
 
     // MARK: - UI Setup

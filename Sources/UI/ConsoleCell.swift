@@ -91,6 +91,8 @@ class ConsoleCell: UITableViewCell {
             contentLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 1),
             contentLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -1),
         ])
+
+        forceLTR()
     }
 
     override func prepareForReuse() {

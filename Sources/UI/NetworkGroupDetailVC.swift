@@ -58,6 +58,7 @@ class NetworkGroupDetailVC: UIViewController {
         tableView.showsVerticalScrollIndicator = false
 
         applyFilter()
+        view.forceLTR()
 
         // Defer scroll to after layout
         DispatchQueue.main.async { [weak self] in

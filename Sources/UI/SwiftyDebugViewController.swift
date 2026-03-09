@@ -22,6 +22,7 @@ class SwiftyDebugViewController: UIViewController {
         bubble.center = Bubble.originalPosition
         bubble.delegate = self
         view.addSubview(bubble)
+        view.forceLTR()
     }
 
     func shouldReceive(point: CGPoint) -> Bool {

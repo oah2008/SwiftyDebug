@@ -58,6 +58,7 @@ class AppInfoViewController: UITableViewController {
         ) { [weak self] _ in
             self?.reloadURLs()
         }
+        view.forceLTR()
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -345,6 +346,8 @@ private class AppURLCell: UITableViewCell {
             urlLabel.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -12),
             urlLabel.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -8),
         ])
+
+        forceLTR()
     }
 
     private func configurePill(_ label: URLPaddedLabel) {

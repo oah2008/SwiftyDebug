@@ -71,6 +71,7 @@ class Bubble: UIView {
     // MARK: - Setup
 
     private func setupAppearance() {
+        semanticContentAttribute = .forceLeftToRight
         backgroundColor = .black
         layer.cornerRadius = Self.bubbleSize / 2
 

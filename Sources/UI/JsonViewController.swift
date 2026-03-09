@@ -294,6 +294,7 @@ class JsonViewController: UIViewController {
         naviItemTitleLabel?.font = .boldSystemFont(ofSize: 20)
         naviItemTitleLabel?.text = detailModel?.title
         navigationItem.titleView = naviItemTitleLabel
+        view.forceLTR()
         
         textView.textContainer.lineFragmentPadding = 15
 
