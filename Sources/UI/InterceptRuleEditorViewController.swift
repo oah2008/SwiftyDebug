@@ -329,7 +329,6 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     @objc private func selectHostsTapped() {
         let picker = HostPickerSheetViewController()
-        picker.hosts = availableHosts
         picker.selectedHosts = Set(selectedHosts)
         picker.onApply = { [weak self] applied in
             guard let self = self else { return }

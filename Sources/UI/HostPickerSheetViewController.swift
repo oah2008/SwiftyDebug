@@ -7,21 +7,20 @@
 
 import UIKit
 
-/// Sheet-presented multi-select host picker styled like the network filter sheet.
-/// Groups hosts by their tag — selecting a tag selects all hosts under it.
+/// Sheet-presented multi-select host picker styled exactly like the network filter sheet.
+/// Builds entries from `SwiftyDebug.urls`, strips scheme, groups by tag, shows full URL as subtitle.
+/// Selecting a tagged group selects all hosts under it.
 class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
 
-    /// Raw list of available hosts.
-    var hosts: [String] = []
-    /// Currently selected hosts.
+    /// Currently selected hosts (lowercased).
     var selectedHosts: Set<String> = []
     var onApply: (([String]) -> Void)?
 
-    /// An entry in the picker — may represent a single host or a group with a tag.
+    /// An entry in the picker — mirrors the filter sheet's structure.
     private struct Entry {
-        let display: String
-        let subtitle: String?
-        let hosts: [String]
+        let display: String       // Tag label (or stripped URL if no tag)
+        let subtitle: String?     // First stripped URL (shown as detail text)
+        let hosts: [String]       // All unique hosts covered by this entry
     }
 
     private var entries: [Entry] = []
@@ -43,62 +42,104 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         view.forceLTR()
     }
 
-    // MARK: - Build grouped entries
+    // MARK: - Build entries (same pattern as filter sheet)
 
     private func buildEntries() {
-        let tags = SwiftyDebug._tags
-        var grouped: [(tag: String, hosts: [String])] = []
-        var tagOrder: [String] = []
-        var tagMap: [String: [String]] = [:]
-        var assignedHosts = Set<String>()
+        let onlyURLs = SwiftyDebug.urls
 
-        // Group hosts by matching tag keyword
-        for host in hosts {
-            var matched = false
-            for (keyword, label) in tags {
-                if host.contains(keyword.lowercased()) {
-                    let key = label.lowercased()
-                    if tagMap[key] == nil {
-                        tagOrder.append(label)
-                        tagMap[key] = []
-                    }
-                    tagMap[key]!.append(host)
-                    assignedHosts.insert(host)
-                    matched = true
-                    break
-                }
-            }
-            if !matched {
-                // No tag — standalone entry
-            }
+        // Raw entries: (display = tag or stripped URL, strippedURL, host)
+        struct RawEntry {
+            let display: String
+            let strippedURL: String
+            let host: String
         }
 
-        // Tagged groups first
-        for label in tagOrder {
-            let groupHosts = tagMap[label.lowercased()] ?? []
-            if !groupHosts.isEmpty {
-                grouped.append((tag: label, hosts: groupHosts))
-            }
+        var rawEntries: [RawEntry] = []
+        var coveredHosts = Set<String>()
+
+        for urlString in onlyURLs {
+            var stripped = stripScheme(urlString)
+            if stripped.hasSuffix("/") { stripped = String(stripped.dropLast()) }
+
+            let host = stripped.components(separatedBy: "/").first ?? stripped
+            let lowerHost = host.lowercased()
+
+            let display = tagLabel(forURLString: urlString) ?? stripped
+            rawEntries.append(RawEntry(display: display, strippedURL: stripped, host: lowerHost))
+            coveredHosts.insert(lowerHost)
         }
 
-        // Then ungrouped hosts
-        for host in hosts where !assignedHosts.contains(host) {
-            grouped.append((tag: host, hosts: [host]))
+        // Also include hosts from captured network traffic that aren't covered by SDK URLs
+        let models = NetworkRequestStore.shared.httpModels as? [NetworkTransaction] ?? []
+        var seenTrafficHosts = Set<String>()
+        for model in models {
+            guard let host = model.url?.host?.lowercased(), !host.isEmpty else { continue }
+            if coveredHosts.contains(host) || seenTrafficHosts.contains(host) { continue }
+            seenTrafficHosts.insert(host)
+
+            let display = tagLabel(forHost: host) ?? host
+            rawEntries.append(RawEntry(display: display, strippedURL: host, host: host))
         }
 
-        entries = grouped.map { group in
-            if group.hosts.count == 1 && group.tag == group.hosts[0] {
-                // Single ungrouped host
-                return Entry(display: group.tag, subtitle: nil, hosts: group.hosts)
-            } else {
-                // Tagged group
-                return Entry(
-                    display: group.tag,
-                    subtitle: group.hosts.joined(separator: ", "),
-                    hosts: group.hosts
-                )
+        // Sort alphabetically by display
+        let sorted = rawEntries.sorted { $0.display.lowercased() < $1.display.lowercased() }
+
+        // Merge by display label (same tag → one row, like filter sheet)
+        var displayOrder: [String] = []
+        var mergedMap: [String: (strippedURLs: [String], hosts: Set<String>)] = [:]
+
+        for entry in sorted {
+            let key = entry.display.lowercased()
+            if mergedMap[key] == nil {
+                displayOrder.append(entry.display)
+                mergedMap[key] = (strippedURLs: [], hosts: [])
+            }
+            mergedMap[key]!.strippedURLs.append(entry.strippedURL)
+            mergedMap[key]!.hosts.insert(entry.host)
+        }
+
+        entries = displayOrder.map { display in
+            let info = mergedMap[display.lowercased()]!
+            let subtitle = info.strippedURLs.first
+            // If display == subtitle, no need to show subtitle
+            let showSubtitle = (subtitle != nil && subtitle!.lowercased() != display.lowercased()) ? subtitle : nil
+            return Entry(
+                display: display,
+                subtitle: showSubtitle ?? (info.strippedURLs.count > 1 ? info.strippedURLs.joined(separator: ", ") : nil),
+                hosts: Array(info.hosts).sorted()
+            )
+        }
+    }
+
+    private func stripScheme(_ url: String) -> String {
+        var result = url
+        for prefix in ["https://", "http://", "HTTPS://", "HTTP://"] {
+            if result.hasPrefix(prefix) {
+                result = String(result.dropFirst(prefix.count))
+                break
             }
         }
+        return result
+    }
+
+    private func tagLabel(forURLString urlString: String) -> String? {
+        let map = SwiftyDebug._tags
+        guard !map.isEmpty else { return nil }
+        let lower = urlString.lowercased()
+        if let label = map[urlString] { return label }
+        for (keyword, label) in map where lower.contains(keyword.lowercased()) {
+            return label
+        }
+        return nil
+    }
+
+    private func tagLabel(forHost host: String) -> String? {
+        let map = SwiftyDebug._tags
+        guard !map.isEmpty else { return nil }
+        for (keyword, label) in map where host.contains(keyword.lowercased()) {
+            return label
+        }
+        return nil
     }
 
     // MARK: - UI Setup
@@ -179,8 +220,7 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
     }
 
     @objc private func didTapApply() {
-        // Return selected hosts preserving original order
-        let result = hosts.filter { selectedHosts.contains($0) }
+        let result = Array(selectedHosts).sorted()
         onApply?(result)
         dismiss(animated: true)
     }
@@ -207,10 +247,8 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         let allSelected = entry.hosts.allSatisfy { selectedHosts.contains($0) }
 
         if allSelected {
-            // Deselect all hosts in this group
             for host in entry.hosts { selectedHosts.remove(host) }
         } else {
-            // Select all hosts in this group
             for host in entry.hosts { selectedHosts.insert(host) }
         }
         tableView.reloadRows(at: [indexPath], with: .none)

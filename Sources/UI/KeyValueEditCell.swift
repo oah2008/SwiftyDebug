@@ -49,7 +49,7 @@ class KeyValueEditCell: UITableViewCell {
         contentView.addSubview(dropButton)
 
         keyField.translatesAutoresizingMaskIntoConstraints = false
-        keyField.font = UIFont(name: "Menlo", size: 12) ?? .monospacedSystemFont(ofSize: 12, weight: .regular)
+        keyField.font = UIFont(name: "Menlo", size: 13) ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
         keyField.textColor = UIColor(red: 0.30, green: 0.78, blue: 0.72, alpha: 1) // teal for keys
         keyField.attributedPlaceholder = NSAttributedString(
             string: "key",
@@ -66,7 +66,7 @@ class KeyValueEditCell: UITableViewCell {
         contentView.addSubview(separator)
 
         valueField.translatesAutoresizingMaskIntoConstraints = false
-        valueField.font = UIFont(name: "Menlo", size: 12) ?? .monospacedSystemFont(ofSize: 12, weight: .regular)
+        valueField.font = UIFont(name: "Menlo", size: 13) ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
         valueField.textColor = UIColor(white: 0.85, alpha: 1)
         valueField.attributedPlaceholder = NSAttributedString(
             string: "value",
@@ -85,19 +85,20 @@ class KeyValueEditCell: UITableViewCell {
             dropButton.heightAnchor.constraint(equalToConstant: 28),
 
             keyField.leadingAnchor.constraint(equalTo: dropButton.trailingAnchor, constant: 4),
-            keyField.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
-            keyField.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -8),
+            keyField.leadingAnchor.constraint(equalTo: dropButton.trailingAnchor, constant: 4),
+            keyField.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 18),
+            keyField.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18),
             keyField.widthAnchor.constraint(equalTo: contentView.widthAnchor, multiplier: 0.30),
 
             separator.leadingAnchor.constraint(equalTo: keyField.trailingAnchor, constant: 6),
             separator.widthAnchor.constraint(equalToConstant: 1),
-            separator.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 6),
-            separator.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -6),
+            separator.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
+            separator.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12),
 
             valueField.leadingAnchor.constraint(equalTo: separator.trailingAnchor, constant: 6),
             valueField.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
-            valueField.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
-            valueField.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -8),
+            valueField.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 18),
+            valueField.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18),
         ])
 
         updateDropAppearance()
