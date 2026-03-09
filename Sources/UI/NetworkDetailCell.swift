@@ -106,11 +106,15 @@ class NetworkDetailCell: UITableViewCell {
         previewButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         previewButton.layer.cornerRadius = 6
         previewButton.clipsToBounds = true
-        previewButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
-        previewButton.setTitleColor(Self.tealTitle, for: .normal)
         var previewBtnConfig = UIButton.Configuration.plain()
         previewBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
         previewBtnConfig.imagePadding = 3
+        previewBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 7, weight: .bold)
+            return attr
+        }
+        previewBtnConfig.baseForegroundColor = Self.tealTitle
         previewButton.configuration = previewBtnConfig
         previewButton.addTarget(self, action: #selector(tapPreview), for: .touchUpInside)
 
@@ -139,11 +143,15 @@ class NetworkDetailCell: UITableViewCell {
         showFullButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         showFullButton.layer.cornerRadius = 6
         showFullButton.clipsToBounds = true
-        showFullButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
-        showFullButton.setTitleColor(Self.tealTitle, for: .normal)
         var showFullBtnConfig = UIButton.Configuration.plain()
         showFullBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
         showFullBtnConfig.imagePadding = 4
+        showFullBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 7, weight: .bold)
+            return attr
+        }
+        showFullBtnConfig.baseForegroundColor = Self.tealTitle
         showFullButton.configuration = showFullBtnConfig
         showFullButton.addTarget(self, action: #selector(tapPreview), for: .touchUpInside)
 
@@ -313,6 +321,7 @@ class NetworkDetailCell: UITableViewCell {
                     let truncated = String(content.prefix(Self.truncateLength)) + "\n..."
                     contentTextView.attributedText = isCurl ? Self.highlightCurl(truncated) : Self.highlightJSON(truncated)
                     contentTextView.textAlignment = .natural
+                    showFullButton.setTitle(isCurl ? "Show Full cURL" : "Show Full Response", for: .normal)
                     showFullButton.isHidden = false
                 } else {
                     // Normal content: full syntax highlighting

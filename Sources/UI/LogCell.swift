@@ -197,11 +197,15 @@ class LogCell: UITableViewCell {
         showFullButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
         showFullButton.layer.cornerRadius = 6
         showFullButton.clipsToBounds = true
-        showFullButton.titleLabel?.font = .systemFont(ofSize: 7, weight: .bold)
-        showFullButton.setTitleColor(Self.tealColor, for: .normal)
         var showFullConfig = UIButton.Configuration.plain()
         showFullConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
         showFullConfig.imagePadding = 4
+        showFullConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 7, weight: .bold)
+            return attr
+        }
+        showFullConfig.baseForegroundColor = Self.tealColor
         showFullButton.configuration = showFullConfig
 
         let showFullCfg = UIImage.SymbolConfiguration(pointSize: 6, weight: .semibold)

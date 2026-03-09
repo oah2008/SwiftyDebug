@@ -1117,12 +1117,16 @@ class LogViewController: UIViewController {
         let count = range.count
         let btn = UIButton(type: .system)
         btn.setTitle("Copy \(count) line\(count == 1 ? "" : "s")", for: .normal)
-        btn.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
         btn.backgroundColor = UIColor.systemBlue
-        btn.setTitleColor(.white, for: .normal)
         btn.layer.cornerRadius = 16
         var btnConfig = UIButton.Configuration.plain()
         btnConfig.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16)
+        btnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 13, weight: .semibold)
+            return attr
+        }
+        btnConfig.baseForegroundColor = .white
         btn.configuration = btnConfig
         btn.addTarget(self, action: #selector(copySelectionTapped), for: .touchUpInside)
         btn.sizeToFit()
