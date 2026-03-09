@@ -7,14 +7,19 @@
 
 import UIKit
 
-/// Modal editor for creating/editing intercept rules.
+/// Editor for creating or editing a single intercept rule.
 /// Headers and query params start empty. The user taps "Add" to pick from the original request
 /// values or add a custom entry. Each item can be edited or toggled to "drop" (remove from request).
+///
+/// When pushed from `InterceptRuleListViewController`, set `existingRuleId` to edit that rule.
+/// When presented directly (no existing rules), it creates a new rule.
 class InterceptRuleEditorViewController: UITableViewController {
 
     // MARK: - Input
 
     var httpModel: NetworkTransaction?
+    /// Set to a rule ID to edit an existing rule. Leave nil to create a new one.
+    var existingRuleId: String?
 
     // MARK: - Sections
 
@@ -27,12 +32,10 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     // MARK: - Item state
 
-    /// Represents a header or query param entry in the editor.
     private struct EditItem {
         var key: String
         var value: String
         var isDropped: Bool
-        /// Whether the key field is editable (false for items picked from the original request).
         var isKeyEditable: Bool
     }
 
@@ -45,28 +48,35 @@ class InterceptRuleEditorViewController: UITableViewController {
     private var queryParamItems: [EditItem] = []
     private var existingRule: InterceptRule?
 
-    /// Original request headers for the picker (key → value).
     private var originalHeaders: [(key: String, value: String)] = []
-    /// Original request query params for the picker (key → value).
     private var originalQueryParams: [(key: String, value: String)] = []
+
+    /// Whether this editor was presented modally (no rules existed) vs pushed from the list.
+    private var isPresentedModally: Bool {
+        return navigationController?.viewControllers.first === self
+    }
 
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        title = "Intercept Rule"
+        title = existingRuleId != nil ? "Edit Rule" : "New Rule"
         view.backgroundColor = .black
 
-        navigationItem.leftBarButtonItem = UIBarButtonItem(
-            barButtonSystemItem: .cancel, target: self, action: #selector(cancelTapped)
-        )
         let saveItem = UIBarButtonItem(
             barButtonSystemItem: .save, target: self, action: #selector(saveTapped)
         )
         saveItem.tintColor = DebugTheme.accentColor
         navigationItem.rightBarButtonItem = saveItem
-        navigationItem.leftBarButtonItem?.tintColor = UIColor(white: 0.7, alpha: 1)
+
+        // Show cancel only when presented modally
+        if isPresentedModally {
+            navigationItem.leftBarButtonItem = UIBarButtonItem(
+                barButtonSystemItem: .cancel, target: self, action: #selector(cancelTapped)
+            )
+            navigationItem.leftBarButtonItem?.tintColor = UIColor(white: 0.7, alpha: 1)
+        }
 
         let dynamicTable = UITableView(frame: .zero, style: .grouped)
         dynamicTable.dataSource = self
@@ -101,17 +111,18 @@ class InterceptRuleEditorViewController: UITableViewController {
             originalQueryParams = items.map { (key: $0.name, value: $0.value ?? "") }
         }
 
-        // Check for existing rule
-        existingRule = InterceptRuleStore.shared.rule(for: normalizedEndpoint)
+        // Load existing rule by ID if editing
+        if let ruleId = existingRuleId {
+            existingRule = InterceptRuleStore.shared.rules(for: normalizedEndpoint)
+                .first(where: { $0.id == ruleId })
+        }
 
         if let rule = existingRule {
             isBlocked = rule.isBlocked
 
-            // Restore overrides as active items
             headerItems = rule.headerOverrides.map {
                 EditItem(key: $0.key, value: $0.value, isDropped: false, isKeyEditable: false)
             }
-            // Restore removed keys as dropped items (use original value if available)
             for removedKey in rule.removedHeaderKeys.sorted() {
                 let originalValue = originalHeaders.first(where: { $0.key.lowercased() == removedKey.lowercased() })?.value ?? ""
                 headerItems.append(EditItem(key: removedKey, value: originalValue, isDropped: true, isKeyEditable: false))
@@ -142,12 +153,10 @@ class InterceptRuleEditorViewController: UITableViewController {
         rule.isBlocked = isBlocked
         rule.isEnabled = true
 
-        // Active (non-dropped) items with non-empty keys → overrides
         rule.headerOverrides = headerItems
             .filter { !$0.isDropped && !$0.key.isEmpty }
             .map { KVPair(key: $0.key, value: $0.value) }
 
-        // Dropped items → removed keys
         rule.removedHeaderKeys = Set(
             headerItems.filter { $0.isDropped && !$0.key.isEmpty }.map { $0.key.lowercased() }
         )
@@ -161,7 +170,12 @@ class InterceptRuleEditorViewController: UITableViewController {
         )
 
         InterceptRuleStore.shared.addOrUpdate(rule)
-        dismiss(animated: true)
+
+        if isPresentedModally {
+            dismiss(animated: true)
+        } else {
+            navigationController?.popViewController(animated: true)
+        }
     }
 
     @objc private func blockToggleChanged(_ sender: UISwitch) {
@@ -170,8 +184,14 @@ class InterceptRuleEditorViewController: UITableViewController {
     }
 
     @objc private func removeRuleTapped() {
-        InterceptRuleStore.shared.remove(normalizedEndpoint: normalizedEndpoint)
-        dismiss(animated: true)
+        if let ruleId = existingRule?.id {
+            InterceptRuleStore.shared.remove(id: ruleId)
+        }
+        if isPresentedModally {
+            dismiss(animated: true)
+        } else {
+            navigationController?.popViewController(animated: true)
+        }
     }
 
     // MARK: - Add picker
@@ -229,11 +249,9 @@ class InterceptRuleEditorViewController: UITableViewController {
     ) {
         let alert = UIAlertController(title: title, message: nil, preferredStyle: .actionSheet)
 
-        // Show original items not yet added
         let available = originalItems.filter { item in
             let k = caseInsensitive ? item.key.lowercased() : item.key
-            let keys = caseInsensitive ? existingKeys : existingKeys
-            return !keys.contains(k)
+            return !existingKeys.contains(k)
         }
 
         for item in available {
@@ -243,7 +261,6 @@ class InterceptRuleEditorViewController: UITableViewController {
             })
         }
 
-        // "Add Custom" option
         alert.addAction(UIAlertAction(title: "Add Custom", style: .default) { _ in
             completion(EditItem(key: "", value: "", isDropped: false, isKeyEditable: true))
         })
@@ -260,7 +277,6 @@ class InterceptRuleEditorViewController: UITableViewController {
     }
 
     private func reloadSectionHeader(_ section: Section) {
-        // Reload just the section header to update the count
         if let headerView = tableView.headerView(forSection: section.rawValue) {
             if let label = headerView.viewWithTag(100) as? UILabel {
                 let count: Int
@@ -393,8 +409,6 @@ class InterceptRuleEditorViewController: UITableViewController {
         guard let sec = Section(rawValue: section) else { return nil }
 
         let isKVSection = (sec == .headers || sec == .queryParams)
-
-        // Hide headers/queryParams sections when blocked
         if isKVSection && isBlocked { return nil }
 
         let header = UIView()
@@ -420,7 +434,6 @@ class InterceptRuleEditorViewController: UITableViewController {
             label.centerYAnchor.constraint(equalTo: header.centerYAnchor),
         ])
 
-        // Add button for headers and queryParams sections
         if isKVSection {
             let addButton = UIButton(type: .system)
             addButton.translatesAutoresizingMaskIntoConstraints = false
@@ -468,13 +481,8 @@ class InterceptRuleEditorViewController: UITableViewController {
         }
     }
 
-    override func tableView(_ tableView: UITableView, viewForFooterInSection section: Int) -> UIView? {
-        return nil
-    }
-
-    override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat {
-        return 0
-    }
+    override func tableView(_ tableView: UITableView, viewForFooterInSection section: Int) -> UIView? { nil }
+    override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat { 0 }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)

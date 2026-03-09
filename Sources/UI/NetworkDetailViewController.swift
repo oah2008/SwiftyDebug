@@ -561,10 +561,23 @@ class NetworkDetailViewController: UITableViewController {
         headerCell?.showInterceptButton = true
         headerCell?.onInterceptTapped = { [weak self] in
             guard let self = self, let model = self.httpModel else { return }
-            let editor = InterceptRuleEditorViewController()
-            editor.httpModel = model
-            let nav = SwiftyDebugNavigationController(rootViewController: editor)
-            self.present(nav, animated: true)
+            let normalized = EndpointNormalizer.normalize(model.url?.path ?? "")
+            let existingRules = InterceptRuleStore.shared.rules(for: normalized)
+
+            if existingRules.isEmpty {
+                // No rules yet — go directly to the editor to create one
+                let editor = InterceptRuleEditorViewController()
+                editor.httpModel = model
+                let nav = SwiftyDebugNavigationController(rootViewController: editor)
+                self.present(nav, animated: true)
+            } else {
+                // Rules exist — show the rule list manager
+                let list = InterceptRuleListViewController()
+                list.httpModel = model
+                list.normalizedEndpoint = normalized
+                let nav = SwiftyDebugNavigationController(rootViewController: list)
+                self.present(nav, animated: true)
+            }
         }
         view.forceLTR()
     }
