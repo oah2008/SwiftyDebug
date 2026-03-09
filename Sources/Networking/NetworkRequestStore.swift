@@ -71,6 +71,21 @@ class NetworkRequestStore: NSObject {
         }
     }
 
+    func clearPinned() {
+        objc_sync_enter(self)
+        defer { objc_sync_exit(self) }
+
+        NetworkTransaction.clearPinnedDiskCache()
+
+        // Remove pinned models from memory
+        let pinned = httpModels.compactMap { $0 as? NetworkTransaction }.filter { $0.isPinned }
+        for model in pinned {
+            httpModels.remove(model)
+        }
+
+        NotificationCenter.default.post(name: .allLogsCleared, object: nil)
+    }
+
     func remove(_ model: NetworkTransaction) {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }

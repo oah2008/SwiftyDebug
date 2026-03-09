@@ -105,11 +105,17 @@ class NetworkViewController: UIViewController {
     private func buildFilterEntries() -> [(display: String, filterKeys: [(key: String, isPathFilter: Bool)], isWeb: Bool)] {
         guard let allCacheModels = cacheModels, !allCacheModels.isEmpty else { return [] }
 
-        // Filter by current tab first
+        // Filter by current tab first (respecting settings toggles)
         let allModels: [NetworkTransaction]
         switch currentTab {
-        case .app: allModels = allCacheModels.filter { !$0.isWebViewRequest }
-        case .web: allModels = allCacheModels.filter { $0.isWebViewRequest }
+        case .app:
+            allModels = Settings.shared.networkRequestsEnabled
+                ? allCacheModels.filter { !$0.isWebViewRequest }
+                : []
+        case .web:
+            allModels = Settings.shared.webNetworkRequestsEnabled
+                ? allCacheModels.filter { $0.isWebViewRequest }
+                : []
         case .pinned: allModels = allCacheModels.filter { $0.isPinned }
         }
         guard !allModels.isEmpty else { return [] }
@@ -211,11 +217,17 @@ class NetworkViewController: UIViewController {
 
     private func uniqueEndpointsForFilters(pathFilters: Set<String>, hostFilters: Set<String>) -> [FilterableEndpoint] {
         guard let allCache = cacheModels else { return [] }
-        // Filter by current tab
+        // Filter by current tab (respecting settings toggles)
         let models: [NetworkTransaction]
         switch currentTab {
-        case .app: models = allCache.filter { !$0.isWebViewRequest }
-        case .web: models = allCache.filter { $0.isWebViewRequest }
+        case .app:
+            models = Settings.shared.networkRequestsEnabled
+                ? allCache.filter { !$0.isWebViewRequest }
+                : []
+        case .web:
+            models = Settings.shared.webNetworkRequestsEnabled
+                ? allCache.filter { $0.isWebViewRequest }
+                : []
         case .pinned: models = allCache.filter { $0.isPinned }
         }
         if pathFilters.isEmpty && hostFilters.isEmpty { return [] }
@@ -362,11 +374,17 @@ class NetworkViewController: UIViewController {
 
         let state = currentTabState
 
-        // 1. Tab segment filter
+        // 1. Tab segment filter (respecting settings toggles)
         var filtered: [NetworkTransaction]
         switch currentTab {
-        case .app: filtered = cacheModels.filter { !$0.isWebViewRequest }
-        case .web: filtered = cacheModels.filter { $0.isWebViewRequest }
+        case .app:
+            filtered = Settings.shared.networkRequestsEnabled
+                ? cacheModels.filter { !$0.isWebViewRequest }
+                : []
+        case .web:
+            filtered = Settings.shared.webNetworkRequestsEnabled
+                ? cacheModels.filter { $0.isWebViewRequest }
+                : []
         case .pinned: filtered = cacheModels.filter { $0.isPinned }
         }
 

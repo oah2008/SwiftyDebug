@@ -16,7 +16,11 @@ extension SwiftyDebug {
 
         _ = LogStore.shared
 
-        PrintInterceptor.shared.enable = SwiftyDebug.enableConsoleLog
+        // Apply persisted toggle states
+        let settings = Settings.shared
+        SwiftyDebug.monitorAllUrls = settings.monitorAllRequests
+        SwiftyDebug.monitorMedia = settings.monitorMediaEnabled
+        PrintInterceptor.shared.enable = SwiftyDebug.enableConsoleLog && settings.consoleLogsEnabled
 
         NSLogHook.enableIfNeeded()
         WKWebViewSwizzling.enableIfNeeded()

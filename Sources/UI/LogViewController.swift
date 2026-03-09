@@ -681,7 +681,13 @@ class LogViewController: UIViewController {
         guard let totalCount = note.userInfo?["totalCount"] as? Int else { return }
 
         guard isConsoleTab else {
-            consoleTotalCount = totalCount
+            consoleTotalCount = Settings.shared.consoleLogsEnabled ? totalCount : 0
+            return
+        }
+
+        guard Settings.shared.consoleLogsEnabled else {
+            consoleTotalCount = 0
+            consoleTableView.reloadData()
             return
         }
 
@@ -717,7 +723,7 @@ class LogViewController: UIViewController {
         entryCache.removeAllObjects()
         highlightQueue.cancelAllOperations()
 
-        consoleTotalCount = consoleDB.cachedTotalCount
+        consoleTotalCount = Settings.shared.consoleLogsEnabled ? consoleDB.cachedTotalCount : 0
 
         let search = (currentSearchWord ?? "").lowercased()
         if search.isEmpty {
@@ -948,12 +954,23 @@ class LogViewController: UIViewController {
 
     /// Handle new log entries from LogModelDB (called via refreshLogs notification)
     private func handleDefaultLogUpdate() {
-        let source = selectedSource.rawValue
+        let source = selectedSource
+        // Respect web logs toggle
+        if source == .web && !Settings.shared.webLogsEnabled {
+            if defaultTotalCount != 0 {
+                defaultTotalCount = 0
+                defaultEntryCache.removeAllObjects()
+                defaultTableView.reloadData()
+            }
+            return
+        }
+
+        let sourceRaw = source.rawValue
         let newCount: Int
         if let query = defaultSearchQuery {
-            newCount = logModelDB.searchCount(source: source, query: query)
+            newCount = logModelDB.searchCount(source: sourceRaw, query: query)
         } else {
-            newCount = logModelDB.cachedCount[source] ?? logModelDB.readCount(source: source)
+            newCount = logModelDB.cachedCount[sourceRaw] ?? logModelDB.readCount(source: sourceRaw)
         }
 
         let previousCount = defaultTotalCount
@@ -986,14 +1003,21 @@ class LogViewController: UIViewController {
     private func rebuildDefaultEntries() {
         defaultEntryCache.removeAllObjects()
 
-        let source = selectedSource.rawValue
+        let source = selectedSource
+        // Respect web logs toggle
+        let isDisabled = (source == .web && !Settings.shared.webLogsEnabled)
+
+        let sourceRaw = source.rawValue
         let search = (currentSearchWord ?? "").lowercased()
-        if search.isEmpty {
+        if isDisabled {
             defaultSearchQuery = nil
-            defaultTotalCount = logModelDB.cachedCount[source] ?? logModelDB.readCount(source: source)
+            defaultTotalCount = 0
+        } else if search.isEmpty {
+            defaultSearchQuery = nil
+            defaultTotalCount = logModelDB.cachedCount[sourceRaw] ?? logModelDB.readCount(source: sourceRaw)
         } else {
             defaultSearchQuery = search
-            defaultTotalCount = logModelDB.searchCount(source: source, query: search)
+            defaultTotalCount = logModelDB.searchCount(source: sourceRaw, query: search)
         }
 
         defaultTableView.reloadData()

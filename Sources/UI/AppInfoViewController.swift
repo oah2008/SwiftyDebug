@@ -9,6 +9,43 @@ import UIKit
 
 class AppInfoViewController: UITableViewController {
 
+    // MARK: - Sections
+
+    private enum Section: Int, CaseIterable {
+        case settings = 0
+        case actions = 1
+        case urls = 2
+    }
+
+    // MARK: - Toggle definitions
+
+    private struct ToggleItem {
+        let title: String
+        let subtitle: String
+        let keyPath: ReferenceWritableKeyPath<Settings, Bool>
+    }
+
+    private let toggles: [ToggleItem] = [
+        ToggleItem(title: "Network Requests",
+                   subtitle: "Capture native app network requests",
+                   keyPath: \.networkRequestsEnabled),
+        ToggleItem(title: "Web Network Requests",
+                   subtitle: "Capture WKWebView network requests",
+                   keyPath: \.webNetworkRequestsEnabled),
+        ToggleItem(title: "Console Logs",
+                   subtitle: "Capture console & print logs",
+                   keyPath: \.consoleLogsEnabled),
+        ToggleItem(title: "Web Logs",
+                   subtitle: "Capture WKWebView console logs",
+                   keyPath: \.webLogsEnabled),
+        ToggleItem(title: "Monitor All Requests",
+                   subtitle: "Intercept all network traffic, not just monitored URLs",
+                   keyPath: \.monitorAllRequests),
+        ToggleItem(title: "Monitor Media",
+                   subtitle: "Intercept images, video, audio & font requests",
+                   keyPath: \.monitorMediaEnabled),
+    ]
+
     // MARK: - Data
 
     /// Unique captured URLs with tag info
@@ -163,33 +200,103 @@ class AppInfoViewController: UITableViewController {
         return short
     }
 
+    // MARK: - Toggle actions
+
+    @objc private func toggleChanged(_ sender: UISwitch) {
+        let toggle = toggles[sender.tag]
+        Settings.shared[keyPath: toggle.keyPath] = sender.isOn
+    }
+
+    private func clearPinnedRequests() {
+        let alert = UIAlertController(
+            title: "Clear Pinned Requests",
+            message: "This will remove all pinned network requests from disk. This cannot be undone.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { _ in
+            NetworkRequestStore.shared.clearPinned()
+        })
+        present(alert, animated: true)
+    }
+
     // MARK: - UITableViewDataSource
 
     override func numberOfSections(in tableView: UITableView) -> Int {
-        return 1
+        return Section.allCases.count
     }
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        return capturedURLs.count
+        switch Section(rawValue: section)! {
+        case .settings: return toggles.count
+        case .actions:  return 1
+        case .urls:     return capturedURLs.count
+        }
     }
 
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "AppURLCell", for: indexPath) as! AppURLCell
-        if indexPath.row < capturedURLs.count {
-            cell.configure(item: capturedURLs[indexPath.row])
+        switch Section(rawValue: indexPath.section)! {
+        case .settings:
+            let toggle = toggles[indexPath.row]
+            let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "SettingsToggleCell")
+            cell.selectionStyle = .none
+            cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+            cell.textLabel?.text = toggle.title
+            cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+            cell.textLabel?.textColor = .white
+            cell.detailTextLabel?.text = toggle.subtitle
+            cell.detailTextLabel?.font = .systemFont(ofSize: 11)
+            cell.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
+            cell.detailTextLabel?.numberOfLines = 2
+
+            let sw = UISwitch()
+            sw.isOn = Settings.shared[keyPath: toggle.keyPath]
+            sw.onTintColor = DebugTheme.accentColor
+            sw.tag = indexPath.row
+            sw.addTarget(self, action: #selector(toggleChanged(_:)), for: .valueChanged)
+            cell.accessoryView = sw
+            cell.forceLTR()
+            return cell
+
+        case .actions:
+            let cell = UITableViewCell(style: .default, reuseIdentifier: "ActionCell")
+            cell.selectionStyle = .default
+            cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+            cell.textLabel?.text = "Clear Pinned Requests"
+            cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+            cell.textLabel?.textColor = .systemRed
+            cell.textLabel?.textAlignment = .center
+            cell.forceLTR()
+            return cell
+
+        case .urls:
+            let cell = tableView.dequeueReusableCell(withIdentifier: "AppURLCell", for: indexPath) as! AppURLCell
+            if indexPath.row < capturedURLs.count {
+                cell.configure(item: capturedURLs[indexPath.row])
+            }
+            return cell
         }
-        return cell
     }
 
     // MARK: - UITableViewDelegate
 
     override func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
+        let title: String?
+        switch Section(rawValue: section)! {
+        case .settings: title = "SETTINGS"
+        case .actions:  title = "ACTIONS"
+        case .urls:     title = capturedURLs.isEmpty ? nil : "MONITORED URLS (\(capturedURLs.count))"
+        }
+
+        guard let title = title else { return nil }
+
         let header = UIView()
         header.backgroundColor = .clear
 
         let label = UILabel()
         label.font = .systemFont(ofSize: 13, weight: .bold)
         label.textColor = DebugTheme.accentColor
+        label.text = title
         label.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(label)
 
@@ -199,13 +306,15 @@ class AppInfoViewController: UITableViewController {
             label.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -4),
         ])
 
-        label.text = "MONITORED URLS (\(capturedURLs.count))"
-
         return header
     }
 
     override func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
-        return capturedURLs.isEmpty ? 0 : 40
+        switch Section(rawValue: section)! {
+        case .settings: return 40
+        case .actions:  return 40
+        case .urls:     return capturedURLs.isEmpty ? 0 : 40
+        }
     }
 
     override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat {
@@ -227,18 +336,23 @@ class AppInfoViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
 
-        // Copy value to clipboard on tap
-        guard indexPath.row < capturedURLs.count else { return }
-        let text = capturedURLs[indexPath.row].url
+        switch Section(rawValue: indexPath.section)! {
+        case .settings:
+            break
+        case .actions:
+            clearPinnedRequests()
+        case .urls:
+            guard indexPath.row < capturedURLs.count else { return }
+            let text = capturedURLs[indexPath.row].url
+            UIPasteboard.general.string = text
 
-        UIPasteboard.general.string = text
-
-        let alert = UIAlertController(title: "Copied to clipboard", message: text, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "OK", style: .cancel))
-        alert.popoverPresentationController?.sourceView = view
-        alert.popoverPresentationController?.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-        alert.popoverPresentationController?.permittedArrowDirections = .init(rawValue: 0)
-        present(alert, animated: true)
+            let alert = UIAlertController(title: "Copied to clipboard", message: text, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .cancel))
+            alert.popoverPresentationController?.sourceView = view
+            alert.popoverPresentationController?.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            alert.popoverPresentationController?.permittedArrowDirections = .init(rawValue: 0)
+            present(alert, animated: true)
+        }
     }
 }
 

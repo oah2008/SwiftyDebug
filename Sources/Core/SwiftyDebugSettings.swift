@@ -27,12 +27,65 @@ class Settings: NSObject {
         }
     }
 
+    var networkRequestsEnabled: Bool = true {
+        didSet { save(.networkRequestsEnabled, value: networkRequestsEnabled) }
+    }
+
+    var webNetworkRequestsEnabled: Bool = true {
+        didSet { save(.webNetworkRequestsEnabled, value: webNetworkRequestsEnabled) }
+    }
+
+    var consoleLogsEnabled: Bool = true {
+        didSet {
+            save(.consoleLogsEnabled, value: consoleLogsEnabled)
+            PrintInterceptor.shared.enable = consoleLogsEnabled && SwiftyDebug.enableConsoleLog
+        }
+    }
+
+    var webLogsEnabled: Bool = true {
+        didSet { save(.webLogsEnabled, value: webLogsEnabled) }
+    }
+
+    var monitorAllRequests: Bool = false {
+        didSet {
+            save(.monitorAllRequests, value: monitorAllRequests)
+            SwiftyDebug.monitorAllUrls = monitorAllRequests
+        }
+    }
+
+    var monitorMediaEnabled: Bool = false {
+        didSet {
+            save(.monitorMedia, value: monitorMediaEnabled)
+            SwiftyDebug.monitorMedia = monitorMediaEnabled
+        }
+    }
+
     private override init() {
-        shakeGestureEnabled = UserDefaults.standard.bool(forKey: SettingsKey.shakeGestureEnabled.rawValue)
-        debugUIVisible = UserDefaults.standard.bool(forKey: SettingsKey.debugUIVisible.rawValue)
-        bubbleVisible = UserDefaults.standard.object(forKey: SettingsKey.bubbleVisible.rawValue) == nil
+        let ud = UserDefaults.standard
+
+        shakeGestureEnabled = ud.bool(forKey: SettingsKey.shakeGestureEnabled.rawValue)
+        debugUIVisible = ud.bool(forKey: SettingsKey.debugUIVisible.rawValue)
+        bubbleVisible = ud.object(forKey: SettingsKey.bubbleVisible.rawValue) == nil
             ? true
-            : UserDefaults.standard.bool(forKey: SettingsKey.bubbleVisible.rawValue)
+            : ud.bool(forKey: SettingsKey.bubbleVisible.rawValue)
+
+        // Toggle defaults: ON unless explicitly set to false
+        networkRequestsEnabled = ud.object(forKey: SettingsKey.networkRequestsEnabled.rawValue) == nil
+            ? true
+            : ud.bool(forKey: SettingsKey.networkRequestsEnabled.rawValue)
+        webNetworkRequestsEnabled = ud.object(forKey: SettingsKey.webNetworkRequestsEnabled.rawValue) == nil
+            ? true
+            : ud.bool(forKey: SettingsKey.webNetworkRequestsEnabled.rawValue)
+        consoleLogsEnabled = ud.object(forKey: SettingsKey.consoleLogsEnabled.rawValue) == nil
+            ? true
+            : ud.bool(forKey: SettingsKey.consoleLogsEnabled.rawValue)
+        webLogsEnabled = ud.object(forKey: SettingsKey.webLogsEnabled.rawValue) == nil
+            ? true
+            : ud.bool(forKey: SettingsKey.webLogsEnabled.rawValue)
+
+        // Toggle defaults: OFF
+        monitorAllRequests = ud.bool(forKey: SettingsKey.monitorAllRequests.rawValue)
+        monitorMediaEnabled = ud.bool(forKey: SettingsKey.monitorMedia.rawValue)
     }
 
     // MARK: - Private
