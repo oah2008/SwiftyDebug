@@ -7,7 +7,7 @@
 
 import UIKit
 
-private enum NetworkTab: Int { case app = 0, web = 1 }
+private enum NetworkTab: Int { case app = 0, web = 1, pinned = 2 }
 
 /// Per-tab filter + layout state (includes auto-follow + scroll offset).
 private final class TabFilterState {
@@ -38,7 +38,7 @@ class NetworkViewController: UIViewController {
     private static var savedTab: NetworkTab = .app
     private var currentTab: NetworkTab = NetworkViewController.savedTab
     private var tabStates: [NetworkTab: TabFilterState] = [
-        .app: TabFilterState(), .web: TabFilterState()
+        .app: TabFilterState(), .web: TabFilterState(), .pinned: TabFilterState()
     ]
     private var currentTabState: TabFilterState { tabStates[currentTab]! }
 
@@ -108,6 +108,7 @@ class NetworkViewController: UIViewController {
         switch currentTab {
         case .app: allModels = allCacheModels.filter { !$0.isWebViewRequest }
         case .web: allModels = allCacheModels.filter { $0.isWebViewRequest }
+        case .pinned: allModels = allCacheModels.filter { $0.isPinned }
         }
         guard !allModels.isEmpty else { return [] }
 
@@ -211,6 +212,7 @@ class NetworkViewController: UIViewController {
         switch currentTab {
         case .app: models = allCache.filter { !$0.isWebViewRequest }
         case .web: models = allCache.filter { $0.isWebViewRequest }
+        case .pinned: models = allCache.filter { $0.isPinned }
         }
         if pathFilters.isEmpty && hostFilters.isEmpty { return [] }
 
@@ -361,6 +363,7 @@ class NetworkViewController: UIViewController {
         switch currentTab {
         case .app: filtered = cacheModels.filter { !$0.isWebViewRequest }
         case .web: filtered = cacheModels.filter { $0.isWebViewRequest }
+        case .pinned: filtered = cacheModels.filter { $0.isPinned }
         }
 
         // 2. Path / host filters
@@ -608,6 +611,11 @@ class NetworkViewController: UIViewController {
 
         searchBar.delegate = self
 
+        // Hide filter/layout on Pinned tab
+        let isPinned = currentTab == .pinned
+        filterButton.isHidden = isPinned
+        layoutToggleButton.isHidden = isPinned
+
         updateFilterButtonIcon()
 
         //notification
@@ -668,6 +676,7 @@ class NetworkViewController: UIViewController {
         segmentControl = UISegmentedControl(items: [
             Self.makeSegmentImage(systemName: "iphone", title: "App"),
             Self.makeSegmentImage(systemName: "globe", title: "Web"),
+            Self.makeSegmentImage(systemName: "pin.fill", title: "Pinned"),
         ])
         segmentControl.translatesAutoresizingMaskIntoConstraints = false
         segmentControl.selectedSegmentIndex = currentTab.rawValue
@@ -902,6 +911,12 @@ class NetworkViewController: UIViewController {
         searchBar.text = newState.searchText
         updateLayoutToggleIcon()
         updateFilterButtonIcon()
+
+        // Hide filter/layout buttons on Pinned tab (not relevant there)
+        let isPinned = currentTab == .pinned
+        filterButton.isHidden = isPinned
+        layoutToggleButton.isHidden = isPinned
+
         applyFilter()
         tableView.reloadData()
         tableView.layoutIfNeeded()
@@ -1089,7 +1104,13 @@ extension NetworkViewController: UITableViewDelegate {
             } else {
                 model.removePinFromDisk()
             }
-            tableView.reloadRows(at: [indexPath], with: .none)
+            // On the Pinned tab, re-filter so unpinned row disappears
+            if self?.currentTab == .pinned {
+                self?.applyFilter()
+                tableView.reloadData()
+            } else {
+                tableView.reloadRows(at: [indexPath], with: .none)
+            }
             completion(true)
         }
         action.backgroundColor = UIColor(red: 0.16, green: 0.50, blue: 0.47, alpha: 1)
