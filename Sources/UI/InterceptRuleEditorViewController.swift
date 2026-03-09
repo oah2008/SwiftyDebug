@@ -58,14 +58,11 @@ class InterceptRuleEditorViewController: UITableViewController {
     private var originalHeaders: [(key: String, value: String)] = []
     private var originalQueryParams: [(key: String, value: String)] = []
 
-    /// Available hosts extracted from `SwiftyDebug.urls`.
-    private var availableHosts: [String] = []
-
     private var displayedEndpoint: String {
         switch matchMode {
         case .exact:      return requestPath
         case .normalized: return normalizedPath
-        case .host:       return selectedHosts.isEmpty ? "(no hosts selected)" : selectedHosts.joined(separator: ", ")
+        case .host:       return selectedHosts.isEmpty ? "(no URLs selected)" : selectedHosts.joined(separator: ", ")
         }
     }
 
@@ -114,19 +111,11 @@ class InterceptRuleEditorViewController: UITableViewController {
     // MARK: - Populate
 
     private func populateFromModel() {
-        // Build available hosts from SwiftyDebug.urls
-        availableHosts = Self.extractHosts(from: SwiftyDebug.urls)
-
         if let model = httpModel {
             requestPath = model.url?.path ?? ""
             normalizedPath = EndpointNormalizer.normalize(requestPath)
             requestHost = (model.url?.host ?? "").lowercased()
             originalURL = model.url?.absoluteString ?? ""
-
-            // Ensure the current request's host is included
-            if !requestHost.isEmpty && !availableHosts.contains(requestHost) {
-                availableHosts.insert(requestHost, at: 0)
-            }
 
             // Capture original request values for the picker
             if let headerFields = model.requestHeaderFields as? [String: String] {
@@ -189,41 +178,17 @@ class InterceptRuleEditorViewController: UITableViewController {
         }
     }
 
-    /// Extracts host names from the SDK URL list and captured network traffic.
-    private static func extractHosts(from urls: [String]) -> [String] {
-        var seen = Set<String>()
-        var hosts: [String] = []
-
-        // From SDK URLs
-        for entry in urls {
-            if let url = URL(string: entry), let host = url.host {
-                let h = host.lowercased()
-                if seen.insert(h).inserted { hosts.append(h) }
-            } else if entry.contains(".") && !entry.contains("/") {
-                let h = entry.lowercased()
-                if seen.insert(h).inserted { hosts.append(h) }
-            }
-        }
-
-        // From captured network traffic
-        let models = NetworkRequestStore.shared.httpModels as? [NetworkTransaction] ?? []
-        for model in models {
-            if let host = model.url?.host?.lowercased(), !host.isEmpty {
-                if seen.insert(host).inserted { hosts.append(host) }
-            }
-        }
-
-        return hosts.sorted()
-    }
-
-    /// Collects unique header keys from captured requests matching the selected hosts.
+    /// Collects unique header keys from captured requests matching the selected URL patterns.
     private func headerKeysForSelectedHosts() -> [(key: String, value: String)] {
         let models = NetworkRequestStore.shared.httpModels as? [NetworkTransaction] ?? []
         var seen = Set<String>()
         var result: [(key: String, value: String)] = []
 
         for model in models {
-            guard let host = model.url?.host?.lowercased(), selectedHosts.contains(host) else { continue }
+            guard let url = model.url as URL? else { continue }
+            // Check if any selected pattern matches this request
+            let matches = selectedHosts.contains { InterceptRuleStore.urlMatchesPattern(url, pattern: $0) }
+            guard matches else { continue }
             guard let headers = model.requestHeaderFields as? [String: String] else { continue }
             for (key, value) in headers {
                 let lk = key.lowercased()
@@ -246,7 +211,7 @@ class InterceptRuleEditorViewController: UITableViewController {
         var rule: InterceptRule
         if matchMode == .host {
             if selectedHosts.isEmpty {
-                showAlert(title: "No Hosts", message: "Select at least one host.")
+                showAlert(title: "No URLs", message: "Select at least one URL to intercept.")
                 return
             }
             let sorted = selectedHosts.map { $0.lowercased() }.sorted()
@@ -459,7 +424,7 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     private func sectionTitle(for section: Section, count: Int) -> String {
         switch section {
-        case .endpoint:    return matchMode == .host ? "HOSTS" : "ENDPOINT"
+        case .endpoint:    return matchMode == .host ? "URLS" : "ENDPOINT"
         case .action:      return "ACTION"
         case .headers:     return "HEADERS\(count > 0 ? " (\(count))" : "")"
         case .queryParams: return "QUERY PARAMETERS\(count > 0 ? " (\(count))" : "")"
@@ -494,7 +459,7 @@ class InterceptRuleEditorViewController: UITableViewController {
                     let cell = UITableViewCell(style: .default, reuseIdentifier: "HostSelectCell")
                     cell.selectionStyle = .default
                     cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
-                    cell.textLabel?.text = selectedHosts.isEmpty ? "Select Hosts..." : "Change Hosts..."
+                    cell.textLabel?.text = selectedHosts.isEmpty ? "Select URLs..." : "Change URLs..."
                     cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
                     cell.textLabel?.textColor = .systemPurple
                     cell.accessoryType = .disclosureIndicator

@@ -7,20 +7,21 @@
 
 import UIKit
 
-/// Sheet-presented multi-select host picker styled exactly like the network filter sheet.
-/// Builds entries from `SwiftyDebug.urls`, strips scheme, groups by tag, shows full URL as subtitle.
-/// Selecting a tagged group selects all hosts under it.
+/// Sheet-presented multi-select host/URL picker styled exactly like the network filter sheet.
+/// Builds entries from `SwiftyDebug.urls` that have active traffic, plus already-selected entries.
+/// Shows tag + full URL (scheme stripped), merges same-tag entries into one row.
+/// Selection stores stripped URLs — rules match by URL prefix.
 class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
 
-    /// Currently selected hosts (lowercased).
+    /// Currently selected stripped URLs (lowercased).
     var selectedHosts: Set<String> = []
     var onApply: (([String]) -> Void)?
 
     /// An entry in the picker — mirrors the filter sheet's structure.
     private struct Entry {
-        let display: String       // Tag label (or stripped URL if no tag)
-        let subtitle: String?     // First stripped URL (shown as detail text)
-        let hosts: [String]       // All unique hosts covered by this entry
+        let display: String           // Tag label (or stripped URL if no tag)
+        let subtitle: String?         // Stripped URL(s) shown as detail text
+        let filterKeys: [String]      // Stripped URLs this entry covers
     }
 
     private var entries: [Entry] = []
@@ -46,31 +47,60 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
 
     private func buildEntries() {
         let onlyURLs = SwiftyDebug.urls
+        let models = NetworkRequestStore.shared.httpModels as? [NetworkTransaction] ?? []
 
-        // Raw entries: (display = tag or stripped URL, strippedURL, host)
+        // Collect all stripped URLs already selected in existing host rules
+        var ruleSelectedKeys = Set<String>()
+        for rule in InterceptRuleStore.shared.allRules() where rule.matchMode == .host {
+            for key in rule.matchHosts {
+                ruleSelectedKeys.insert(key.lowercased())
+            }
+        }
+        // Also include current selection
+        for key in selectedHosts {
+            ruleSelectedKeys.insert(key.lowercased())
+        }
+
         struct RawEntry {
             let display: String
-            let strippedURL: String
-            let host: String
+            let filterKey: String // stripped URL
         }
 
         var rawEntries: [RawEntry] = []
-        var coveredHosts = Set<String>()
+        var addedKeys = Set<String>()
 
+        // Build entries from SwiftyDebug.urls — only those with active traffic OR already selected in rules
         for urlString in onlyURLs {
             var stripped = stripScheme(urlString)
             if stripped.hasSuffix("/") { stripped = String(stripped.dropLast()) }
+            let key = stripped.lowercased()
 
-            let host = stripped.components(separatedBy: "/").first ?? stripped
-            let lowerHost = host.lowercased()
+            // Check if any captured model matches this URL prefix
+            var hasMatch = false
+            for model in models {
+                let modelStripped = stripScheme(model.url?.absoluteString ?? "").lowercased()
+                if modelStripped == key || modelStripped.hasPrefix(key + "/") {
+                    hasMatch = true
+                    break
+                }
+            }
 
-            let display = tagLabel(forURLString: urlString) ?? stripped
-            rawEntries.append(RawEntry(display: display, strippedURL: stripped, host: lowerHost))
-            coveredHosts.insert(lowerHost)
+            // Show if has active traffic OR is already selected in a rule
+            if hasMatch || ruleSelectedKeys.contains(key) {
+                if addedKeys.insert(key).inserted {
+                    let display = tagLabel(forURLString: urlString) ?? stripped
+                    rawEntries.append(RawEntry(display: display, filterKey: stripped))
+                }
+            }
         }
 
-        // Also include hosts from captured network traffic that aren't covered by SDK URLs
-        let models = NetworkRequestStore.shared.httpModels as? [NetworkTransaction] ?? []
+        // Also include uncovered hosts from captured traffic
+        var coveredHosts = Set<String>()
+        for entry in rawEntries {
+            let host = entry.filterKey.components(separatedBy: "/").first ?? entry.filterKey
+            coveredHosts.insert(host.lowercased())
+        }
+
         var seenTrafficHosts = Set<String>()
         for model in models {
             guard let host = model.url?.host?.lowercased(), !host.isEmpty else { continue }
@@ -78,36 +108,47 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
             seenTrafficHosts.insert(host)
 
             let display = tagLabel(forHost: host) ?? host
-            rawEntries.append(RawEntry(display: display, strippedURL: host, host: host))
+            if addedKeys.insert(host).inserted {
+                rawEntries.append(RawEntry(display: display, filterKey: host))
+            }
+        }
+
+        // Also include any rule-selected keys not yet in the list
+        for key in ruleSelectedKeys {
+            if addedKeys.insert(key).inserted {
+                let display = tagLabel(forHost: key.components(separatedBy: "/").first ?? key) ?? key
+                rawEntries.append(RawEntry(display: display, filterKey: key))
+            }
         }
 
         // Sort alphabetically by display
         let sorted = rawEntries.sorted { $0.display.lowercased() < $1.display.lowercased() }
 
-        // Merge by display label (same tag → one row, like filter sheet)
+        // Merge by display label (same tag → one row)
         var displayOrder: [String] = []
-        var mergedMap: [String: (strippedURLs: [String], hosts: Set<String>)] = [:]
+        var mergedMap: [String: [String]] = [:]
 
         for entry in sorted {
             let key = entry.display.lowercased()
             if mergedMap[key] == nil {
                 displayOrder.append(entry.display)
-                mergedMap[key] = (strippedURLs: [], hosts: [])
+                mergedMap[key] = []
             }
-            mergedMap[key]!.strippedURLs.append(entry.strippedURL)
-            mergedMap[key]!.hosts.insert(entry.host)
+            mergedMap[key]!.append(entry.filterKey)
         }
 
         entries = displayOrder.map { display in
-            let info = mergedMap[display.lowercased()]!
-            let subtitle = info.strippedURLs.first
-            // If display == subtitle, no need to show subtitle
-            let showSubtitle = (subtitle != nil && subtitle!.lowercased() != display.lowercased()) ? subtitle : nil
-            return Entry(
-                display: display,
-                subtitle: showSubtitle ?? (info.strippedURLs.count > 1 ? info.strippedURLs.joined(separator: ", ") : nil),
-                hosts: Array(info.hosts).sorted()
-            )
+            let filterKeys = mergedMap[display.lowercased()]!
+            // Show first URL as subtitle (like filter sheet)
+            let subtitle: String?
+            if let first = filterKeys.first, first.lowercased() != display.lowercased() {
+                subtitle = filterKeys.count > 1 ? filterKeys.joined(separator: ", ") : first
+            } else if filterKeys.count > 1 {
+                subtitle = filterKeys.joined(separator: ", ")
+            } else {
+                subtitle = nil
+            }
+            return Entry(display: display, subtitle: subtitle, filterKeys: filterKeys)
         }
     }
 
@@ -149,7 +190,6 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         topBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(topBar)
 
-        // Clear button
         clearButton.translatesAutoresizingMaskIntoConstraints = false
         clearButton.setTitle("Clear", for: .normal)
         clearButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .medium)
@@ -157,7 +197,6 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         clearButton.addTarget(self, action: #selector(didTapClear), for: .touchUpInside)
         topBar.addSubview(clearButton)
 
-        // Title
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = .boldSystemFont(ofSize: 16)
         titleLabel.textColor = .white
@@ -165,7 +204,6 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         titleLabel.text = "Select Hosts"
         topBar.addSubview(titleLabel)
 
-        // Apply button
         applyButton.translatesAutoresizingMaskIntoConstraints = false
         applyButton.setTitle("Apply", for: .normal)
         applyButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -234,7 +272,7 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "HostCell", for: indexPath) as! HostPickerCell
         let entry = entries[indexPath.row]
-        let isSelected = entry.hosts.allSatisfy { selectedHosts.contains($0) }
+        let isSelected = entry.filterKeys.contains { selectedHosts.contains($0.lowercased()) }
 
         cell.configure(display: entry.display, subtitle: entry.subtitle, selected: isSelected)
         return cell
@@ -244,12 +282,12 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         let entry = entries[indexPath.row]
-        let allSelected = entry.hosts.allSatisfy { selectedHosts.contains($0) }
+        let allSelected = entry.filterKeys.allSatisfy { selectedHosts.contains($0.lowercased()) }
 
         if allSelected {
-            for host in entry.hosts { selectedHosts.remove(host) }
+            for key in entry.filterKeys { selectedHosts.remove(key.lowercased()) }
         } else {
-            for host in entry.hosts { selectedHosts.insert(host) }
+            for key in entry.filterKeys { selectedHosts.insert(key.lowercased()) }
         }
         tableView.reloadRows(at: [indexPath], with: .none)
     }

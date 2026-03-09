@@ -33,7 +33,6 @@ class InterceptRuleStore {
 
         let path = url.path
         let normalized = EndpointNormalizer.normalize(path)
-        let host = url.host?.lowercased() ?? ""
         var result: [InterceptRule] = []
 
         // Exact-match rules
@@ -44,18 +43,43 @@ class InterceptRuleStore {
         if let list = rules[normalized] {
             result.append(contentsOf: list.filter { $0.matchMode == .normalized })
         }
-        // Host-match rules — scan all host-keyed entries
-        if !host.isEmpty {
-            for (key, list) in rules where key.hasPrefix("host:") {
-                for rule in list where rule.matchMode == .host {
-                    if rule.matchHosts.contains(host) {
-                        result.append(rule)
-                    }
+        // Host-match rules — URL prefix matching against stripped URLs
+        for (key, list) in rules where key.hasPrefix("host:") {
+            for rule in list where rule.matchMode == .host {
+                if rule.matchHosts.contains(where: { Self.urlMatchesPattern(url, pattern: $0) }) {
+                    result.append(rule)
                 }
             }
         }
 
         return result.sorted { $0.order < $1.order }
+    }
+
+    /// Checks if a URL matches a host-rule pattern (stripped URL prefix).
+    /// Pattern examples: "api.example.com", "api.example.com/v1"
+    /// A pattern "api.example.com/v1" matches "https://api.example.com/v1/users/123" but not "https://api.example.com/v2/users".
+    /// A pattern "api.example.com" matches any URL on that host.
+    static func urlMatchesPattern(_ url: URL, pattern: String) -> Bool {
+        var stripped = url.absoluteString.lowercased()
+        for prefix in ["https://", "http://"] {
+            if stripped.hasPrefix(prefix) {
+                stripped = String(stripped.dropFirst(prefix.count))
+                break
+            }
+        }
+        // Remove query string and fragment for comparison
+        if let qIndex = stripped.firstIndex(of: "?") {
+            stripped = String(stripped[..<qIndex])
+        }
+        if let fIndex = stripped.firstIndex(of: "#") {
+            stripped = String(stripped[..<fIndex])
+        }
+        if stripped.hasSuffix("/") { stripped = String(stripped.dropLast()) }
+
+        var p = pattern.lowercased()
+        if p.hasSuffix("/") { p = String(p.dropLast()) }
+
+        return stripped == p || stripped.hasPrefix(p + "/")
     }
 
     /// Convenience: match by path only (no host matching).
@@ -136,16 +160,17 @@ class InterceptRuleStore {
         return composite
     }
 
-    /// Returns all host-based rules that match a given host.
-    func hostRules(forHost host: String) -> [InterceptRule] {
+    /// Returns all host-based rules that match a given URL (by stripped URL prefix).
+    func hostRules(forURL url: URL) -> [InterceptRule] {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
 
-        let h = host.lowercased()
         var result: [InterceptRule] = []
         for (key, list) in rules where key.hasPrefix("host:") {
-            for rule in list where rule.matchMode == .host && rule.matchHosts.contains(h) {
-                result.append(rule)
+            for rule in list where rule.matchMode == .host {
+                if rule.matchHosts.contains(where: { Self.urlMatchesPattern(url, pattern: $0) }) {
+                    result.append(rule)
+                }
             }
         }
         return result.sorted { $0.order < $1.order }
