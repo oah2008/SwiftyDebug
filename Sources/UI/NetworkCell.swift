@@ -277,21 +277,21 @@ class NetworkCell: UITableViewCell {
 
         curlButton.isHidden = true
         curlButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
-        curlButton.layer.cornerRadius = 6
+        curlButton.layer.cornerRadius = 8
         curlButton.clipsToBounds = true
         var curlBtnConfig = UIButton.Configuration.plain()
-        curlBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12)
-        curlBtnConfig.imagePadding = 5
+        curlBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16)
+        curlBtnConfig.imagePadding = 6
         curlBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
             var attr = attr
-            attr.font = .systemFont(ofSize: 11, weight: .semibold)
+            attr.font = .systemFont(ofSize: 13, weight: .semibold)
             return attr
         }
         curlBtnConfig.baseForegroundColor = DebugTheme.accentColor
         curlButton.configuration = curlBtnConfig
         curlButton.addTarget(self, action: #selector(curlButtonTapped), for: .touchUpInside)
 
-        let curlConfig = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
+        let curlConfig = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
         let curlIcon = UIImage(systemName: "terminal", withConfiguration: curlConfig)?
             .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
         curlButton.setImage(curlIcon, for: .normal)
@@ -302,21 +302,21 @@ class NetworkCell: UITableViewCell {
 
         interceptButton.isHidden = true
         interceptButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
-        interceptButton.layer.cornerRadius = 6
+        interceptButton.layer.cornerRadius = 8
         interceptButton.clipsToBounds = true
         var interceptBtnConfig = UIButton.Configuration.plain()
-        interceptBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12)
-        interceptBtnConfig.imagePadding = 5
+        interceptBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16)
+        interceptBtnConfig.imagePadding = 6
         interceptBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
             var attr = attr
-            attr.font = .systemFont(ofSize: 11, weight: .semibold)
+            attr.font = .systemFont(ofSize: 13, weight: .semibold)
             return attr
         }
         interceptBtnConfig.baseForegroundColor = .systemOrange
         interceptButton.configuration = interceptBtnConfig
         interceptButton.addTarget(self, action: #selector(interceptButtonTapped), for: .touchUpInside)
 
-        let interceptBtnIconConfig = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
+        let interceptBtnIconConfig = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
         let interceptBtnIcon = UIImage(systemName: "bolt.fill", withConfiguration: interceptBtnIconConfig)?
             .withTintColor(.systemOrange, renderingMode: .alwaysOriginal)
         interceptButton.setImage(interceptBtnIcon, for: .normal)
@@ -333,6 +333,7 @@ class NetworkCell: UITableViewCell {
         mainStack.addArrangedSubview(urlLabel)
         mainStack.addArrangedSubview(bottomRow)
         mainStack.addArrangedSubview(curlButton)
+        mainStack.setCustomSpacing(12, after: curlButton)
         mainStack.addArrangedSubview(interceptButton)
         cardView.addSubview(mainStack)
 

@@ -242,6 +242,9 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
     /// self.request.HTTPBody is nil when the body was sent via a stream,
     /// so we must capture it from the recursiveRequest after reading the stream.
     private var capturedRequestBody: Data?
+    /// The request after intercept rules have been applied (headers/query params modified).
+    /// Used in stopLoading() so the UI reflects the actual request that was sent.
+    private var interceptedRequest: URLRequest?
 
     // MARK: Recursive request flag
 
@@ -397,6 +400,9 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
                         recursiveRequest.url = newURL
                     }
                 }
+                // Save the modified request so stopLoading() reflects what was actually sent.
+                // Only set when a rule was applied; non-intercepted requests use self.request as before.
+                self.interceptedRequest = recursiveRequest as URLRequest
             }
         }
 
@@ -435,8 +441,11 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
 
         let model = NetworkTransaction()
         model.requestId = UUID().uuidString
-        model.url = self.request.url as NSURL?
-        model.method = self.request.httpMethod
+        // Use the intercepted request (with rule modifications applied) if available,
+        // so the UI, cURL command, and request info reflect what was actually sent.
+        let effectiveRequest = self.interceptedRequest ?? self.request
+        model.url = effectiveRequest.url as NSURL?
+        model.method = effectiveRequest.httpMethod
         model.mineType = self.response?.mimeType
 
         // Use capturedRequestBody which includes stream-based bodies
@@ -475,7 +484,7 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
 
         model.errorDescription = (self.error as NSError?)?.description
         model.errorLocalizedDescription = self.error?.localizedDescription
-        model.requestHeaderFields = self.request.allHTTPHeaderFields as NSDictionary?
+        model.requestHeaderFields = effectiveRequest.allHTTPHeaderFields as NSDictionary?
 
         if let httpResponse = self.response as? HTTPURLResponse {
             model.responseHeaderFields = httpResponse.allHeaderFields as NSDictionary
@@ -516,6 +525,7 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
         self.data = nil
         self.response = nil
         self.error = nil
+        self.interceptedRequest = nil
     }
 
     // MARK: Authentication challenge handling

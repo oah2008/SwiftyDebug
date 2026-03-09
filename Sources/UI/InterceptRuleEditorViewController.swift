@@ -8,7 +8,8 @@
 import UIKit
 
 /// Modal editor for creating/editing intercept rules.
-/// Shows endpoint info, block toggle, and editable key-value tables for headers and query params.
+/// Headers and query params start empty. The user taps "Add" to pick from the original request
+/// values or add a custom entry. Each item can be edited or toggled to "drop" (remove from request).
 class InterceptRuleEditorViewController: UITableViewController {
 
     // MARK: - Input
@@ -24,14 +25,30 @@ class InterceptRuleEditorViewController: UITableViewController {
         case queryParams = 3
     }
 
+    // MARK: - Item state
+
+    /// Represents a header or query param entry in the editor.
+    private struct EditItem {
+        var key: String
+        var value: String
+        var isDropped: Bool
+        /// Whether the key field is editable (false for items picked from the original request).
+        var isKeyEditable: Bool
+    }
+
     // MARK: - State
 
     private var normalizedEndpoint: String = ""
     private var originalURL: String = ""
     private var isBlocked: Bool = false
-    private var headers: [KVPair] = []
-    private var queryParams: [KVPair] = []
+    private var headerItems: [EditItem] = []
+    private var queryParamItems: [EditItem] = []
     private var existingRule: InterceptRule?
+
+    /// Original request headers for the picker (key → value).
+    private var originalHeaders: [(key: String, value: String)] = []
+    /// Original request query params for the picker (key → value).
+    private var originalQueryParams: [(key: String, value: String)] = []
 
     // MARK: - Lifecycle
 
@@ -75,29 +92,42 @@ class InterceptRuleEditorViewController: UITableViewController {
         originalURL = model.url?.absoluteString ?? ""
         normalizedEndpoint = EndpointNormalizer.normalize(model.url?.path ?? "")
 
+        // Capture original request values for the picker
+        if let headerFields = model.requestHeaderFields as? [String: String] {
+            originalHeaders = headerFields.sorted(by: { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending })
+        }
+        if let url = model.url, let components = URLComponents(url: url as URL, resolvingAgainstBaseURL: false),
+           let items = components.queryItems {
+            originalQueryParams = items.map { (key: $0.name, value: $0.value ?? "") }
+        }
+
         // Check for existing rule
         existingRule = InterceptRuleStore.shared.rule(for: normalizedEndpoint)
 
         if let rule = existingRule {
             isBlocked = rule.isBlocked
-            headers = rule.headerOverrides
-            queryParams = rule.queryParamOverrides
+
+            // Restore overrides as active items
+            headerItems = rule.headerOverrides.map {
+                EditItem(key: $0.key, value: $0.value, isDropped: false, isKeyEditable: false)
+            }
+            // Restore removed keys as dropped items (use original value if available)
+            for removedKey in rule.removedHeaderKeys.sorted() {
+                let originalValue = originalHeaders.first(where: { $0.key.lowercased() == removedKey.lowercased() })?.value ?? ""
+                headerItems.append(EditItem(key: removedKey, value: originalValue, isDropped: true, isKeyEditable: false))
+            }
+
+            queryParamItems = rule.queryParamOverrides.map {
+                EditItem(key: $0.key, value: $0.value, isDropped: false, isKeyEditable: false)
+            }
+            for removedKey in rule.removedQueryParamKeys.sorted() {
+                let originalValue = originalQueryParams.first(where: { $0.key == removedKey })?.value ?? ""
+                queryParamItems.append(EditItem(key: removedKey, value: originalValue, isDropped: true, isKeyEditable: false))
+            }
         } else {
-            // Pre-populate from the current request
             isBlocked = false
-
-            // Headers from request
-            if let headerFields = model.requestHeaderFields as? [String: String] {
-                headers = headerFields.sorted(by: { $0.key < $1.key }).map {
-                    KVPair(key: $0.key, value: $0.value)
-                }
-            }
-
-            // Query params from URL
-            if let url = model.url, let components = URLComponents(url: url as URL, resolvingAgainstBaseURL: false),
-               let items = components.queryItems {
-                queryParams = items.map { KVPair(key: $0.name, value: $0.value ?? "") }
-            }
+            headerItems = []
+            queryParamItems = []
         }
     }
 
@@ -110,30 +140,25 @@ class InterceptRuleEditorViewController: UITableViewController {
     @objc private func saveTapped() {
         var rule = existingRule ?? InterceptRule(normalizedEndpoint: normalizedEndpoint)
         rule.isBlocked = isBlocked
-        rule.headerOverrides = headers.filter { !$0.key.isEmpty }
-        rule.queryParamOverrides = queryParams.filter { !$0.key.isEmpty }
         rule.isEnabled = true
 
-        // Compute removed keys by comparing with original request
-        if let model = httpModel {
-            // Removed headers: keys in original that are no longer in overrides
-            if let originalHeaders = model.requestHeaderFields as? [String: String] {
-                let currentKeys = Set(rule.headerOverrides.map { $0.key.lowercased() })
-                rule.removedHeaderKeys = Set(
-                    originalHeaders.keys.filter { !currentKeys.contains($0.lowercased()) }
-                        .map { $0.lowercased() }
-                )
-            }
+        // Active (non-dropped) items with non-empty keys → overrides
+        rule.headerOverrides = headerItems
+            .filter { !$0.isDropped && !$0.key.isEmpty }
+            .map { KVPair(key: $0.key, value: $0.value) }
 
-            // Removed query params
-            if let url = model.url, let components = URLComponents(url: url as URL, resolvingAgainstBaseURL: false),
-               let items = components.queryItems {
-                let currentKeys = Set(rule.queryParamOverrides.map { $0.key })
-                rule.removedQueryParamKeys = Set(
-                    items.map(\.name).filter { !currentKeys.contains($0) }
-                )
-            }
-        }
+        // Dropped items → removed keys
+        rule.removedHeaderKeys = Set(
+            headerItems.filter { $0.isDropped && !$0.key.isEmpty }.map { $0.key.lowercased() }
+        )
+
+        rule.queryParamOverrides = queryParamItems
+            .filter { !$0.isDropped && !$0.key.isEmpty }
+            .map { KVPair(key: $0.key, value: $0.value) }
+
+        rule.removedQueryParamKeys = Set(
+            queryParamItems.filter { $0.isDropped && !$0.key.isEmpty }.map { $0.key }
+        )
 
         InterceptRuleStore.shared.addOrUpdate(rule)
         dismiss(animated: true)
@@ -141,13 +166,121 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     @objc private func blockToggleChanged(_ sender: UISwitch) {
         isBlocked = sender.isOn
-        // Animate sections visibility
         tableView.reloadSections(IndexSet([Section.headers.rawValue, Section.queryParams.rawValue]), with: .fade)
     }
 
     @objc private func removeRuleTapped() {
         InterceptRuleStore.shared.remove(normalizedEndpoint: normalizedEndpoint)
         dismiss(animated: true)
+    }
+
+    // MARK: - Add picker
+
+    @objc private func addHeaderTapped() {
+        showAddPicker(
+            title: "Add Header",
+            originalItems: originalHeaders,
+            existingKeys: Set(headerItems.map { $0.key.lowercased() }),
+            caseInsensitive: true
+        ) { [weak self] item in
+            guard let self = self else { return }
+            self.headerItems.append(item)
+            let indexPath = IndexPath(row: self.headerItems.count - 1, section: Section.headers.rawValue)
+            self.tableView.insertRows(at: [indexPath], with: .automatic)
+            self.reloadSectionHeader(Section.headers)
+            if item.isKeyEditable {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    if let cell = self.tableView.cellForRow(at: indexPath) as? KeyValueEditCell {
+                        cell.keyField.becomeFirstResponder()
+                    }
+                }
+            }
+        }
+    }
+
+    @objc private func addQueryParamTapped() {
+        showAddPicker(
+            title: "Add Query Parameter",
+            originalItems: originalQueryParams,
+            existingKeys: Set(queryParamItems.map { $0.key }),
+            caseInsensitive: false
+        ) { [weak self] item in
+            guard let self = self else { return }
+            self.queryParamItems.append(item)
+            let indexPath = IndexPath(row: self.queryParamItems.count - 1, section: Section.queryParams.rawValue)
+            self.tableView.insertRows(at: [indexPath], with: .automatic)
+            self.reloadSectionHeader(Section.queryParams)
+            if item.isKeyEditable {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    if let cell = self.tableView.cellForRow(at: indexPath) as? KeyValueEditCell {
+                        cell.keyField.becomeFirstResponder()
+                    }
+                }
+            }
+        }
+    }
+
+    private func showAddPicker(
+        title: String,
+        originalItems: [(key: String, value: String)],
+        existingKeys: Set<String>,
+        caseInsensitive: Bool,
+        completion: @escaping (EditItem) -> Void
+    ) {
+        let alert = UIAlertController(title: title, message: nil, preferredStyle: .actionSheet)
+
+        // Show original items not yet added
+        let available = originalItems.filter { item in
+            let k = caseInsensitive ? item.key.lowercased() : item.key
+            let keys = caseInsensitive ? existingKeys : existingKeys
+            return !keys.contains(k)
+        }
+
+        for item in available {
+            let displayTitle = "\(item.key): \(item.value.prefix(50))"
+            alert.addAction(UIAlertAction(title: displayTitle, style: .default) { _ in
+                completion(EditItem(key: item.key, value: item.value, isDropped: false, isKeyEditable: false))
+            })
+        }
+
+        // "Add Custom" option
+        alert.addAction(UIAlertAction(title: "Add Custom", style: .default) { _ in
+            completion(EditItem(key: "", value: "", isDropped: false, isKeyEditable: true))
+        })
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
+        }
+
+        present(alert, animated: true)
+    }
+
+    private func reloadSectionHeader(_ section: Section) {
+        // Reload just the section header to update the count
+        if let headerView = tableView.headerView(forSection: section.rawValue) {
+            if let label = headerView.viewWithTag(100) as? UILabel {
+                let count: Int
+                switch section {
+                case .headers:     count = headerItems.count
+                case .queryParams: count = queryParamItems.count
+                default: return
+                }
+                label.text = sectionTitle(for: section, count: count)
+            }
+        }
+    }
+
+    private func sectionTitle(for section: Section, count: Int) -> String {
+        switch section {
+        case .endpoint:    return "ENDPOINT PATTERN"
+        case .action:      return "ACTION"
+        case .headers:     return "HEADERS\(count > 0 ? " (\(count))" : "")"
+        case .queryParams: return "QUERY PARAMETERS\(count > 0 ? " (\(count))" : "")"
+        }
     }
 
     // MARK: - UITableViewDataSource
@@ -159,9 +292,9 @@ class InterceptRuleEditorViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
         case .endpoint:    return 1
-        case .action:      return existingRule != nil ? 2 : 1  // block toggle + remove button (if editing)
-        case .headers:     return isBlocked ? 0 : headers.count
-        case .queryParams: return isBlocked ? 0 : queryParams.count
+        case .action:      return existingRule != nil ? 2 : 1
+        case .headers:     return isBlocked ? 0 : headerItems.count
+        case .queryParams: return isBlocked ? 0 : queryParamItems.count
         }
     }
 
@@ -185,7 +318,6 @@ class InterceptRuleEditorViewController: UITableViewController {
 
         case .action:
             if indexPath.row == 0 {
-                // Block toggle
                 let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "BlockCell")
                 cell.selectionStyle = .none
                 cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
@@ -204,7 +336,6 @@ class InterceptRuleEditorViewController: UITableViewController {
                 cell.forceLTR()
                 return cell
             } else {
-                // Remove rule button
                 let cell = UITableViewCell(style: .default, reuseIdentifier: "RemoveCell")
                 cell.selectionStyle = .default
                 cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
@@ -218,25 +349,39 @@ class InterceptRuleEditorViewController: UITableViewController {
 
         case .headers:
             let cell = tableView.dequeueReusableCell(withIdentifier: "KVCell", for: indexPath) as! KeyValueEditCell
-            let pair = headers[indexPath.row]
-            cell.configure(key: pair.key, value: pair.value)
+            let item = headerItems[indexPath.row]
+            cell.configure(key: item.key, value: item.value, dropped: item.isDropped, keyEditable: item.isKeyEditable)
             cell.onKeyChanged = { [weak self] newKey in
-                self?.headers[indexPath.row].key = newKey
+                self?.headerItems[indexPath.row].key = newKey
             }
             cell.onValueChanged = { [weak self] newValue in
-                self?.headers[indexPath.row].value = newValue
+                self?.headerItems[indexPath.row].value = newValue
+            }
+            cell.onDropToggled = { [weak self] in
+                guard let self = self else { return }
+                self.headerItems[indexPath.row].isDropped.toggle()
+                if let c = tableView.cellForRow(at: indexPath) as? KeyValueEditCell {
+                    c.isDropped = self.headerItems[indexPath.row].isDropped
+                }
             }
             return cell
 
         case .queryParams:
             let cell = tableView.dequeueReusableCell(withIdentifier: "KVCell", for: indexPath) as! KeyValueEditCell
-            let pair = queryParams[indexPath.row]
-            cell.configure(key: pair.key, value: pair.value)
+            let item = queryParamItems[indexPath.row]
+            cell.configure(key: item.key, value: item.value, dropped: item.isDropped, keyEditable: item.isKeyEditable)
             cell.onKeyChanged = { [weak self] newKey in
-                self?.queryParams[indexPath.row].key = newKey
+                self?.queryParamItems[indexPath.row].key = newKey
             }
             cell.onValueChanged = { [weak self] newValue in
-                self?.queryParams[indexPath.row].value = newValue
+                self?.queryParamItems[indexPath.row].value = newValue
+            }
+            cell.onDropToggled = { [weak self] in
+                guard let self = self else { return }
+                self.queryParamItems[indexPath.row].isDropped.toggle()
+                if let c = tableView.cellForRow(at: indexPath) as? KeyValueEditCell {
+                    c.isDropped = self.queryParamItems[indexPath.row].isDropped
+                }
             }
             return cell
         }
@@ -245,31 +390,72 @@ class InterceptRuleEditorViewController: UITableViewController {
     // MARK: - UITableViewDelegate
 
     override func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
-        let title: String?
-        switch Section(rawValue: section)! {
-        case .endpoint:    title = "ENDPOINT PATTERN"
-        case .action:      title = "ACTION"
-        case .headers:     title = isBlocked ? nil : "HEADERS (\(headers.count))"
-        case .queryParams: title = isBlocked ? nil : "QUERY PARAMETERS (\(queryParams.count))"
-        }
+        guard let sec = Section(rawValue: section) else { return nil }
 
-        guard let title = title else { return nil }
+        let isKVSection = (sec == .headers || sec == .queryParams)
+
+        // Hide headers/queryParams sections when blocked
+        if isKVSection && isBlocked { return nil }
 
         let header = UIView()
         header.backgroundColor = .clear
 
+        let count: Int
+        switch sec {
+        case .headers:     count = headerItems.count
+        case .queryParams: count = queryParamItems.count
+        default:           count = 0
+        }
+
         let label = UILabel()
+        label.tag = 100
         label.font = .systemFont(ofSize: 13, weight: .bold)
         label.textColor = DebugTheme.accentColor
-        label.text = title
+        label.text = sectionTitle(for: sec, count: count)
         label.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(label)
 
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
-            label.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16),
-            label.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -4),
+            label.centerYAnchor.constraint(equalTo: header.centerYAnchor),
         ])
+
+        // Add button for headers and queryParams sections
+        if isKVSection {
+            let addButton = UIButton(type: .system)
+            addButton.translatesAutoresizingMaskIntoConstraints = false
+            var config = UIButton.Configuration.plain()
+            config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10)
+            config.imagePadding = 4
+            config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+                var attr = attr
+                attr.font = .systemFont(ofSize: 12, weight: .semibold)
+                return attr
+            }
+            config.baseForegroundColor = DebugTheme.accentColor
+            addButton.configuration = config
+            addButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
+            addButton.layer.cornerRadius = 6
+            addButton.clipsToBounds = true
+
+            let iconConfig = UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+            let icon = UIImage(systemName: "plus", withConfiguration: iconConfig)?
+                .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
+            addButton.setImage(icon, for: .normal)
+            addButton.setTitle("Add", for: .normal)
+
+            if sec == .headers {
+                addButton.addTarget(self, action: #selector(addHeaderTapped), for: .touchUpInside)
+            } else {
+                addButton.addTarget(self, action: #selector(addQueryParamTapped), for: .touchUpInside)
+            }
+
+            header.addSubview(addButton)
+            NSLayoutConstraint.activate([
+                addButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16),
+                addButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            ])
+        }
 
         return header
     }
@@ -278,59 +464,15 @@ class InterceptRuleEditorViewController: UITableViewController {
         switch Section(rawValue: section)! {
         case .endpoint, .action: return 40
         case .headers:     return isBlocked ? 0 : 40
-        case .queryParams: return isBlocked ? 0 : (queryParams.isEmpty ? 0 : 40)
+        case .queryParams: return isBlocked ? 0 : 40
         }
     }
 
     override func tableView(_ tableView: UITableView, viewForFooterInSection section: Int) -> UIView? {
-        guard !isBlocked else { return nil }
-
-        let isHeaderSection = (section == Section.headers.rawValue)
-        let isParamSection = (section == Section.queryParams.rawValue)
-        guard isHeaderSection || isParamSection else { return nil }
-
-        let footer = UIView()
-        footer.backgroundColor = .clear
-
-        let addButton = UIButton(type: .system)
-        addButton.translatesAutoresizingMaskIntoConstraints = false
-        var config = UIButton.Configuration.plain()
-        config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12)
-        config.imagePadding = 5
-        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
-            var attr = attr
-            attr.font = .systemFont(ofSize: 11, weight: .semibold)
-            return attr
-        }
-        config.baseForegroundColor = DebugTheme.accentColor
-        addButton.configuration = config
-        addButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
-        addButton.layer.cornerRadius = 6
-        addButton.clipsToBounds = true
-
-        let iconConfig = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
-        let icon = UIImage(systemName: "plus", withConfiguration: iconConfig)?
-            .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
-        addButton.setImage(icon, for: .normal)
-        addButton.setTitle("Add", for: .normal)
-        addButton.tag = section
-        addButton.addTarget(self, action: #selector(addPairTapped(_:)), for: .touchUpInside)
-
-        footer.addSubview(addButton)
-        NSLayoutConstraint.activate([
-            addButton.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 12),
-            addButton.topAnchor.constraint(equalTo: footer.topAnchor, constant: 4),
-            addButton.bottomAnchor.constraint(equalTo: footer.bottomAnchor, constant: -4),
-        ])
-
-        return footer
+        return nil
     }
 
     override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat {
-        guard !isBlocked else { return 0 }
-        if section == Section.headers.rawValue || section == Section.queryParams.rawValue {
-            return 36
-        }
         return 0
     }
 
@@ -350,48 +492,13 @@ class InterceptRuleEditorViewController: UITableViewController {
 
         switch Section(rawValue: indexPath.section)! {
         case .headers:
-            headers.remove(at: indexPath.row)
+            headerItems.remove(at: indexPath.row)
             tableView.deleteRows(at: [indexPath], with: .automatic)
-            // Update header count
-            if let header = tableView.headerView(forSection: indexPath.section) {
-                if let label = header.subviews.compactMap({ $0 as? UILabel }).first {
-                    label.text = "HEADERS (\(headers.count))"
-                }
-            }
+            reloadSectionHeader(.headers)
         case .queryParams:
-            queryParams.remove(at: indexPath.row)
+            queryParamItems.remove(at: indexPath.row)
             tableView.deleteRows(at: [indexPath], with: .automatic)
-        default:
-            break
-        }
-    }
-
-    // MARK: - Add pair
-
-    @objc private func addPairTapped(_ sender: UIButton) {
-        let section = Section(rawValue: sender.tag)!
-        let newPair = KVPair(key: "", value: "")
-
-        switch section {
-        case .headers:
-            headers.append(newPair)
-            let indexPath = IndexPath(row: headers.count - 1, section: section.rawValue)
-            tableView.insertRows(at: [indexPath], with: .automatic)
-            // Focus the key field
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                if let cell = self.tableView.cellForRow(at: indexPath) as? KeyValueEditCell {
-                    cell.keyField.becomeFirstResponder()
-                }
-            }
-        case .queryParams:
-            queryParams.append(newPair)
-            let indexPath = IndexPath(row: queryParams.count - 1, section: section.rawValue)
-            tableView.insertRows(at: [indexPath], with: .automatic)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                if let cell = self.tableView.cellForRow(at: indexPath) as? KeyValueEditCell {
-                    cell.keyField.becomeFirstResponder()
-                }
-            }
+            reloadSectionHeader(.queryParams)
         default:
             break
         }
