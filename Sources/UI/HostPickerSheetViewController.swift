@@ -8,12 +8,23 @@
 import UIKit
 
 /// Sheet-presented multi-select host picker styled like the network filter sheet.
-/// Displays available hosts with checkmarks and an Apply button.
+/// Groups hosts by their tag — selecting a tag selects all hosts under it.
 class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
 
+    /// Raw list of available hosts.
     var hosts: [String] = []
+    /// Currently selected hosts.
     var selectedHosts: Set<String> = []
     var onApply: (([String]) -> Void)?
+
+    /// An entry in the picker — may represent a single host or a group with a tag.
+    private struct Entry {
+        let display: String
+        let subtitle: String?
+        let hosts: [String]
+    }
+
+    private var entries: [Entry] = []
 
     // UI
     private let topBar = UIView()
@@ -26,10 +37,71 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         super.viewDidLoad()
         view.backgroundColor = UIColor(white: 0.12, alpha: 1)
 
+        buildEntries()
         setupTopBar()
         setupTableView()
         view.forceLTR()
     }
+
+    // MARK: - Build grouped entries
+
+    private func buildEntries() {
+        let tags = SwiftyDebug._tags
+        var grouped: [(tag: String, hosts: [String])] = []
+        var tagOrder: [String] = []
+        var tagMap: [String: [String]] = [:]
+        var assignedHosts = Set<String>()
+
+        // Group hosts by matching tag keyword
+        for host in hosts {
+            var matched = false
+            for (keyword, label) in tags {
+                if host.contains(keyword.lowercased()) {
+                    let key = label.lowercased()
+                    if tagMap[key] == nil {
+                        tagOrder.append(label)
+                        tagMap[key] = []
+                    }
+                    tagMap[key]!.append(host)
+                    assignedHosts.insert(host)
+                    matched = true
+                    break
+                }
+            }
+            if !matched {
+                // No tag — standalone entry
+            }
+        }
+
+        // Tagged groups first
+        for label in tagOrder {
+            let groupHosts = tagMap[label.lowercased()] ?? []
+            if !groupHosts.isEmpty {
+                grouped.append((tag: label, hosts: groupHosts))
+            }
+        }
+
+        // Then ungrouped hosts
+        for host in hosts where !assignedHosts.contains(host) {
+            grouped.append((tag: host, hosts: [host]))
+        }
+
+        entries = grouped.map { group in
+            if group.hosts.count == 1 && group.tag == group.hosts[0] {
+                // Single ungrouped host
+                return Entry(display: group.tag, subtitle: nil, hosts: group.hosts)
+            } else {
+                // Tagged group
+                return Entry(
+                    display: group.tag,
+                    subtitle: group.hosts.joined(separator: ", "),
+                    hosts: group.hosts
+                )
+            }
+        }
+    }
+
+    // MARK: - UI Setup
 
     private func setupTopBar() {
         topBar.backgroundColor = UIColor(white: 0.15, alpha: 1)
@@ -88,6 +160,7 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         tableView.separatorColor = UIColor(white: 0.25, alpha: 1)
         tableView.dataSource = self
         tableView.delegate = self
+        tableView.register(HostPickerCell.self, forCellReuseIdentifier: "HostCell")
         view.addSubview(tableView)
 
         NSLayoutConstraint.activate([
@@ -106,42 +179,66 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
     }
 
     @objc private func didTapApply() {
-        onApply?(hosts.filter { selectedHosts.contains($0) })
+        // Return selected hosts preserving original order
+        let result = hosts.filter { selectedHosts.contains($0) }
+        onApply?(result)
         dismiss(animated: true)
     }
 
     // MARK: - UITableViewDataSource
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        hosts.count
+        entries.count
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = UITableViewCell(style: .default, reuseIdentifier: "HostCell")
-        cell.backgroundColor = UIColor(white: 0.12, alpha: 1)
-        cell.selectionStyle = .none
-        cell.tintColor = DebugTheme.accentColor
+        let cell = tableView.dequeueReusableCell(withIdentifier: "HostCell", for: indexPath) as! HostPickerCell
+        let entry = entries[indexPath.row]
+        let isSelected = entry.hosts.allSatisfy { selectedHosts.contains($0) }
 
-        let host = hosts[indexPath.row]
-        let isSelected = selectedHosts.contains(host)
-
-        cell.textLabel?.text = host
-        cell.textLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
-        cell.textLabel?.textColor = .white
-        cell.accessoryType = isSelected ? .checkmark : .none
-        cell.forceLTR()
+        cell.configure(display: entry.display, subtitle: entry.subtitle, selected: isSelected)
         return cell
     }
 
     // MARK: - UITableViewDelegate
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-        let host = hosts[indexPath.row]
-        if selectedHosts.contains(host) {
-            selectedHosts.remove(host)
+        let entry = entries[indexPath.row]
+        let allSelected = entry.hosts.allSatisfy { selectedHosts.contains($0) }
+
+        if allSelected {
+            // Deselect all hosts in this group
+            for host in entry.hosts { selectedHosts.remove(host) }
         } else {
-            selectedHosts.insert(host)
+            // Select all hosts in this group
+            for host in entry.hosts { selectedHosts.insert(host) }
         }
         tableView.reloadRows(at: [indexPath], with: .none)
+    }
+}
+
+// MARK: - Cell
+
+private class HostPickerCell: UITableViewCell {
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: .subtitle, reuseIdentifier: reuseIdentifier)
+        backgroundColor = UIColor(white: 0.12, alpha: 1)
+        selectionStyle = .none
+        tintColor = DebugTheme.accentColor
+        textLabel?.textColor = .white
+        textLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        detailTextLabel?.textColor = UIColor(white: 0.45, alpha: 1)
+        detailTextLabel?.font = .systemFont(ofSize: 12)
+        detailTextLabel?.numberOfLines = 2
+        forceLTR()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(display: String, subtitle: String?, selected: Bool) {
+        textLabel?.text = display
+        detailTextLabel?.text = subtitle
+        accessoryType = selected ? .checkmark : .none
     }
 }

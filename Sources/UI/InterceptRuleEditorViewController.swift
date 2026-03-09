@@ -189,19 +189,30 @@ class InterceptRuleEditorViewController: UITableViewController {
         }
     }
 
-    /// Extracts host names from the SDK URL list.
+    /// Extracts host names from the SDK URL list and captured network traffic.
     private static func extractHosts(from urls: [String]) -> [String] {
+        var seen = Set<String>()
         var hosts: [String] = []
+
+        // From SDK URLs
         for entry in urls {
             if let url = URL(string: entry), let host = url.host {
                 let h = host.lowercased()
-                if !hosts.contains(h) { hosts.append(h) }
+                if seen.insert(h).inserted { hosts.append(h) }
             } else if entry.contains(".") && !entry.contains("/") {
-                // Looks like a bare hostname
                 let h = entry.lowercased()
-                if !hosts.contains(h) { hosts.append(h) }
+                if seen.insert(h).inserted { hosts.append(h) }
             }
         }
+
+        // From captured network traffic
+        let models = NetworkRequestStore.shared.httpModels as? [NetworkTransaction] ?? []
+        for model in models {
+            if let host = model.url?.host?.lowercased(), !host.isEmpty {
+                if seen.insert(host).inserted { hosts.append(host) }
+            }
+        }
+
         return hosts.sorted()
     }
 
