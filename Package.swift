@@ -17,7 +17,7 @@ let package = Package(
         .target(
             name: "SwiftyDebug",
             dependencies: [],
-            path: "Sources/SwiftyDebug",
+            path: "Sources",
             resources: [
                 .process("Resources")
             ],

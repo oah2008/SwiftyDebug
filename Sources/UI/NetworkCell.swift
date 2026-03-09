@@ -62,10 +62,19 @@ class NetworkCell: UITableViewCell {
     private let viewedIcon = UIImageView()
     private let pinIcon = UIImageView()
 
+    // MARK: - Intercept badge (list view)
+
+    private let interceptIcon = UIImageView()
+
     // MARK: - cURL action row (detail header only)
 
     private let curlButton = UIButton(type: .system)
     var onCurlTapped: (() -> Void)?
+
+    // MARK: - Intercept action row (detail header only)
+
+    private let interceptButton = UIButton(type: .system)
+    var onInterceptTapped: (() -> Void)?
 
     // MARK: - Layout containers
 
@@ -86,6 +95,11 @@ class NetworkCell: UITableViewCell {
     /// Set to true to show the cURL copy button (used in detail page header)
     var showCurlButton: Bool = false {
         didSet { curlButton.isHidden = !showCurlButton }
+    }
+
+    /// Set to true to show the intercept button (used in detail page header)
+    var showInterceptButton: Bool = false {
+        didSet { interceptButton.isHidden = !showInterceptButton }
     }
 
     var httpModel: NetworkTransaction? {
@@ -233,6 +247,18 @@ class NetworkCell: UITableViewCell {
         pinIcon.widthAnchor.constraint(equalToConstant: 12).isActive = true
         pinIcon.heightAnchor.constraint(equalToConstant: 12).isActive = true
 
+        // Intercept indicator (orange bolt icon)
+        interceptIcon.isHidden = true
+        interceptIcon.contentMode = .scaleAspectFit
+        interceptIcon.translatesAutoresizingMaskIntoConstraints = false
+        interceptIcon.setContentHuggingPriority(.required, for: .horizontal)
+        interceptIcon.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let interceptIconConfig = UIImage.SymbolConfiguration(pointSize: 9, weight: .medium)
+        interceptIcon.image = UIImage(systemName: "bolt.fill", withConfiguration: interceptIconConfig)?
+            .withTintColor(.systemOrange, renderingMode: .alwaysOriginal)
+        interceptIcon.widthAnchor.constraint(equalToConstant: 12).isActive = true
+        interceptIcon.heightAnchor.constraint(equalToConstant: 12).isActive = true
+
         let bottomSpacer = UIView()
         bottomSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         bottomSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -242,6 +268,7 @@ class NetworkCell: UITableViewCell {
         bottomRow.spacing = 6
         bottomRow.addArrangedSubview(tagsStack)
         bottomRow.addArrangedSubview(bottomSpacer)
+        bottomRow.addArrangedSubview(interceptIcon)
         bottomRow.addArrangedSubview(pinIcon)
         bottomRow.addArrangedSubview(viewedIcon)
         bottomRow.addArrangedSubview(timeLabel)
@@ -250,26 +277,51 @@ class NetworkCell: UITableViewCell {
 
         curlButton.isHidden = true
         curlButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
-        curlButton.layer.cornerRadius = 6
+        curlButton.layer.cornerRadius = 8
         curlButton.clipsToBounds = true
         var curlBtnConfig = UIButton.Configuration.plain()
-        curlBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12)
-        curlBtnConfig.imagePadding = 5
+        curlBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16)
+        curlBtnConfig.imagePadding = 6
         curlBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
             var attr = attr
-            attr.font = .systemFont(ofSize: 11, weight: .semibold)
+            attr.font = .systemFont(ofSize: 13, weight: .semibold)
             return attr
         }
         curlBtnConfig.baseForegroundColor = DebugTheme.accentColor
         curlButton.configuration = curlBtnConfig
         curlButton.addTarget(self, action: #selector(curlButtonTapped), for: .touchUpInside)
 
-        let curlConfig = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
+        let curlConfig = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
         let curlIcon = UIImage(systemName: "terminal", withConfiguration: curlConfig)?
             .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
         curlButton.setImage(curlIcon, for: .normal)
         curlButton.setTitle("Copy cURL", for: .normal)
         curlButton.setTitleColor(DebugTheme.accentColor, for: .normal)
+
+        // --- Intercept button (hidden by default, shown in detail header) ---
+
+        interceptButton.isHidden = true
+        interceptButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
+        interceptButton.layer.cornerRadius = 8
+        interceptButton.clipsToBounds = true
+        var interceptBtnConfig = UIButton.Configuration.plain()
+        interceptBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16)
+        interceptBtnConfig.imagePadding = 6
+        interceptBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 13, weight: .semibold)
+            return attr
+        }
+        interceptBtnConfig.baseForegroundColor = .systemOrange
+        interceptButton.configuration = interceptBtnConfig
+        interceptButton.addTarget(self, action: #selector(interceptButtonTapped), for: .touchUpInside)
+
+        let interceptBtnIconConfig = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        let interceptBtnIcon = UIImage(systemName: "bolt.fill", withConfiguration: interceptBtnIconConfig)?
+            .withTintColor(.systemOrange, renderingMode: .alwaysOriginal)
+        interceptButton.setImage(interceptBtnIcon, for: .normal)
+        interceptButton.setTitle("Intercept Request", for: .normal)
+        interceptButton.setTitleColor(.systemOrange, for: .normal)
 
         // --- Main stack ---
 
@@ -281,6 +333,8 @@ class NetworkCell: UITableViewCell {
         mainStack.addArrangedSubview(urlLabel)
         mainStack.addArrangedSubview(bottomRow)
         mainStack.addArrangedSubview(curlButton)
+        mainStack.setCustomSpacing(12, after: curlButton)
+        mainStack.addArrangedSubview(interceptButton)
         cardView.addSubview(mainStack)
 
         // --- Constraints ---
@@ -389,6 +443,13 @@ class NetworkCell: UITableViewCell {
 
         // Pin indicator
         pinIcon.isHidden = !model.isPinned
+
+        // Intercept indicator
+        if let url = model.url as URL? {
+            interceptIcon.isHidden = !InterceptRuleStore.shared.hasRule(forURL: url)
+        } else {
+            interceptIcon.isHidden = true
+        }
 
         // Tagged highlight
         if model.isTag {
@@ -564,6 +625,10 @@ class NetworkCell: UITableViewCell {
 
     @objc private func curlButtonTapped() {
         onCurlTapped?()
+    }
+
+    @objc private func interceptButtonTapped() {
+        onInterceptTapped?()
     }
 
     private static func abbreviateHost(_ host: String) -> String {

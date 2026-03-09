@@ -557,6 +557,49 @@ class NetworkDetailViewController: UITableViewController {
             }
             self.present(activity, animated: true)
         }
+
+        headerCell?.showInterceptButton = true
+        headerCell?.onInterceptTapped = { [weak self] in
+            guard let self = self, let model = self.httpModel else { return }
+            guard let url = model.url as URL? else { return }
+            let existingRules = InterceptRuleStore.shared.matchingRules(forURL: url)
+
+            if existingRules.isEmpty {
+                // No rules yet — ask user which type to create
+                let alert = UIAlertController(title: "Intercept Rule", message: nil, preferredStyle: .actionSheet)
+
+                alert.addAction(UIAlertAction(title: "Intercept Endpoint", style: .default) { _ in
+                    let editor = InterceptRuleEditorViewController()
+                    editor.httpModel = model
+                    editor.initialMatchMode = .normalized
+                    let nav = SwiftyDebugNavigationController(rootViewController: editor)
+                    self.present(nav, animated: true)
+                })
+
+                alert.addAction(UIAlertAction(title: "Intercept Host", style: .default) { _ in
+                    let editor = InterceptRuleEditorViewController()
+                    editor.httpModel = model
+                    editor.initialMatchMode = .host
+                    let nav = SwiftyDebugNavigationController(rootViewController: editor)
+                    self.present(nav, animated: true)
+                })
+
+                alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+                if let popover = alert.popoverPresentationController {
+                    popover.sourceView = self.view
+                    popover.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY, width: 0, height: 0)
+                    popover.permittedArrowDirections = []
+                }
+                self.present(alert, animated: true)
+            } else {
+                // Rules exist — show the rule list manager
+                let list = InterceptRuleListViewController()
+                list.httpModel = model
+                let nav = SwiftyDebugNavigationController(rootViewController: list)
+                self.present(nav, animated: true)
+            }
+        }
         view.forceLTR()
     }
 

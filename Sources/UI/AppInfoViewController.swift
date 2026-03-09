@@ -13,8 +13,9 @@ class AppInfoViewController: UITableViewController {
 
     private enum Section: Int, CaseIterable {
         case settings = 0
-        case actions = 1
-        case urls = 2
+        case interceptRules = 1
+        case actions = 2
+        case urls = 3
     }
 
     // MARK: - Toggle definitions
@@ -47,6 +48,8 @@ class AppInfoViewController: UITableViewController {
     ]
 
     // MARK: - Data
+
+    private var interceptRules: [InterceptRule] = []
 
     /// Unique captured URLs with tag info
     private var capturedURLs: [URLItem] = []
@@ -110,6 +113,8 @@ class AppInfoViewController: UITableViewController {
     // MARK: - Build Data
 
     private func reloadURLs() {
+        interceptRules = InterceptRuleStore.shared.allRules()
+
         let urls = SwiftyDebug.urls
 
         capturedURLs = urls.map { urlString in
@@ -228,9 +233,10 @@ class AppInfoViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
-        case .settings: return toggles.count
-        case .actions:  return 1
-        case .urls:     return capturedURLs.count
+        case .settings:       return toggles.count
+        case .interceptRules: return interceptRules.count + 1 // rules + "Add Host Rule" button
+        case .actions:        return 1
+        case .urls:           return capturedURLs.count
         }
     }
 
@@ -255,6 +261,85 @@ class AppInfoViewController: UITableViewController {
             sw.tag = indexPath.row
             sw.addTarget(self, action: #selector(toggleChanged(_:)), for: .valueChanged)
             cell.accessoryView = sw
+            cell.forceLTR()
+            return cell
+
+        case .interceptRules:
+            if indexPath.row == interceptRules.count {
+                // "Add Host Rule" button
+                let cell = UITableViewCell(style: .default, reuseIdentifier: "AddRuleCell")
+                cell.selectionStyle = .default
+                cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+                let iconConfig = UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+                cell.imageView?.image = UIImage(systemName: "plus.circle.fill", withConfiguration: iconConfig)?
+                    .withTintColor(.systemPurple, renderingMode: .alwaysOriginal)
+                cell.textLabel?.text = "Add Host Rule"
+                cell.textLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+                cell.textLabel?.textColor = .systemPurple
+                cell.accessoryType = .disclosureIndicator
+                cell.forceLTR()
+                return cell
+            }
+            let rule = interceptRules[indexPath.row]
+            let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "InterceptRuleCell")
+            cell.selectionStyle = .default
+            cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+
+            // Mode badge color
+            let modeColor: UIColor
+            let modeText: String
+            switch rule.matchMode {
+            case .exact:      modeColor = .systemOrange;  modeText = "EXACT"
+            case .normalized: modeColor = DebugTheme.accentColor; modeText = "PATTERN"
+            case .host:       modeColor = .systemPurple;  modeText = "HOST"
+            }
+
+            // Summary
+            var summary: String
+            if rule.isBlocked {
+                summary = "Block"
+            } else {
+                var parts: [String] = []
+                let hc = rule.headerOverrides.count + rule.removedHeaderKeys.count
+                let pc = rule.queryParamOverrides.count + rule.removedQueryParamKeys.count
+                if hc > 0 { parts.append("\(hc) header\(hc == 1 ? "" : "s")") }
+                if pc > 0 { parts.append("\(pc) param\(pc == 1 ? "" : "s")") }
+                summary = parts.isEmpty ? "Empty rule" : parts.joined(separator: ", ")
+            }
+
+            // Title: [MODE] endpoint/hosts
+            let endpoint: String
+            if rule.matchMode == .host {
+                endpoint = rule.matchHosts.joined(separator: ", ")
+            } else {
+                endpoint = rule.matchEndpoint
+            }
+
+            let titleAttr = NSMutableAttributedString()
+            let badgeAttr: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 9, weight: .bold),
+                .foregroundColor: modeColor,
+            ]
+            titleAttr.append(NSAttributedString(string: "\(modeText)  ", attributes: badgeAttr))
+            titleAttr.append(NSAttributedString(string: endpoint, attributes: [
+                .font: UIFont(name: "Menlo", size: 12) ?? .monospacedSystemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: UIColor.white,
+            ]))
+            cell.textLabel?.attributedText = titleAttr
+            cell.textLabel?.numberOfLines = 2
+
+            cell.detailTextLabel?.text = summary
+            cell.detailTextLabel?.font = .systemFont(ofSize: 11)
+            cell.detailTextLabel?.textColor = rule.isBlocked ? .systemRed : UIColor(white: 0.55, alpha: 1)
+
+            // Enable/disable switch
+            let sw = UISwitch()
+            sw.isOn = rule.isEnabled
+            sw.onTintColor = DebugTheme.accentColor
+            sw.tag = indexPath.row
+            sw.addTarget(self, action: #selector(ruleToggleChanged(_:)), for: .valueChanged)
+            cell.accessoryView = sw
+            cell.contentView.alpha = rule.isEnabled ? 1 : 0.5
             cell.forceLTR()
             return cell
 
@@ -283,9 +368,10 @@ class AppInfoViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
         let title: String?
         switch Section(rawValue: section)! {
-        case .settings: title = "SETTINGS"
-        case .actions:  title = "ACTIONS"
-        case .urls:     title = capturedURLs.isEmpty ? nil : "MONITORED URLS (\(capturedURLs.count))"
+        case .settings:       title = "SETTINGS"
+        case .interceptRules: title = "INTERCEPT RULES\(interceptRules.isEmpty ? "" : " (\(interceptRules.count))")"
+        case .actions:        title = "ACTIONS"
+        case .urls:           title = capturedURLs.isEmpty ? nil : "MONITORED URLS (\(capturedURLs.count))"
         }
 
         guard let title = title else { return nil }
@@ -311,9 +397,10 @@ class AppInfoViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
         switch Section(rawValue: section)! {
-        case .settings: return 40
-        case .actions:  return 40
-        case .urls:     return capturedURLs.isEmpty ? 0 : 40
+        case .settings:       return 40
+        case .interceptRules: return 40
+        case .actions:        return 40
+        case .urls:           return capturedURLs.isEmpty ? 0 : 40
         }
     }
 
@@ -339,6 +426,12 @@ class AppInfoViewController: UITableViewController {
         switch Section(rawValue: indexPath.section)! {
         case .settings:
             break
+        case .interceptRules:
+            if indexPath.row == interceptRules.count {
+                addHostRuleTapped()
+            } else {
+                editRuleFromAppTab(interceptRules[indexPath.row])
+            }
         case .actions:
             clearPinnedRequests()
         case .urls:
@@ -353,6 +446,54 @@ class AppInfoViewController: UITableViewController {
             alert.popoverPresentationController?.permittedArrowDirections = .init(rawValue: 0)
             present(alert, animated: true)
         }
+    }
+
+    // Swipe to delete rules
+    override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
+        guard Section(rawValue: indexPath.section) == .interceptRules else { return false }
+        return indexPath.row < interceptRules.count
+    }
+
+    override func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
+        guard editingStyle == .delete,
+              Section(rawValue: indexPath.section) == .interceptRules,
+              indexPath.row < interceptRules.count else { return }
+        let rule = interceptRules[indexPath.row]
+        interceptRules.remove(at: indexPath.row)
+        InterceptRuleStore.shared.remove(id: rule.id)
+        tableView.deleteRows(at: [indexPath], with: .automatic)
+    }
+
+    // MARK: - Intercept Rule actions
+
+    @objc private func ruleToggleChanged(_ sender: UISwitch) {
+        guard sender.tag < interceptRules.count else { return }
+        interceptRules[sender.tag].isEnabled = sender.isOn
+        InterceptRuleStore.shared.update(interceptRules[sender.tag])
+        // Update opacity
+        let indexPath = IndexPath(row: sender.tag, section: Section.interceptRules.rawValue)
+        if let cell = tableView.cellForRow(at: indexPath) {
+            cell.contentView.alpha = sender.isOn ? 1 : 0.5
+        }
+    }
+
+    private func editRuleFromAppTab(_ rule: InterceptRule) {
+        let editor = InterceptRuleEditorViewController()
+        editor.existingRuleId = rule.id
+
+        // Create a minimal model so the editor can look up the rule
+        // For host rules we don't need a real request model — set httpModel to nil
+        // and look up the rule from the store directly
+        editor.ruleToEdit = rule
+        let nav = SwiftyDebugNavigationController(rootViewController: editor)
+        present(nav, animated: true)
+    }
+
+    private func addHostRuleTapped() {
+        let editor = InterceptRuleEditorViewController()
+        editor.initialMatchMode = .host
+        let nav = SwiftyDebugNavigationController(rootViewController: editor)
+        present(nav, animated: true)
     }
 }
 
