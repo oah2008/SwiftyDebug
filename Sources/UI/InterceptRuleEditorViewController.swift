@@ -8,8 +8,7 @@
 import UIKit
 
 /// Editor for creating or editing a single intercept rule.
-/// Headers and query params start empty. The user taps "Add" to pick from the original request
-/// values or add a custom entry. Each item can be edited or toggled to "drop" (remove from request).
+/// Supports endpoint matching (Pattern/Exact) and host-based matching.
 ///
 /// When pushed from `InterceptRuleListViewController`, set `existingRuleId` to edit that rule.
 /// When presented directly (no existing rules), it creates a new rule.
@@ -20,11 +19,13 @@ class InterceptRuleEditorViewController: UITableViewController {
     var httpModel: NetworkTransaction?
     /// Set to a rule ID to edit an existing rule. Leave nil to create a new one.
     var existingRuleId: String?
+    /// Set before presenting to pre-select the match mode (.normalized, .exact, or .host).
+    var initialMatchMode: EndpointMatchMode?
 
     // MARK: - Sections
 
     private enum Section: Int, CaseIterable {
-        case endpoint = 0
+        case endpoint = 0  // For endpoint mode: mode selector + path display. For host mode: host selector.
         case action = 1
         case headers = 2
         case queryParams = 3
@@ -43,8 +44,10 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     private var requestPath: String = ""
     private var normalizedPath: String = ""
+    private var requestHost: String = ""
     private var originalURL: String = ""
     private var matchMode: EndpointMatchMode = .normalized
+    private var selectedHosts: [String] = []
     private var isBlocked: Bool = false
     private var headerItems: [EditItem] = []
     private var queryParamItems: [EditItem] = []
@@ -53,12 +56,17 @@ class InterceptRuleEditorViewController: UITableViewController {
     private var originalHeaders: [(key: String, value: String)] = []
     private var originalQueryParams: [(key: String, value: String)] = []
 
-    /// The endpoint string displayed based on the current match mode.
+    /// Available hosts extracted from `SwiftyDebug.urls`.
+    private var availableHosts: [String] = []
+
     private var displayedEndpoint: String {
-        matchMode == .exact ? requestPath : normalizedPath
+        switch matchMode {
+        case .exact:      return requestPath
+        case .normalized: return normalizedPath
+        case .host:       return selectedHosts.isEmpty ? "(no hosts selected)" : selectedHosts.joined(separator: ", ")
+        }
     }
 
-    /// Whether this editor was presented modally (no rules existed) vs pushed from the list.
     private var isPresentedModally: Bool {
         return navigationController?.viewControllers.first === self
     }
@@ -107,7 +115,15 @@ class InterceptRuleEditorViewController: UITableViewController {
 
         requestPath = model.url?.path ?? ""
         normalizedPath = EndpointNormalizer.normalize(requestPath)
+        requestHost = (model.url?.host ?? "").lowercased()
         originalURL = model.url?.absoluteString ?? ""
+
+        // Build available hosts from SwiftyDebug.urls
+        availableHosts = Self.extractHosts(from: SwiftyDebug.urls)
+        // Ensure the current request's host is included
+        if !requestHost.isEmpty && !availableHosts.contains(requestHost) {
+            availableHosts.insert(requestHost, at: 0)
+        }
 
         // Capture original request values for the picker
         if let headerFields = model.requestHeaderFields as? [String: String] {
@@ -120,13 +136,15 @@ class InterceptRuleEditorViewController: UITableViewController {
 
         // Load existing rule by ID if editing
         if let ruleId = existingRuleId {
-            // Search across both exact and normalized keys
-            let allMatching = InterceptRuleStore.shared.matchingRules(forPath: requestPath)
-            existingRule = allMatching.first(where: { $0.id == ruleId })
+            if let url = model.url as URL? {
+                existingRule = InterceptRuleStore.shared.matchingRules(forURL: url)
+                    .first(where: { $0.id == ruleId })
+            }
         }
 
         if let rule = existingRule {
             matchMode = rule.matchMode
+            selectedHosts = rule.matchHosts
             isBlocked = rule.isBlocked
 
             headerItems = rule.headerOverrides.map {
@@ -145,11 +163,50 @@ class InterceptRuleEditorViewController: UITableViewController {
                 queryParamItems.append(EditItem(key: removedKey, value: originalValue, isDropped: true, isKeyEditable: false))
             }
         } else {
-            matchMode = .normalized
+            matchMode = initialMatchMode ?? .normalized
+            if matchMode == .host && !requestHost.isEmpty {
+                selectedHosts = [requestHost]
+            }
             isBlocked = false
             headerItems = []
             queryParamItems = []
         }
+    }
+
+    /// Extracts host names from the SDK URL list.
+    private static func extractHosts(from urls: [String]) -> [String] {
+        var hosts: [String] = []
+        for entry in urls {
+            if let url = URL(string: entry), let host = url.host {
+                let h = host.lowercased()
+                if !hosts.contains(h) { hosts.append(h) }
+            } else if entry.contains(".") && !entry.contains("/") {
+                // Looks like a bare hostname
+                let h = entry.lowercased()
+                if !hosts.contains(h) { hosts.append(h) }
+            }
+        }
+        return hosts.sorted()
+    }
+
+    /// Collects unique header keys from captured requests matching the selected hosts.
+    private func headerKeysForSelectedHosts() -> [(key: String, value: String)] {
+        let models = NetworkRequestStore.shared.httpModels as? [NetworkTransaction] ?? []
+        var seen = Set<String>()
+        var result: [(key: String, value: String)] = []
+
+        for model in models {
+            guard let host = model.url?.host?.lowercased(), selectedHosts.contains(host) else { continue }
+            guard let headers = model.requestHeaderFields as? [String: String] else { continue }
+            for (key, value) in headers {
+                let lk = key.lowercased()
+                if !seen.contains(lk) {
+                    seen.insert(lk)
+                    result.append((key: key, value: value))
+                }
+            }
+        }
+        return result.sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
     }
 
     // MARK: - Actions
@@ -159,8 +216,21 @@ class InterceptRuleEditorViewController: UITableViewController {
     }
 
     @objc private func saveTapped() {
-        let matchEndpoint = matchMode == .exact ? requestPath : normalizedPath
-        var rule = existingRule ?? InterceptRule(matchEndpoint: matchEndpoint, matchMode: matchMode)
+        var rule: InterceptRule
+        if matchMode == .host {
+            if selectedHosts.isEmpty {
+                showAlert(title: "No Hosts", message: "Select at least one host.")
+                return
+            }
+            let sorted = selectedHosts.map { $0.lowercased() }.sorted()
+            let key = "host:" + sorted.joined(separator: ",")
+            rule = existingRule ?? InterceptRule(matchEndpoint: key, matchMode: .host)
+            rule.matchHosts = sorted
+        } else {
+            let matchEndpoint = matchMode == .exact ? requestPath : normalizedPath
+            rule = existingRule ?? InterceptRule(matchEndpoint: matchEndpoint, matchMode: matchMode)
+        }
+
         rule.isBlocked = isBlocked
         rule.isEnabled = true
         rule.matchMode = matchMode
@@ -181,7 +251,6 @@ class InterceptRuleEditorViewController: UITableViewController {
             queryParamItems.filter { $0.isDropped && !$0.key.isEmpty }.map { $0.key }
         )
 
-        // Rule must have some effect to be saved
         let hasEffect = rule.isBlocked
             || !rule.headerOverrides.isEmpty
             || !rule.removedHeaderKeys.isEmpty
@@ -189,19 +258,12 @@ class InterceptRuleEditorViewController: UITableViewController {
             || !rule.removedQueryParamKeys.isEmpty
 
         if !hasEffect {
-            let alert = UIAlertController(
-                title: "Empty Rule",
-                message: "This rule has no effect. Add headers/parameters to override or drop, or enable blocking.",
-                preferredStyle: .alert
-            )
-            alert.addAction(UIAlertAction(title: "OK", style: .default))
-            present(alert, animated: true)
+            showAlert(title: "Empty Rule", message: "This rule has no effect. Add headers/parameters to override or drop, or enable blocking.")
             return
         }
 
-        // If match mode changed on an existing rule, remove the old one first
-        // (it was keyed under a different matchEndpoint).
-        if let existing = existingRule, existing.matchEndpoint != matchEndpoint {
+        // If the matchEndpoint key changed, remove the old entry first
+        if let existing = existingRule, existing.matchEndpoint != rule.matchEndpoint {
             InterceptRuleStore.shared.remove(id: existing.id)
         }
 
@@ -214,10 +276,10 @@ class InterceptRuleEditorViewController: UITableViewController {
         }
     }
 
-    @objc private func matchModeChanged(_ sender: UISegmentedControl) {
-        matchMode = sender.selectedSegmentIndex == 0 ? .normalized : .exact
-        // Reload endpoint cell to show the correct path
-        tableView.reloadRows(at: [IndexPath(row: 0, section: Section.endpoint.rawValue)], with: .none)
+    private func showAlert(title: String, message: String) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
     }
 
     @objc private func blockToggleChanged(_ sender: UISwitch) {
@@ -236,12 +298,54 @@ class InterceptRuleEditorViewController: UITableViewController {
         }
     }
 
+    // MARK: - Host picker
+
+    @objc private func selectHostsTapped() {
+        let alert = UIAlertController(title: "Select Hosts", message: "Choose hosts to intercept", preferredStyle: .actionSheet)
+
+        for host in availableHosts {
+            let isSelected = selectedHosts.contains(host)
+            let prefix = isSelected ? "✓ " : "  "
+            alert.addAction(UIAlertAction(title: prefix + host, style: isSelected ? .destructive : .default) { [weak self] _ in
+                guard let self = self else { return }
+                if isSelected {
+                    self.selectedHosts.removeAll { $0 == host }
+                } else {
+                    self.selectedHosts.append(host)
+                }
+                // Re-show picker to allow multiple selections
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    self.tableView.reloadSections(IndexSet([Section.endpoint.rawValue]), with: .none)
+                    self.selectHostsTapped()
+                }
+            })
+        }
+
+        alert.addAction(UIAlertAction(title: "Done", style: .cancel) { [weak self] _ in
+            self?.tableView.reloadSections(IndexSet([Section.endpoint.rawValue]), with: .none)
+        })
+
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
+        }
+        present(alert, animated: true)
+    }
+
     // MARK: - Add picker
 
     @objc private func addHeaderTapped() {
+        let items: [(key: String, value: String)]
+        if matchMode == .host {
+            items = headerKeysForSelectedHosts()
+        } else {
+            items = originalHeaders
+        }
+
         showAddPicker(
             title: "Add Header",
-            originalItems: originalHeaders,
+            originalItems: items,
             existingKeys: Set(headerItems.map { $0.key.lowercased() }),
             caseInsensitive: true
         ) { [weak self] item in
@@ -261,6 +365,21 @@ class InterceptRuleEditorViewController: UITableViewController {
     }
 
     @objc private func addQueryParamTapped() {
+        if matchMode == .host {
+            // Host mode: only custom params
+            let item = EditItem(key: "", value: "", isDropped: false, isKeyEditable: true)
+            queryParamItems.append(item)
+            let indexPath = IndexPath(row: queryParamItems.count - 1, section: Section.queryParams.rawValue)
+            tableView.insertRows(at: [indexPath], with: .automatic)
+            reloadSectionHeader(Section.queryParams)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                if let cell = self.tableView.cellForRow(at: indexPath) as? KeyValueEditCell {
+                    cell.keyField.becomeFirstResponder()
+                }
+            }
+            return
+        }
+
         showAddPicker(
             title: "Add Query Parameter",
             originalItems: originalQueryParams,
@@ -333,7 +452,7 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     private func sectionTitle(for section: Section, count: Int) -> String {
         switch section {
-        case .endpoint:    return "ENDPOINT"
+        case .endpoint:    return matchMode == .host ? "HOSTS" : "ENDPOINT"
         case .action:      return "ACTION"
         case .headers:     return "HEADERS\(count > 0 ? " (\(count))" : "")"
         case .queryParams: return "QUERY PARAMETERS\(count > 0 ? " (\(count))" : "")"
@@ -348,7 +467,11 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
-        case .endpoint:    return 2  // match mode selector + endpoint display
+        case .endpoint:
+            if matchMode == .host {
+                return 1 + selectedHosts.count  // host selector button + each selected host
+            }
+            return 2  // mode selector + path display
         case .action:      return existingRule != nil ? 2 : 1
         case .headers:     return isBlocked ? 0 : headerItems.count
         case .queryParams: return isBlocked ? 0 : queryParamItems.count
@@ -358,15 +481,41 @@ class InterceptRuleEditorViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         switch Section(rawValue: indexPath.section)! {
         case .endpoint:
+            if matchMode == .host {
+                if indexPath.row == 0 {
+                    // "Select Hosts" button
+                    let cell = UITableViewCell(style: .default, reuseIdentifier: "HostSelectCell")
+                    cell.selectionStyle = .default
+                    cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+                    cell.textLabel?.text = selectedHosts.isEmpty ? "Select Hosts..." : "Change Hosts..."
+                    cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+                    cell.textLabel?.textColor = .systemPurple
+                    cell.accessoryType = .disclosureIndicator
+                    cell.forceLTR()
+                    return cell
+                } else {
+                    // Display a selected host
+                    let host = selectedHosts[indexPath.row - 1]
+                    let cell = UITableViewCell(style: .default, reuseIdentifier: "HostCell")
+                    cell.selectionStyle = .none
+                    cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+                    cell.textLabel?.text = host
+                    cell.textLabel?.font = UIFont(name: "Menlo", size: 13) ?? .monospacedSystemFont(ofSize: 13, weight: .medium)
+                    cell.textLabel?.textColor = .systemPurple
+                    cell.forceLTR()
+                    return cell
+                }
+            }
+
             if indexPath.row == 0 {
-                // Match mode selector
+                // Match mode selector (Pattern / Exact) — only for endpoint modes
                 let cell = UITableViewCell(style: .default, reuseIdentifier: "MatchModeCell")
                 cell.selectionStyle = .none
                 cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
 
                 let seg = UISegmentedControl(items: ["Pattern", "Exact"])
                 seg.selectedSegmentIndex = matchMode == .normalized ? 0 : 1
-                seg.addTarget(self, action: #selector(matchModeChanged(_:)), for: .valueChanged)
+                seg.addTarget(self, action: #selector(endpointModeChanged(_:)), for: .valueChanged)
                 seg.translatesAutoresizingMaskIntoConstraints = false
                 seg.selectedSegmentTintColor = DebugTheme.accentColor
                 seg.setTitleTextAttributes([.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 12, weight: .semibold)], for: .selected)
@@ -409,7 +558,8 @@ class InterceptRuleEditorViewController: UITableViewController {
                 cell.textLabel?.text = "Block Request"
                 cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
                 cell.textLabel?.textColor = .white
-                cell.detailTextLabel?.text = "Cancel all future requests to this endpoint"
+                let target = matchMode == .host ? "selected hosts" : "this endpoint"
+                cell.detailTextLabel?.text = "Cancel all future requests to \(target)"
                 cell.detailTextLabel?.font = .systemFont(ofSize: 11)
                 cell.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
 
@@ -558,6 +708,10 @@ class InterceptRuleEditorViewController: UITableViewController {
         if indexPath.section == Section.action.rawValue && indexPath.row == 1 {
             removeRuleTapped()
         }
+        // Host selector tap
+        if indexPath.section == Section.endpoint.rawValue && matchMode == .host && indexPath.row == 0 {
+            selectHostsTapped()
+        }
     }
 
     override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
@@ -579,5 +733,12 @@ class InterceptRuleEditorViewController: UITableViewController {
         default:
             break
         }
+    }
+
+    // MARK: - Endpoint mode change (Pattern/Exact only)
+
+    @objc private func endpointModeChanged(_ sender: UISegmentedControl) {
+        matchMode = sender.selectedSegmentIndex == 0 ? .normalized : .exact
+        tableView.reloadRows(at: [IndexPath(row: 1, section: Section.endpoint.rawValue)], with: .none)
     }
 }

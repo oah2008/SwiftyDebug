@@ -67,7 +67,11 @@ class InterceptRuleListViewController: UITableViewController {
     }
 
     private func reloadRules() {
-        ruleList = InterceptRuleStore.shared.matchingRules(forPath: requestPath)
+        if let url = httpModel?.url as URL? {
+            ruleList = InterceptRuleStore.shared.matchingRules(forURL: url)
+        } else {
+            ruleList = InterceptRuleStore.shared.matchingRules(forPath: requestPath)
+        }
         tableView.reloadData()
     }
 
@@ -78,10 +82,32 @@ class InterceptRuleListViewController: UITableViewController {
     }
 
     @objc private func addRuleTapped() {
-        let editor = InterceptRuleEditorViewController()
-        editor.httpModel = httpModel
-        editor.existingRuleId = nil
-        navigationController?.pushViewController(editor, animated: true)
+        let alert = UIAlertController(title: "New Rule", message: nil, preferredStyle: .actionSheet)
+
+        alert.addAction(UIAlertAction(title: "Intercept Endpoint", style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            let editor = InterceptRuleEditorViewController()
+            editor.httpModel = self.httpModel
+            editor.initialMatchMode = .normalized
+            self.navigationController?.pushViewController(editor, animated: true)
+        })
+
+        alert.addAction(UIAlertAction(title: "Intercept Host", style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            let editor = InterceptRuleEditorViewController()
+            editor.httpModel = self.httpModel
+            editor.initialMatchMode = .host
+            self.navigationController?.pushViewController(editor, animated: true)
+        })
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
+        }
+        present(alert, animated: true)
     }
 
     @objc private func toggleEdit() {
@@ -278,6 +304,10 @@ private class InterceptRuleCell: UITableViewCell {
             matchModeLabel.text = " PATTERN "
             matchModeLabel.textColor = DebugTheme.accentColor
             matchModeLabel.backgroundColor = DebugTheme.accentColor.withAlphaComponent(0.15)
+        case .host:
+            matchModeLabel.text = " HOST "
+            matchModeLabel.textColor = .systemPurple
+            matchModeLabel.backgroundColor = UIColor.systemPurple.withAlphaComponent(0.15)
         }
 
         if rule.isBlocked {
@@ -294,6 +324,9 @@ private class InterceptRuleCell: UITableViewCell {
         }
 
         var details: [String] = []
+        if rule.matchMode == .host && !rule.matchHosts.isEmpty {
+            details.append(rule.matchHosts.joined(separator: ", "))
+        }
         if !rule.headerOverrides.isEmpty {
             details.append("Override: " + rule.headerOverrides.map(\.key).joined(separator: ", "))
         }

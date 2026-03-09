@@ -11,8 +11,8 @@ import Foundation
 /// Supports multiple rules per endpoint — rules are applied in `order` ascending,
 /// with later rules overriding earlier ones for the same keys.
 ///
-/// Rules are keyed by `matchEndpoint`. At lookup time both the exact path and normalized
-/// path are checked so that exact-match and normalized-match rules can coexist.
+/// Rules are keyed by `matchEndpoint`. At lookup time the exact path, normalized path,
+/// and request host are all checked so that all three match modes can coexist.
 class InterceptRuleStore {
 
     static let shared = InterceptRuleStore()
@@ -26,7 +26,39 @@ class InterceptRuleStore {
 
     // MARK: - Lookup
 
-    /// Returns all rules that match the given request path (both exact and normalized matches).
+    /// Returns all rules that match the given URL (path-based + host-based).
+    func matchingRules(forURL url: URL) -> [InterceptRule] {
+        objc_sync_enter(self)
+        defer { objc_sync_exit(self) }
+
+        let path = url.path
+        let normalized = EndpointNormalizer.normalize(path)
+        let host = url.host?.lowercased() ?? ""
+        var result: [InterceptRule] = []
+
+        // Exact-match rules
+        if let list = rules[path] {
+            result.append(contentsOf: list.filter { $0.matchMode == .exact })
+        }
+        // Normalized-match rules
+        if let list = rules[normalized] {
+            result.append(contentsOf: list.filter { $0.matchMode == .normalized })
+        }
+        // Host-match rules — scan all host-keyed entries
+        if !host.isEmpty {
+            for (key, list) in rules where key.hasPrefix("host:") {
+                for rule in list where rule.matchMode == .host {
+                    if rule.matchHosts.contains(host) {
+                        result.append(rule)
+                    }
+                }
+            }
+        }
+
+        return result.sorted { $0.order < $1.order }
+    }
+
+    /// Convenience: match by path only (no host matching).
     func matchingRules(forPath path: String) -> [InterceptRule] {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
@@ -34,11 +66,9 @@ class InterceptRuleStore {
         let normalized = EndpointNormalizer.normalize(path)
         var result: [InterceptRule] = []
 
-        // Exact-match rules stored under the literal path
         if let list = rules[path] {
             result.append(contentsOf: list.filter { $0.matchMode == .exact })
         }
-        // Normalized-match rules stored under the normalized path
         if let list = rules[normalized] {
             result.append(contentsOf: list.filter { $0.matchMode == .normalized })
         }
@@ -53,35 +83,25 @@ class InterceptRuleStore {
         return (rules[matchEndpoint] ?? []).sorted { $0.order < $1.order }
     }
 
-    /// Returns `true` if at least one rule matches the given request path.
-    func hasRule(forPath path: String) -> Bool {
-        objc_sync_enter(self)
-        defer { objc_sync_exit(self) }
-
-        let normalized = EndpointNormalizer.normalize(path)
-
-        if let list = rules[path], list.contains(where: { $0.matchMode == .exact }) {
-            return true
-        }
-        if let list = rules[normalized], list.contains(where: { $0.matchMode == .normalized }) {
-            return true
-        }
-        return false
+    /// Returns `true` if at least one rule matches the given URL.
+    func hasRule(forURL url: URL) -> Bool {
+        return !matchingRules(forURL: url).isEmpty
     }
 
-    /// Merges all enabled matching rules for the request path into a single composite rule.
+    /// Returns `true` if at least one rule matches the given path (no host check).
+    func hasRule(forPath path: String) -> Bool {
+        return !matchingRules(forPath: path).isEmpty
+    }
+
+    /// Merges all enabled matching rules for the URL into a single composite rule.
     /// Called from `CustomHTTPProtocol.startLoading()` on every request.
     /// Returns `nil` if no enabled rules match.
-    func resolvedRule(forPath path: String) -> InterceptRule? {
-        let allMatching = matchingRules(forPath: path)
-
-        objc_sync_enter(self)
-        defer { objc_sync_exit(self) }
-
+    func resolvedRule(forURL url: URL) -> InterceptRule? {
+        let allMatching = matchingRules(forURL: url)
         let enabled = allMatching.filter { $0.isEnabled }
         guard !enabled.isEmpty else { return nil }
 
-        var composite = InterceptRule(matchEndpoint: path)
+        var composite = InterceptRule(matchEndpoint: url.path)
 
         for rule in enabled {
             if rule.isBlocked {
@@ -114,6 +134,21 @@ class InterceptRuleStore {
         composite.removedQueryParamKeys.subtract(overriddenParamKeys)
 
         return composite
+    }
+
+    /// Returns all host-based rules that match a given host.
+    func hostRules(forHost host: String) -> [InterceptRule] {
+        objc_sync_enter(self)
+        defer { objc_sync_exit(self) }
+
+        let h = host.lowercased()
+        var result: [InterceptRule] = []
+        for (key, list) in rules where key.hasPrefix("host:") {
+            for rule in list where rule.matchMode == .host && rule.matchHosts.contains(h) {
+                result.append(rule)
+            }
+        }
+        return result.sorted { $0.order < $1.order }
     }
 
     // MARK: - Mutation

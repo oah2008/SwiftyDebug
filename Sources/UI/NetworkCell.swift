@@ -445,7 +445,11 @@ class NetworkCell: UITableViewCell {
         pinIcon.isHidden = !model.isPinned
 
         // Intercept indicator
-        interceptIcon.isHidden = !InterceptRuleStore.shared.hasRule(forPath: model.url?.path ?? "")
+        if let url = model.url as URL? {
+            interceptIcon.isHidden = !InterceptRuleStore.shared.hasRule(forURL: url)
+        } else {
+            interceptIcon.isHidden = true
+        }
 
         // Tagged highlight
         if model.isTag {

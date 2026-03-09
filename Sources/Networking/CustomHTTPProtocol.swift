@@ -366,7 +366,7 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
 
         // --- Interception: check for matching intercept rules ---
         if let url = recursiveRequest.url {
-            if let rule = InterceptRuleStore.shared.resolvedRule(forPath: url.path) {
+            if let rule = InterceptRuleStore.shared.resolvedRule(forURL: url) {
                 if rule.isBlocked {
                     let error = NSError(
                         domain: NSURLErrorDomain,

@@ -20,12 +20,14 @@ struct KVPair: Codable, Equatable {
     }
 }
 
-/// How the rule matches incoming request paths.
+/// How the rule matches incoming requests.
 enum EndpointMatchMode: String, Codable {
     /// Matches only the exact URL path (e.g. `/api/users/123/orders`).
     case exact
     /// Matches the normalized pattern with IDs replaced (e.g. `/api/users/{id}/orders`).
     case normalized
+    /// Matches any request whose host is in `matchHosts`.
+    case host
 }
 
 /// Defines how a matching network request should be modified or blocked.
@@ -33,12 +35,14 @@ enum EndpointMatchMode: String, Codable {
 /// with later rules overriding earlier ones for the same keys.
 struct InterceptRule: Codable {
     let id: String
-    /// The endpoint string used as the match key.
-    /// For `.normalized` mode this is the normalized path (e.g. `/api/users/{id}/orders`).
-    /// For `.exact` mode this is the literal request path (e.g. `/api/users/123/orders`).
+    /// The key used for storage lookup.
+    /// For `.normalized` / `.exact` modes: the endpoint path.
+    /// For `.host` mode: a canonical key like `host:a.com,b.com`.
     let matchEndpoint: String
-    /// How the rule matches incoming request paths.
+    /// How the rule matches incoming requests.
     var matchMode: EndpointMatchMode
+    /// Hosts this rule applies to (only used when `matchMode == .host`).
+    var matchHosts: [String]
     var isBlocked: Bool
     var headerOverrides: [KVPair]
     var queryParamOverrides: [KVPair]
@@ -53,6 +57,7 @@ struct InterceptRule: Codable {
         self.id = UUID().uuidString
         self.matchEndpoint = matchEndpoint
         self.matchMode = matchMode
+        self.matchHosts = []
         self.isBlocked = false
         self.headerOverrides = []
         self.queryParamOverrides = []
@@ -63,22 +68,32 @@ struct InterceptRule: Codable {
         self.order = 0
     }
 
-    // Backward-compatible decoding for rules persisted before matchMode / matchEndpoint existed.
+    /// Convenience initializer for host-based rules.
+    static func hostRule(hosts: [String]) -> InterceptRule {
+        let sorted = hosts.map { $0.lowercased() }.sorted()
+        let key = "host:" + sorted.joined(separator: ",")
+        var rule = InterceptRule(matchEndpoint: key, matchMode: .host)
+        rule.matchHosts = sorted
+        return rule
+    }
+
+    // Backward-compatible decoding.
     enum CodingKeys: String, CodingKey {
-        case id, normalizedEndpoint, matchEndpoint, matchMode, isBlocked, headerOverrides
-        case queryParamOverrides, removedHeaderKeys, removedQueryParamKeys, isEnabled, createdAt, order
+        case id, normalizedEndpoint, matchEndpoint, matchMode, matchHosts, isBlocked
+        case headerOverrides, queryParamOverrides, removedHeaderKeys, removedQueryParamKeys
+        case isEnabled, createdAt, order
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
-        // Migration: old rules stored `normalizedEndpoint`, new ones store `matchEndpoint`.
         if let me = try c.decodeIfPresent(String.self, forKey: .matchEndpoint) {
             matchEndpoint = me
         } else {
             matchEndpoint = try c.decode(String.self, forKey: .normalizedEndpoint)
         }
         matchMode = try c.decodeIfPresent(EndpointMatchMode.self, forKey: .matchMode) ?? .normalized
+        matchHosts = try c.decodeIfPresent([String].self, forKey: .matchHosts) ?? []
         isBlocked = try c.decode(Bool.self, forKey: .isBlocked)
         headerOverrides = try c.decode([KVPair].self, forKey: .headerOverrides)
         queryParamOverrides = try c.decode([KVPair].self, forKey: .queryParamOverrides)
