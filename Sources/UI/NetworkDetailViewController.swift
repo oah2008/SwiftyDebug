@@ -538,7 +538,7 @@ class NetworkDetailViewController: UITableViewController {
             guard let self = self else { return }
             // Use rawCurlString — NOT detailModel.content which has \/ replaced
             let curl = self.rawCurlString
-            UIPasteboard.general.string = "```\n\(curl)\n```"
+            UIPasteboard.general.string = curl
 
             let activity = UIActivityViewController(activityItems: [curl], applicationActivities: nil)
             if UIDevice.current.userInterfaceIdiom == .pad {
@@ -603,7 +603,7 @@ class NetworkDetailViewController: UITableViewController {
         alert.addAction(UIAlertAction(title: "copy cURL to clipboard", style: .default) { [weak self] _ in
             if let httpModel = self?.httpModel {
                 let curl = httpModel.cURLDescription()
-                UIPasteboard.general.string = "```\n\(curl)\n```"
+                UIPasteboard.general.string = curl
             }
         })
 
@@ -1124,7 +1124,7 @@ final class CurlPreviewViewController: UIViewController {
     }
 
     @objc private func copyTapped() {
-        UIPasteboard.general.string = "```\n\(curlString)\n```"
+        UIPasteboard.general.string = curlString
 
         let originalTitle = copyButton.title(for: .normal)
         copyButton.setTitle("Copied!", for: .normal)
