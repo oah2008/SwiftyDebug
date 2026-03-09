@@ -57,7 +57,6 @@ class NetworkViewController: UIViewController {
     private var followButton: UIButton!
     private static let followButtonSize: CGFloat = 40
 
-    private var isFirstAppear = true
     private var isShowingDetail = false
 
     // Convenience
@@ -652,6 +651,10 @@ class NetworkViewController: UIViewController {
         }
         tableView.showsVerticalScrollIndicator = false
 
+        // Always start at bottom with auto-follow enabled when debug VC opens
+        isAutoFollowing = true
+        setFollowButtonVisible(false, animated: false)
+
         reloadHttp()
     }
 
@@ -661,16 +664,6 @@ class NetworkViewController: UIViewController {
             // Returning from detail — don't scroll, just clear flag
             isShowingDetail = false
             return
-        }
-        // Only scroll to bottom on first appear
-        if isFirstAppear {
-            isFirstAppear = false
-            if isAutoFollowing {
-                let count = tableView.numberOfRows(inSection: 0)
-                guard count > 0 else { return }
-                let last = IndexPath(row: count - 1, section: 0)
-                tableView.scrollToRow(at: last, at: .bottom, animated: false)
-            }
         }
     }
 

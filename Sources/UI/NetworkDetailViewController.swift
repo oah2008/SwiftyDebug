@@ -11,6 +11,7 @@ import UIKit
 class NetworkDetailViewController: UITableViewController {
     
     private var closeItem: UIBarButtonItem!
+    private var pinItem: UIBarButtonItem!
 
     var naviItemTitleLabel: UILabel?
     
@@ -527,8 +528,15 @@ class NetworkDetailViewController: UITableViewController {
         tableView.contentInset.bottom = 16
         tableView.showsVerticalScrollIndicator = false
 
-        // Nav bar: close only
-        navigationItem.rightBarButtonItems = [closeItem]
+        // Pin button
+        let pinImage = (httpModel?.isPinned == true)
+            ? UIImage(systemName: "pin.slash.fill")
+            : UIImage(systemName: "pin.fill")
+        pinItem = UIBarButtonItem(image: pinImage, style: .plain, target: self, action: #selector(togglePin))
+        pinItem.tintColor = DebugTheme.accentColor
+
+        // Nav bar
+        navigationItem.rightBarButtonItems = [closeItem, pinItem]
 
         //header
         headerCell = NetworkCell(style: .default, reuseIdentifier: "NetworkCell")
@@ -591,7 +599,20 @@ class NetworkDetailViewController: UITableViewController {
     @objc func close(_ sender: UIBarButtonItem) {
         self.navigationController?.dismiss(animated: true)
     }
-    
+
+    @objc private func togglePin() {
+        guard let model = httpModel else { return }
+        model.isPinned.toggle()
+        if model.isPinned {
+            model.savePinToDisk()
+        } else {
+            model.removePinFromDisk()
+        }
+        pinItem.image = model.isPinned
+            ? UIImage(systemName: "pin.slash.fill")
+            : UIImage(systemName: "pin.fill")
+    }
+
     @objc func didTapMail(_ sender: UIBarButtonItem) {
 
         let alert = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
