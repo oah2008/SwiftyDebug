@@ -43,35 +43,22 @@ class Settings: NSObject {
 
     private func updateBubblePresentation() {
         let presenter = DebugWindowPresenter.shared
+        let bubble = presenter.vc.bubble
+        let screenWidth = UIScreen.main.bounds.size.width
+        let bubbleWidth = bubble.frame.size.width
+        let isOnRightSide = bubble.frame.origin.x > screenWidth / 2
+        let visibleOffset = bubbleWidth / 8 * 8.25
 
-        if presenter.vc.usesDynamicIsland {
-            // Dynamic Island device — show/hide the pill
-            if bubbleVisible {
-                presenter.enable()
-                presenter.vc.dynamicIslandBubble?.isHidden = false
-            } else {
-                presenter.vc.dynamicIslandBubble?.isHidden = true
-                presenter.disable()
-            }
+        if bubbleVisible {
+            bubble.frame.origin.x = isOnRightSide
+                ? screenWidth - visibleOffset
+                : -bubbleWidth + visibleOffset
+            presenter.enable()
         } else {
-            // Regular bubble device
-            let bubble = presenter.vc.bubble
-            let screenWidth = UIScreen.main.bounds.size.width
-            let bubbleWidth = bubble.frame.size.width
-            let isOnRightSide = bubble.frame.origin.x > screenWidth / 2
-            let visibleOffset = bubbleWidth / 8 * 8.25
-
-            if bubbleVisible {
-                bubble.frame.origin.x = isOnRightSide
-                    ? screenWidth - visibleOffset
-                    : -bubbleWidth + visibleOffset
-                presenter.enable()
-            } else {
-                bubble.frame.origin.x = isOnRightSide
-                    ? screenWidth
-                    : -bubbleWidth
-                presenter.disable()
-            }
+            bubble.frame.origin.x = isOnRightSide
+                ? screenWidth
+                : -bubbleWidth
+            presenter.disable()
         }
     }
 }
