@@ -31,10 +31,13 @@ struct NetworkDetailSection {
     var sizeTag: String? = nil
     /// Other requests shown horizontally in the "SIMILAR REQUESTS" section
     var similarRequests: [NetworkTransaction]? = nil
+    /// Original content before display transformation — used for copying valid JSON.
+    var rawContent: String? = nil
 
 
     init(title: String? = nil, content: String? = "", url: String? = "", image: UIImage? = nil, httpModel: NetworkTransaction? = nil) {
         self.title = title?.replacingOccurrences(of: "\\/", with: "/")
+        self.rawContent = content
         self.content = content?.replacingOccurrences(of: "\\/", with: "/")
         self.url = url?.replacingOccurrences(of: "\\/", with: "/")
         self.image = image

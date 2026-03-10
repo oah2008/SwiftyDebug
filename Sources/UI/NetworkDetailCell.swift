@@ -128,6 +128,7 @@ class NetworkDetailCell: UITableViewCell {
 
         // Content text view
         contentTextView.isEditable = false
+        contentTextView.isSelectable = true
         contentTextView.isScrollEnabled = false
         contentTextView.backgroundColor = .clear
         contentTextView.textColor = Self.contentColor
@@ -375,8 +376,18 @@ class NetworkDetailCell: UITableViewCell {
     }
 
     @objc private func tapCopy() {
-        guard let content = detailModel?.content, !content.isEmpty else { return }
-        UIPasteboard.general.string = content
+        let source = detailModel?.rawContent ?? detailModel?.content ?? ""
+        guard !source.isEmpty else { return }
+
+        // Try to re-serialize as valid, clean JSON
+        if let data = source.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data),
+           let pretty = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted),
+           let str = String(data: pretty, encoding: .utf8) {
+            UIPasteboard.general.string = str
+        } else {
+            UIPasteboard.general.string = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
 
         // Brief visual feedback — flash the icon color
         let config = UIImage.SymbolConfiguration(pointSize: 12, weight: .medium)
