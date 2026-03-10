@@ -77,7 +77,7 @@ class Settings: NSObject {
             ? true
             : ud.bool(forKey: SettingsKey.webNetworkRequestsEnabled.rawValue)
         consoleLogsEnabled = ud.object(forKey: SettingsKey.consoleLogsEnabled.rawValue) == nil
-            ? true
+            ? false
             : ud.bool(forKey: SettingsKey.consoleLogsEnabled.rawValue)
         webLogsEnabled = ud.object(forKey: SettingsKey.webLogsEnabled.rawValue) == nil
             ? true
