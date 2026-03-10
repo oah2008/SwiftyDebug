@@ -103,7 +103,7 @@ class NetworkViewController: UIViewController {
     //MARK: - Filter entry building
 
     private func buildFilterEntries() -> [(display: String, filterKeys: [(key: String, isPathFilter: Bool)], isWeb: Bool)] {
-        guard let allCacheModels = cacheModels, !allCacheModels.isEmpty else { return [] }
+        let allCacheModels = cacheModels ?? []
 
         // Filter by current tab first (respecting settings toggles)
         let allModels: [NetworkTransaction]
@@ -118,7 +118,6 @@ class NetworkViewController: UIViewController {
                 : []
         case .pinned: allModels = allCacheModels.filter { $0.isPinned }
         }
-        guard !allModels.isEmpty else { return [] }
 
         let onlyURLs = SwiftyDebug.urls
         var rawEntries: [(display: String, filterKey: String, isPathFilter: Bool, isWeb: Bool)] = []
@@ -161,6 +160,27 @@ class NetworkViewController: UIViewController {
                     m.isWebViewRequest && m.url?.host?.lowercased() == lowerHost
                 }
                 rawEntries.append((display: display, filterKey: host, isPathFilter: false, isWeb: isWeb))
+            }
+        }
+
+        // Add currently-selected filters that are not already in the list (exact match)
+        let state = currentTabState
+        var addedKeys = Set<String>(rawEntries.map { $0.filterKey.lowercased() })
+
+        for key in state.selectedPathFilters {
+            let lower = key.lowercased()
+            if !addedKeys.contains(lower) {
+                addedKeys.insert(lower)
+                let display = tagLabel(forURLString: key) ?? key
+                rawEntries.append((display: display, filterKey: key, isPathFilter: true, isWeb: false))
+            }
+        }
+        for key in state.selectedHostFilters {
+            let lower = key.lowercased()
+            if !addedKeys.contains(lower) {
+                addedKeys.insert(lower)
+                let display = tagLabel(forHost: lower) ?? key
+                rawEntries.append((display: display, filterKey: key, isPathFilter: false, isWeb: false))
             }
         }
 
@@ -495,7 +515,6 @@ class NetworkViewController: UIViewController {
 
     @objc func didTapFilter() {
         let entries = buildFilterEntries()
-        if entries.isEmpty { return }
 
         let state = currentTabState
         let sheet = NetworkFilterSheetController()
