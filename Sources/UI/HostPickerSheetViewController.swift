@@ -69,7 +69,7 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         var rawEntries: [RawEntry] = []
         var addedKeys = Set<String>()
 
-        // Build entries from SwiftyDebug.urls — only those with active traffic OR already selected in rules
+        // Build entries from SwiftyDebug.urls — only those with active traffic
         for urlString in onlyURLs {
             var stripped = stripScheme(urlString)
             if stripped.hasSuffix("/") { stripped = String(stripped.dropLast()) }
@@ -79,14 +79,15 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
             var hasMatch = false
             for model in models {
                 let modelStripped = stripScheme(model.url?.absoluteString ?? "").lowercased()
-                if modelStripped == key || modelStripped.hasPrefix(key + "/") {
+                // Remove query string for comparison
+                let cleanModel = modelStripped.components(separatedBy: "?").first ?? modelStripped
+                if cleanModel == key || cleanModel.hasPrefix(key + "/") {
                     hasMatch = true
                     break
                 }
             }
 
-            // Show if has active traffic OR is already selected in a rule
-            if hasMatch || ruleSelectedKeys.contains(key) {
+            if hasMatch {
                 if addedKeys.insert(key).inserted {
                     let display = tagLabel(forURLString: urlString) ?? stripped
                     rawEntries.append(RawEntry(display: display, filterKey: stripped))
@@ -113,11 +114,13 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
             }
         }
 
-        // Also include any rule-selected keys not yet in the list
+        // Add rule-selected/current-selected keys ONLY if exact key not already in the list
         for key in ruleSelectedKeys {
-            if addedKeys.insert(key).inserted {
-                let display = tagLabel(forHost: key.components(separatedBy: "/").first ?? key) ?? key
-                rawEntries.append(RawEntry(display: display, filterKey: key))
+            if !addedKeys.contains(key) {
+                if addedKeys.insert(key).inserted {
+                    let display = tagLabel(forHost: key.components(separatedBy: "/").first ?? key) ?? key
+                    rawEntries.append(RawEntry(display: display, filterKey: key))
+                }
             }
         }
 
