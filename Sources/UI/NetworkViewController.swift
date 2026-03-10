@@ -171,7 +171,9 @@ class NetworkViewController: UIViewController {
             let lower = key.lowercased()
             if !addedKeys.contains(lower) {
                 addedKeys.insert(lower)
-                let display = tagLabel(forURLString: key) ?? key
+                // Find original URL from SwiftyDebug.urls to resolve tag correctly
+                let originalURL = onlyURLs.first { stripScheme($0).lowercased().hasPrefix(lower) }
+                let display = tagLabel(forURLString: originalURL ?? key) ?? tagLabel(forHost: lower.components(separatedBy: "/").first ?? lower) ?? key
                 rawEntries.append((display: display, filterKey: key, isPathFilter: true, isWeb: false))
             }
         }
@@ -179,7 +181,8 @@ class NetworkViewController: UIViewController {
             let lower = key.lowercased()
             if !addedKeys.contains(lower) {
                 addedKeys.insert(lower)
-                let display = tagLabel(forHost: lower) ?? key
+                let originalURL = onlyURLs.first { stripScheme($0).lowercased().hasPrefix(lower) }
+                let display = tagLabel(forURLString: originalURL ?? key) ?? tagLabel(forHost: lower) ?? key
                 rawEntries.append((display: display, filterKey: key, isPathFilter: false, isWeb: false))
             }
         }
