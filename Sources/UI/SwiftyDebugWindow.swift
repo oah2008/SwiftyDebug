@@ -24,6 +24,10 @@ class SwiftyDebugWindow: UIWindow {
         fatalError("init(coder:) has not been implemented")
     }
     
+    override var traitCollection: UITraitCollection {
+        UITraitCollection(traitsFrom: [super.traitCollection, UITraitCollection(layoutDirection: .leftToRight)])
+    }
+
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
         return self.delegate?.isPointEvent(point: point) ?? false
     }

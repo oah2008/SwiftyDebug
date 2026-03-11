@@ -1,0 +1,11 @@
+platform :ios, '15.0'
+
+use_frameworks!
+
+target 'SwiftyDebugDemo' do
+pod 'SwiftyDebug', :path => '../', :configurations => ['Debug']
+pod 'SwiftyConstraint'
+pod 'SwiftyNetworkIOS'
+pod 'Factory', '~> 1.3.7'
+pod 'Kingfisher', '~> 8.0'
+end
