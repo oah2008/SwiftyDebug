@@ -28,6 +28,8 @@ enum EndpointMatchMode: String, Codable {
     case normalized
     /// Matches any request whose host is in `matchHosts`.
     case host
+    /// Matches every request regardless of URL.
+    case global
 }
 
 /// Defines how a matching network request should be modified or blocked.
@@ -66,6 +68,11 @@ struct InterceptRule: Codable {
         self.isEnabled = true
         self.createdAt = Date()
         self.order = 0
+    }
+
+    /// Convenience initializer for global rules (match every request).
+    static func globalRule() -> InterceptRule {
+        return InterceptRule(matchEndpoint: "global", matchMode: .global)
     }
 
     /// Convenience initializer for host-based rules.

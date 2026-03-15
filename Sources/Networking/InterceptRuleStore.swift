@@ -7,6 +7,10 @@
 
 import Foundation
 
+extension Notification.Name {
+    static let interceptRulesDidChange = Notification.Name("com.swiftydebug.interceptRulesDidChange")
+}
+
 /// Thread-safe singleton that stores interception rules in memory and persists them to disk.
 /// Supports multiple rules per endpoint — rules are applied in `order` ascending,
 /// with later rules overriding earlier ones for the same keys.
@@ -26,7 +30,7 @@ class InterceptRuleStore {
 
     // MARK: - Lookup
 
-    /// Returns all rules that match the given URL (path-based + host-based).
+    /// Returns all rules that match the given URL (path-based + host-based + global).
     func matchingRules(forURL url: URL) -> [InterceptRule] {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
@@ -35,6 +39,10 @@ class InterceptRuleStore {
         let normalized = EndpointNormalizer.normalize(path)
         var result: [InterceptRule] = []
 
+        // Global rules — match every request
+        if let list = rules["global"] {
+            result.append(contentsOf: list.filter { $0.matchMode == .global })
+        }
         // Exact-match rules
         if let list = rules[path] {
             result.append(contentsOf: list.filter { $0.matchMode == .exact })
@@ -284,6 +292,37 @@ class InterceptRuleStore {
         } catch {
             // Silent failure — debug tool, not critical path
         }
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .interceptRulesDidChange, object: nil)
+        }
+    }
+
+    /// Serializes all enabled rules to a JSON string consumable by the WKWebView JS interceptor.
+    func rulesAsJSONString() -> String {
+        objc_sync_enter(self)
+        defer { objc_sync_exit(self) }
+
+        let enabled = rules.values.flatMap { $0 }.filter { $0.isEnabled }
+        var jsRules: [[String: Any]] = []
+        for rule in enabled {
+            let dict: [String: Any] = [
+                "matchEndpoint": rule.matchEndpoint,
+                "matchMode": rule.matchMode.rawValue,
+                "matchHosts": rule.matchHosts,
+                "isBlocked": rule.isBlocked,
+                "order": rule.order,
+                "headerOverrides": rule.headerOverrides.map { ["key": $0.key, "value": $0.value] },
+                "queryParamOverrides": rule.queryParamOverrides.map { ["key": $0.key, "value": $0.value] },
+                "removedHeaderKeys": Array(rule.removedHeaderKeys),
+                "removedQueryParamKeys": Array(rule.removedQueryParamKeys)
+            ]
+            jsRules.append(dict)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: jsRules, options: []),
+              let str = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return str
     }
 
     private func loadFromDisk() {

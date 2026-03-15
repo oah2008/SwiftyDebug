@@ -100,6 +100,14 @@ class InterceptRuleListViewController: UITableViewController {
             self.navigationController?.pushViewController(editor, animated: true)
         })
 
+        alert.addAction(UIAlertAction(title: "Global Rule", style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            let editor = InterceptRuleEditorViewController()
+            editor.httpModel = self.httpModel
+            editor.initialMatchMode = .global
+            self.navigationController?.pushViewController(editor, animated: true)
+        })
+
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
 
         if let popover = alert.popoverPresentationController {
@@ -308,6 +316,10 @@ private class InterceptRuleCell: UITableViewCell {
             matchModeLabel.text = " HOST "
             matchModeLabel.textColor = .systemPurple
             matchModeLabel.backgroundColor = UIColor.systemPurple.withAlphaComponent(0.15)
+        case .global:
+            matchModeLabel.text = " GLOBAL "
+            matchModeLabel.textColor = .systemPink
+            matchModeLabel.backgroundColor = UIColor.systemPink.withAlphaComponent(0.15)
         }
 
         if rule.isBlocked {
@@ -326,6 +338,8 @@ private class InterceptRuleCell: UITableViewCell {
         var details: [String] = []
         if rule.matchMode == .host && !rule.matchHosts.isEmpty {
             details.append(rule.matchHosts.joined(separator: ", "))
+        } else if rule.matchMode == .global {
+            details.append("Applies to all requests")
         }
         if !rule.headerOverrides.isEmpty {
             details.append("Override: " + rule.headerOverrides.map(\.key).joined(separator: ", "))

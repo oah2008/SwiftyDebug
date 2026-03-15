@@ -63,6 +63,7 @@ class InterceptRuleEditorViewController: UITableViewController {
         case .exact:      return requestPath
         case .normalized: return normalizedPath
         case .host:       return selectedHosts.isEmpty ? "(no URLs selected)" : selectedHosts.joined(separator: ", ")
+        case .global:     return "All Requests"
         }
     }
 
@@ -139,12 +140,12 @@ class InterceptRuleEditorViewController: UITableViewController {
             existingRuleId = rule.id
             if rule.matchMode == .host {
                 selectedHosts = rule.matchHosts
-            } else {
+            } else if rule.matchMode != .global {
                 requestPath = rule.matchEndpoint
                 normalizedPath = rule.matchEndpoint
             }
-        } else if initialMatchMode == .host {
-            // Creating host rule from App tab — no model needed
+        } else if initialMatchMode == .host || initialMatchMode == .global {
+            // Creating host/global rule from App tab — no model needed
         }
 
         if let rule = existingRule {
@@ -201,6 +202,25 @@ class InterceptRuleEditorViewController: UITableViewController {
         return result.sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
     }
 
+    /// Collects unique header keys from all captured requests.
+    private func headerKeysForAllRequests() -> [(key: String, value: String)] {
+        let models = NetworkRequestStore.shared.httpModels as? [NetworkTransaction] ?? []
+        var seen = Set<String>()
+        var result: [(key: String, value: String)] = []
+
+        for model in models {
+            guard let headers = model.requestHeaderFields as? [String: String] else { continue }
+            for (key, value) in headers {
+                let lk = key.lowercased()
+                if !seen.contains(lk) {
+                    seen.insert(lk)
+                    result.append((key: key, value: value))
+                }
+            }
+        }
+        return result.sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+    }
+
     // MARK: - Actions
 
     @objc private func cancelTapped() {
@@ -209,7 +229,9 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     @objc private func saveTapped() {
         var rule: InterceptRule
-        if matchMode == .host {
+        if matchMode == .global {
+            rule = existingRule ?? InterceptRule.globalRule()
+        } else if matchMode == .host {
             if selectedHosts.isEmpty {
                 showAlert(title: "No URLs", message: "Select at least one URL to intercept.")
                 return
@@ -313,7 +335,9 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     @objc private func addHeaderTapped() {
         let items: [(key: String, value: String)]
-        if matchMode == .host {
+        if matchMode == .global {
+            items = headerKeysForAllRequests()
+        } else if matchMode == .host {
             items = headerKeysForSelectedHosts()
         } else {
             items = originalHeaders
@@ -341,8 +365,8 @@ class InterceptRuleEditorViewController: UITableViewController {
     }
 
     @objc private func addQueryParamTapped() {
-        if matchMode == .host {
-            // Host mode: only custom params
+        if matchMode == .host || matchMode == .global {
+            // Host/global mode: only custom params
             let item = EditItem(key: "", value: "", isDropped: false, isKeyEditable: true)
             queryParamItems.append(item)
             let indexPath = IndexPath(row: queryParamItems.count - 1, section: Section.queryParams.rawValue)
@@ -424,7 +448,7 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     private func sectionTitle(for section: Section, count: Int) -> String {
         switch section {
-        case .endpoint:    return matchMode == .host ? "URLS" : "ENDPOINT"
+        case .endpoint:    return matchMode == .global ? "SCOPE" : matchMode == .host ? "URLS" : "ENDPOINT"
         case .action:      return "ACTION"
         case .headers:     return "HEADERS\(count > 0 ? " (\(count))" : "")"
         case .queryParams: return "QUERY PARAMETERS\(count > 0 ? " (\(count))" : "")"
@@ -440,6 +464,7 @@ class InterceptRuleEditorViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
         case .endpoint:
+            if matchMode == .global { return 1 }  // description only
             if matchMode == .host {
                 return 1 + selectedHosts.count  // host selector button + each selected host
             }
@@ -453,6 +478,20 @@ class InterceptRuleEditorViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         switch Section(rawValue: indexPath.section)! {
         case .endpoint:
+            if matchMode == .global {
+                let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "GlobalCell")
+                cell.selectionStyle = .none
+                cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+                cell.textLabel?.text = "Global Rule"
+                cell.textLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+                cell.textLabel?.textColor = .systemPink
+                cell.detailTextLabel?.text = "Applies to every request in the app and web views"
+                cell.detailTextLabel?.font = .systemFont(ofSize: 11)
+                cell.detailTextLabel?.textColor = UIColor(white: 0.45, alpha: 1)
+                cell.detailTextLabel?.numberOfLines = 2
+                cell.forceLTR()
+                return cell
+            }
             if matchMode == .host {
                 if indexPath.row == 0 {
                     // "Select Hosts" button
@@ -530,7 +569,7 @@ class InterceptRuleEditorViewController: UITableViewController {
                 cell.textLabel?.text = "Block Request"
                 cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
                 cell.textLabel?.textColor = .white
-                let target = matchMode == .host ? "selected hosts" : "this endpoint"
+                let target = matchMode == .global ? "all URLs" : matchMode == .host ? "selected hosts" : "this endpoint"
                 cell.detailTextLabel?.text = "Cancel all future requests to \(target)"
                 cell.detailTextLabel?.font = .systemFont(ofSize: 11)
                 cell.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
