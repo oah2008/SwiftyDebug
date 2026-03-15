@@ -370,7 +370,8 @@ extension WKWebView {
         var path=getPath(urlStr);var norm=normalizePath(path);var stripped=stripForHost(urlStr);
         var matched=[];
         for(var i=0;i<rules.length;i++){var r=rules[i];
-        if(r.matchMode==='exact'&&r.matchEndpoint===path){matched.push(r);}
+        if(r.matchMode==='global'){matched.push(r);}
+        else if(r.matchMode==='exact'&&r.matchEndpoint===path){matched.push(r);}
         else if(r.matchMode==='normalized'&&r.matchEndpoint===norm){matched.push(r);}
         else if(r.matchMode==='host'&&r.matchHosts){
         for(var j=0;j<r.matchHosts.length;j++){if(hostMatch(stripped,r.matchHosts[j])){matched.push(r);break;}}}}

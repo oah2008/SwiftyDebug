@@ -30,7 +30,7 @@ class InterceptRuleStore {
 
     // MARK: - Lookup
 
-    /// Returns all rules that match the given URL (path-based + host-based).
+    /// Returns all rules that match the given URL (path-based + host-based + global).
     func matchingRules(forURL url: URL) -> [InterceptRule] {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
@@ -39,6 +39,10 @@ class InterceptRuleStore {
         let normalized = EndpointNormalizer.normalize(path)
         var result: [InterceptRule] = []
 
+        // Global rules — match every request
+        if let list = rules["global"] {
+            result.append(contentsOf: list.filter { $0.matchMode == .global })
+        }
         // Exact-match rules
         if let list = rules[path] {
             result.append(contentsOf: list.filter { $0.matchMode == .exact })

@@ -234,7 +234,7 @@ class AppInfoViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
         case .settings:       return toggles.count
-        case .interceptRules: return interceptRules.count + 1 // rules + "Add Host Rule" button
+        case .interceptRules: return interceptRules.count + 1 // rules + "Add Rule" button
         case .actions:        return 1
         case .urls:           return capturedURLs.count
         }
@@ -266,16 +266,16 @@ class AppInfoViewController: UITableViewController {
 
         case .interceptRules:
             if indexPath.row == interceptRules.count {
-                // "Add Host Rule" button
+                // "Add Rule" button
                 let cell = UITableViewCell(style: .default, reuseIdentifier: "AddRuleCell")
                 cell.selectionStyle = .default
                 cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
                 let iconConfig = UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
                 cell.imageView?.image = UIImage(systemName: "plus.circle.fill", withConfiguration: iconConfig)?
-                    .withTintColor(.systemPurple, renderingMode: .alwaysOriginal)
-                cell.textLabel?.text = "Add Host Rule"
+                    .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
+                cell.textLabel?.text = "Add Rule"
                 cell.textLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
-                cell.textLabel?.textColor = .systemPurple
+                cell.textLabel?.textColor = DebugTheme.accentColor
                 cell.accessoryType = .disclosureIndicator
                 cell.forceLTR()
                 return cell
@@ -292,6 +292,7 @@ class AppInfoViewController: UITableViewController {
             case .exact:      modeColor = .systemOrange;  modeText = "EXACT"
             case .normalized: modeColor = DebugTheme.accentColor; modeText = "PATTERN"
             case .host:       modeColor = .systemPurple;  modeText = "HOST"
+            case .global:     modeColor = .systemPink;    modeText = "GLOBAL"
             }
 
             // Summary
@@ -311,6 +312,8 @@ class AppInfoViewController: UITableViewController {
             let endpoint: String
             if rule.matchMode == .host {
                 endpoint = rule.matchHosts.joined(separator: ", ")
+            } else if rule.matchMode == .global {
+                endpoint = "All Requests"
             } else {
                 endpoint = rule.matchEndpoint
             }
@@ -428,7 +431,7 @@ class AppInfoViewController: UITableViewController {
             break
         case .interceptRules:
             if indexPath.row == interceptRules.count {
-                addHostRuleTapped()
+                addRuleTapped()
             } else {
                 editRuleFromAppTab(interceptRules[indexPath.row])
             }
@@ -489,11 +492,31 @@ class AppInfoViewController: UITableViewController {
         present(nav, animated: true)
     }
 
-    private func addHostRuleTapped() {
-        let editor = InterceptRuleEditorViewController()
-        editor.initialMatchMode = .host
-        let nav = SwiftyDebugNavigationController(rootViewController: editor)
-        present(nav, animated: true)
+    private func addRuleTapped() {
+        let alert = UIAlertController(title: "New Rule", message: nil, preferredStyle: .actionSheet)
+
+        alert.addAction(UIAlertAction(title: "Host Rule", style: .default) { [weak self] _ in
+            let editor = InterceptRuleEditorViewController()
+            editor.initialMatchMode = .host
+            let nav = SwiftyDebugNavigationController(rootViewController: editor)
+            self?.present(nav, animated: true)
+        })
+
+        alert.addAction(UIAlertAction(title: "Global Rule", style: .default) { [weak self] _ in
+            let editor = InterceptRuleEditorViewController()
+            editor.initialMatchMode = .global
+            let nav = SwiftyDebugNavigationController(rootViewController: editor)
+            self?.present(nav, animated: true)
+        })
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
+        }
+        present(alert, animated: true)
     }
 }
 

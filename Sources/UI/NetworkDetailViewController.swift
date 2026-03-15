@@ -584,6 +584,14 @@ class NetworkDetailViewController: UITableViewController {
                     self.present(nav, animated: true)
                 })
 
+                alert.addAction(UIAlertAction(title: "Global Rule", style: .default) { _ in
+                    let editor = InterceptRuleEditorViewController()
+                    editor.httpModel = model
+                    editor.initialMatchMode = .global
+                    let nav = SwiftyDebugNavigationController(rootViewController: editor)
+                    self.present(nav, animated: true)
+                })
+
                 alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
 
                 if let popover = alert.popoverPresentationController {
