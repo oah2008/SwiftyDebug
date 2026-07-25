@@ -60,10 +60,21 @@ class SwiftyDebugTabBarController: UITabBarController {
     
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        // Only mark the debug UI hidden when it's genuinely going away — not
+        // when it's merely covered by a modal we presented ourselves.
+        guard presentedViewController == nil else { return }
         Settings.shared.debugUIVisible = false
     }
+
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        // CRITICAL: `displayedList` gates `SwiftyDebugWindow.point(inside:)` —
+        // when false the overlay window only accepts touches inside the bubble.
+        // Presenting a full-screen modal from inside the debug UI (e.g. the
+        // media viewer) fires viewDidDisappear here; clearing the flag then made
+        // the window swallow every touch in that modal, so its buttons appeared
+        // dead. Keep the gate open while we still have something presented.
+        guard presentedViewController == nil else { return }
         DebugWindowPresenter.shared.displayedList = false
     }
     
@@ -71,9 +82,10 @@ class SwiftyDebugTabBarController: UITabBarController {
     func setChildControllers() {
         let network = makeNav(root: NetworkViewController(),  tabTitle: "Network", systemImage: "arrow.up.arrow.down")
         let logs    = makeNav(root: LogViewController(),      tabTitle: "Logs",    systemImage: "doc.text")
+        let media   = makeNav(root: MediaTabViewController(), tabTitle: "Media",   systemImage: "photo.on.rectangle")
         let app     = makeNav(root: AppInfoViewController(),  tabTitle: "App",     systemImage: "info.circle")
 
-        let navs: [UINavigationController] = [network, logs, app]
+        let navs: [UINavigationController] = [network, logs, media, app]
 
         self.viewControllers = navs
 

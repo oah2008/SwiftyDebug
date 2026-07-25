@@ -35,6 +35,27 @@ class NetworkTransaction: NSObject {
     var errorLocalizedDescription: String?
     var size: String?
 
+    /// Precomputed searchable metadata, built once at capture time so search
+    /// never touches disk. See `RequestSearchIndex`. Also exposes `imageURLs`
+    /// for the media grid / Media tab.
+    var searchIndex: RequestSearchIndex?
+
+    /// Image URLs discovered in the response body at capture time (empty if the
+    /// response wasn't JSON or contained no images).
+    var imageURLs: [String] { searchIndex?.imageURLs ?? [] }
+
+    /// Builds `searchIndex` from the current in-memory fields plus the given
+    /// response body (pass the already-loaded `Data`; do not read from disk).
+    /// Call once, at capture time, on a background-safe context.
+    func buildSearchIndex(responseBody: Data?) {
+        searchIndex = RequestSearchIndex.build(from: self, responseBody: responseBody)
+        // Feed the persisted header-name suggestion registry (INTERCEPT-UX).
+        HeaderSuggestionStore.shared.record(headers: requestHeaderFields)
+        // Feed the persistent header/param metadata store, which survives
+        // clearing captured requests and powers the intercept editor.
+        RequestMetadataStore.shared.record(self)
+    }
+
     private var _requestDataFilePath: String?
     private var _responseDataFilePath: String?
 
@@ -178,9 +199,15 @@ class NetworkTransaction: NSObject {
                 model.requestData = try? Data(contentsOf: URL(fileURLWithPath: reqPath))
             }
             let resPath = (dir as NSString).appendingPathComponent("pin_\(safeId)_res")
+            var loadedResponse: Data?
             if fm.fileExists(atPath: resPath) {
-                model.responseData = try? Data(contentsOf: URL(fileURLWithPath: resPath))
+                loadedResponse = try? Data(contentsOf: URL(fileURLWithPath: resPath))
+                model.responseData = loadedResponse
             }
+
+            // Rebuild the search/media index for pinned models (they were
+            // deserialized, so the index wasn't carried over).
+            model.buildSearchIndex(responseBody: loadedResponse)
 
             results.append(model)
         }

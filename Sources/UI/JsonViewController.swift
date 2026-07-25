@@ -186,6 +186,18 @@ class JsonViewController: UIViewController {
         return base
     }
 
+    /// Renders a header dictionary as clean, sorted, valid JSON for display —
+    /// replaces the old fragile `dropFirst()/dropLast()` string surgery that
+    /// produced the mis-indented "extra space per line" output. (See COPY.)
+    static func headerDisplayString(_ headers: [String: Any]?) -> String {
+        guard let headers = headers, !headers.isEmpty else { return "" }
+        if let data = try? JSONSerialization.data(withJSONObject: headers, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+           let str = String(data: data, encoding: .utf8) {
+            return str
+        }
+        return ""
+    }
+
     @objc private func copyLogContent() {
         let text: String
         if let data = logModel?.contentData, let str = String(data: data, encoding: .utf8) {
@@ -311,13 +323,13 @@ class JsonViewController: UIViewController {
         {
             imageView.isHidden = true
             textView.isHidden = false
-            textView.text = String(detailModel?.requestHeaderFields?.dictionaryToString()?.dropFirst().dropLast().dropFirst().dropLast().dropFirst().dropFirst() ?? "").replacingOccurrences(of: "\",\n  \"", with: "\",\n\"")
+            textView.text = Self.headerDisplayString(detailModel?.requestHeaderFields)
         }
         else if editType == .responseHeader
         {
             imageView.isHidden = true
             textView.isHidden = false
-            textView.text = String(detailModel?.responseHeaderFields?.dictionaryToString()?.dropFirst().dropLast().dropFirst().dropLast().dropFirst().dropFirst() ?? "").replacingOccurrences(of: "\",\n  \"", with: "\",\n\"")
+            textView.text = Self.headerDisplayString(detailModel?.responseHeaderFields)
         }
         else if editType == .log
         {

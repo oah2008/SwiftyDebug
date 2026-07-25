@@ -20,6 +20,19 @@ struct KVPair: Codable, Equatable {
     }
 }
 
+/// How a matching request's URL is rewritten.
+enum RedirectMode: String, Codable {
+    /// No redirect.
+    case none
+    /// Replace only the host (and optional port). Path and query are untouched.
+    /// `mahaly.com/checkout/abc?p=1` + `beta.mahaly.com` → `beta.mahaly.com/checkout/abc?p=1`
+    case host
+    /// Replace host **and** path, preserving the original query string.
+    /// `mahaly.com/checkout/abc?p=1` + `beta.mahaly.com/checkout/xyz`
+    ///   → `beta.mahaly.com/checkout/xyz?p=1`
+    case hostAndPath
+}
+
 /// How the rule matches incoming requests.
 enum EndpointMatchMode: String, Codable {
     /// Matches only the exact URL path (e.g. `/api/users/123/orders`).
@@ -54,6 +67,11 @@ struct InterceptRule: Codable {
     let createdAt: Date
     /// Position in the rule list. Lower = applied first, higher = applied later (wins on conflict).
     var order: Int
+    /// How matching requests' URLs are rewritten. `.none` by default.
+    var redirectMode: RedirectMode
+    /// Redirect destination. For `.host`: `"beta.example.com"` (optionally with a
+    /// scheme and/or port). For `.hostAndPath`: `"beta.example.com/checkout/xyz"`.
+    var redirectTarget: String
 
     init(matchEndpoint: String, matchMode: EndpointMatchMode = .normalized) {
         self.id = UUID().uuidString
@@ -68,6 +86,59 @@ struct InterceptRule: Codable {
         self.isEnabled = true
         self.createdAt = Date()
         self.order = 0
+        self.redirectMode = .none
+        self.redirectTarget = ""
+    }
+
+    /// Rewrites `url` per this rule's redirect settings, preserving the original
+    /// query string. Returns nil when no redirect applies.
+    ///
+    ///   host        : mahaly.com/checkout/abc?p=1  + "beta.com"
+    ///                 -> beta.com/checkout/abc?p=1
+    ///   hostAndPath : mahaly.com/checkout/abc?p=1  + "beta.com/checkout/xyz"
+    ///                 -> beta.com/checkout/xyz?p=1
+    func redirectedURL(for url: URL) -> URL? {
+        guard redirectMode != .none else { return nil }
+        let target = redirectTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return nil }
+
+        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+
+        // Peel an optional scheme off the target; otherwise keep the original.
+        var rest = target
+        for prefix in ["https://", "http://"] where rest.lowercased().hasPrefix(prefix) {
+            comps.scheme = String(prefix.dropLast(3))  // "https" / "http"
+            rest = String(rest.dropFirst(prefix.count))
+            break
+        }
+        // Drop any query/fragment the user pasted into the target — the original
+        // request's query is always preserved.
+        if let q = rest.firstIndex(of: "?") { rest = String(rest[..<q]) }
+        if let f = rest.firstIndex(of: "#") { rest = String(rest[..<f]) }
+        while rest.hasSuffix("/") { rest = String(rest.dropLast()) }
+        guard !rest.isEmpty else { return nil }
+
+        // Split "host[:port]/path/segments"
+        var hostPart = rest
+        var pathPart = ""
+        if let slash = rest.firstIndex(of: "/") {
+            hostPart = String(rest[..<slash])
+            pathPart = String(rest[slash...])
+        }
+        // Optional port on the host part.
+        if let colon = hostPart.lastIndex(of: ":"),
+           let port = Int(hostPart[hostPart.index(after: colon)...]) {
+            comps.port = port
+            hostPart = String(hostPart[..<colon])
+        }
+        guard !hostPart.isEmpty else { return nil }
+        comps.host = hostPart
+
+        if redirectMode == .hostAndPath {
+            // Replace the path wholesale; query is left untouched by design.
+            comps.path = pathPart.isEmpty ? "/" : pathPart
+        }
+        return comps.url
     }
 
     /// Convenience initializer for global rules (match every request).
@@ -89,6 +160,7 @@ struct InterceptRule: Codable {
         case id, normalizedEndpoint, matchEndpoint, matchMode, matchHosts, isBlocked
         case headerOverrides, queryParamOverrides, removedHeaderKeys, removedQueryParamKeys
         case isEnabled, createdAt, order
+        case redirectMode, redirectTarget
     }
 
     init(from decoder: Decoder) throws {
@@ -109,6 +181,8 @@ struct InterceptRule: Codable {
         isEnabled = try c.decode(Bool.self, forKey: .isEnabled)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
+        redirectMode = try c.decodeIfPresent(RedirectMode.self, forKey: .redirectMode) ?? .none
+        redirectTarget = try c.decodeIfPresent(String.self, forKey: .redirectTarget) ?? ""
     }
 
     func encode(to encoder: Encoder) throws {
@@ -125,5 +199,7 @@ struct InterceptRule: Codable {
         try c.encode(isEnabled, forKey: .isEnabled)
         try c.encode(createdAt, forKey: .createdAt)
         try c.encode(order, forKey: .order)
+        try c.encode(redirectMode, forKey: .redirectMode)
+        try c.encode(redirectTarget, forKey: .redirectTarget)
     }
 }

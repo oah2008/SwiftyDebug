@@ -14,9 +14,10 @@ final class MainTabBarController: UITabBarController {
 
         let feed    = makeNav(FeedViewController(),     title: "Posts",   icon: "doc.text.fill")
         let pokemon = makeNav(PokemonViewController(),  title: "Pokemon", icon: "star.circle.fill")
+        let browser = makeNav(BrowserViewController(),  title: "Browser", icon: "globe")
         let info    = makeNav(DemoInfoViewController(), title: "Setup",   icon: "info.circle.fill")
 
-        viewControllers = [feed, pokemon, info]
+        viewControllers = [feed, pokemon, browser, info]
         tabBar.tintColor = UIColor(red: 0.30, green: 0.80, blue: 0.72, alpha: 1)
         tabBar.backgroundColor = .systemBackground
     }

@@ -26,6 +26,18 @@ enum LogEntryBuilder {
     }
 
     static func handleLog(file: String, function: String, line: Int, message: String, color: UIColor, type: SwiftyDebugToolType) {
+        // Kill-switch: no logging work when the SDK is fully stopped.
+        guard SwiftyDebugRuntime.isActive else { return }
+
+        // Respect the relevant per-source toggle so a disabled source does zero
+        // build/DB work. Web console logs are gated by `webLogsEnabled`;
+        // everything else (SDK/app logs) by `consoleLogsEnabled`.
+        if file == "[WKWebView]" {
+            guard Settings.shared.webLogsEnabled else { return }
+        } else {
+            guard SwiftyDebug.enableConsoleLog && Settings.shared.consoleLogsEnabled else { return }
+        }
+
         let fileInfo = parseFileInfo(file: file, function: function, line: line)
 
         let newLog = LogRecord(content: message, color: color, fileInfo: fileInfo, isTag: false, type: type)

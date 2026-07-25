@@ -14,6 +14,11 @@ class NSLogHook: NSObject {
     private static var hooked = false
     private static var savedStdoutFD: Int32 = -1
     private static var stdoutPipe: Pipe?
+    /// Guards `savedStdoutFD` so the pipe readability handler (on FileHandle's
+    /// private queue) never writes to a descriptor that `disable()` (on main) is
+    /// concurrently closing — which could otherwise write captured stdout into an
+    /// unrelated, reused descriptor.
+    private static let stdoutFDLock = NSLock()
 
     // Pipe buffering — accumulate data, flush every 100ms instead of per-read
     private static var pendingPipeData = Data()
@@ -85,12 +90,22 @@ class NSLogHook: NSObject {
     // Background pause
     private static var isPaused = false
 
+    // Lifecycle observer tokens (so disable() can remove exactly these).
+    private static var lifecycleObservers: [NSObjectProtocol] = []
+
     // Notification coalescing
     private static var pendingRefreshNotification = false
 
     /// Call this once (e.g. from `SwiftyDebug.enable()`) to start capturing logs.
     /// The method is idempotent.
+    ///
+    /// Respects the console-logs toggle and the global kill-switch: if console
+    /// logging is off (or the SDK is fully stopped), the expensive stdout pipe
+    /// and OSLog poll timer are **not** started at all, so a disabled SDK does
+    /// zero polling work.
     static func enableIfNeeded() {
+        guard SwiftyDebugRuntime.isActive else { return }
+        guard SwiftyDebug.enableConsoleLog && Settings.shared.consoleLogsEnabled else { return }
         guard !hooked else { return }
         hooked = true
 
@@ -107,6 +122,54 @@ class NSLogHook: NSObject {
 
         // Pause/resume polling on app lifecycle
         observeAppLifecycle()
+    }
+
+    /// Fully tears down log capture: restores the original stdout, cancels the
+    /// OSLog poll timer, drops the pipe readability handler, and flushes any
+    /// buffered pipe data. After this call the hook does zero background work.
+    /// Re-arm with `enableIfNeeded()`.
+    static func disable() {
+        guard hooked else { return }
+        hooked = false
+
+        // Cancel the OSLog poll timer so no more polling happens.
+        pollTimer?.cancel()
+        pollTimer = nil
+        if #available(iOS 15.0, *) { cachedStore = nil }
+
+        // Restore stdout to its original destination and drop the pipe handler.
+        if let pipe = stdoutPipe {
+            // Drop the handler first so no new reads start.
+            pipe.fileHandleForReading.readabilityHandler = nil
+            // Serialize the FD restore/close with the readability handler's
+            // writes so we never close a descriptor mid-write.
+            stdoutFDLock.lock()
+            if savedStdoutFD >= 0 {
+                // Flush anything still buffered before swapping the FD back.
+                fflush(stdout)
+                dup2(savedStdoutFD, STDOUT_FILENO)
+                close(savedStdoutFD)
+                savedStdoutFD = -1
+            }
+            stdoutFDLock.unlock()
+            try? pipe.fileHandleForWriting.close()
+            try? pipe.fileHandleForReading.close()
+        }
+        stdoutPipe = nil
+
+        // Drop any accumulated pipe data.
+        pipeBufferQueue.async {
+            pendingPipeData = Data()
+            pipeFlushScheduled = false
+        }
+
+        // Remove lifecycle observers so a stopped SDK doesn't react to
+        // background/foreground transitions.
+        for token in lifecycleObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+        lifecycleObservers.removeAll()
+        isPaused = false
     }
 
     // MARK: - stdout pipe (for print() only)
@@ -138,10 +201,17 @@ class NSLogHook: NSObject {
             let data = handle.availableData
             guard !data.isEmpty else { return }
 
-            // Forward to Xcode console immediately (zero delay)
+            // Forward to Xcode console immediately (zero delay). Hold the lock
+            // across the write so disable() can't close the FD mid-write.
+            stdoutFDLock.lock()
             if savedStdoutFD >= 0 {
                 writeAll(fd: savedStdoutFD, data: data)
             }
+            stdoutFDLock.unlock()
+
+            // If capture was torn down, forward to Xcode only and skip all
+            // SwiftyDebug ingestion work.
+            guard hooked, SwiftyDebugRuntime.isActive else { return }
 
             // Accumulate on buffer queue, flush at adaptive interval
             pipeBufferQueue.async {
@@ -173,11 +243,14 @@ class NSLogHook: NSObject {
     }
 
     private static func scheduleNextPoll() {
-        guard !isPaused else { return }
+        guard !isPaused, hooked, SwiftyDebugRuntime.isActive else { return }
 
         let timer = DispatchSource.makeTimerSource(queue: pollQueue)
         timer.schedule(deadline: .now() + currentInterval)
         timer.setEventHandler {
+            // Bail immediately if capture was torn down between scheduling and
+            // firing — a stopped SDK must do zero polling work.
+            guard hooked, SwiftyDebugRuntime.isActive else { return }
             if #available(iOS 15.0, *) {
                 pollOSLogStore()
             }
@@ -360,7 +433,7 @@ class NSLogHook: NSObject {
     // MARK: - App lifecycle (pause polling when backgrounded)
 
     private static func observeAppLifecycle() {
-        NotificationCenter.default.addObserver(
+        let bg = NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
             object: nil, queue: nil
         ) { _ in
@@ -368,11 +441,11 @@ class NSLogHook: NSObject {
             // Current timer will fire but scheduleNextPoll() will no-op
         }
 
-        NotificationCenter.default.addObserver(
+        let fg = NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification,
             object: nil, queue: nil
         ) { _ in
-            guard isPaused else { return }
+            guard isPaused, hooked, SwiftyDebugRuntime.isActive else { return }
             isPaused = false
             // Reset to appropriate polling — catch entries from background period
             currentInterval = effectiveMinInterval
@@ -380,6 +453,8 @@ class NSLogHook: NSObject {
             lastPollDate = Date().addingTimeInterval(-2)
             scheduleNextPoll()
         }
+
+        lifecycleObservers = [bg, fg]
     }
 
     // MARK: - System framework filter

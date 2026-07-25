@@ -35,4 +35,52 @@ extension SwiftyDebug {
         PrintInterceptor.shared.enable = false
         Settings.shared.shakeGestureEnabled = false
     }
+
+    // MARK: - Full stop / resume (kill-switch)
+
+    /// Completely stops all SDK work at runtime: network interception, log
+    /// capture, OSLog polling, and webview JS hooks all become no-ops. The
+    /// swizzles remain installed (un-swizzling is unsafe) but every hot path
+    /// consults `SwiftyDebugRuntime.isActive` and short-circuits, so the SDK
+    /// costs ~zero CPU — as if it were never included. Reverses with
+    /// `resumeFromFullStop()`.
+    static func fullStop() {
+        // Flip the global gate first so in-flight hot paths stop doing work
+        // immediately.
+        SwiftyDebugRuntime.markStopped()
+
+        // Stop native network interception (unregisters the URLProtocol; the
+        // runtime gate in canInit is the real backstop for already-created
+        // sessions).
+        NetworkMonitor.shared.disable()
+
+        // Tear down log capture: restore stdout, cancel the OSLog poll timer,
+        // drop the pipe handler, and mute the print interceptor.
+        NSLogHook.disable()
+        PrintInterceptor.shared.enable = false
+
+        // Tell every live WKWebView's injected JS to stop capturing/intercepting.
+        WKWebViewSwizzling.pushEnabledStateToWebViews(enabled: false)
+
+        // Hide the overlay (bubble + particles). Visibility is also set by the
+        // shake handler, but do it here too so programmatic callers get the full
+        // effect.
+        Settings.shared.bubbleVisible = false
+    }
+
+    /// Reverses `fullStop()` — re-enables all capture via the runtime gates
+    /// (nothing is re-swizzled).
+    static func resumeFromFullStop() {
+        SwiftyDebugRuntime.markActive()
+
+        NetworkMonitor.shared.enable()
+
+        // Restore log capture, honoring the user's per-source toggles.
+        NSLogHook.enableIfNeeded()
+        PrintInterceptor.shared.enable = SwiftyDebug.enableConsoleLog && Settings.shared.consoleLogsEnabled
+
+        WKWebViewSwizzling.pushEnabledStateToWebViews(enabled: true)
+
+        Settings.shared.bubbleVisible = true
+    }
 }

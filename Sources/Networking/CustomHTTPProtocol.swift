@@ -250,6 +250,12 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
 
     private static let kOurRecursiveRequestFlagProperty = "com.apple.dts.CustomHTTPProtocol"
 
+    /// Mark a request with this key (via `URLProtocol.setProperty`) to make
+    /// `canInit` skip it entirely. Used by SwiftyDebug's own internal fetches
+    /// (e.g. `ImageLoader` thumbnails) so they are never captured — otherwise
+    /// loading a captured image would itself be captured, in an infinite loop.
+    static var recursiveRequestFlagProperty: String { kOurRecursiveRequestFlagProperty }
+
     // MARK: Skipped file extensions
 
     private static let skippedExtensions: Set<String> = {
@@ -263,6 +269,13 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
     // MARK: NSURLProtocol overrides
 
     override class func canInit(with request: URLRequest) -> Bool {
+        // Global kill-switch: when the SDK is fully stopped, do zero
+        // interception — this is the real off-switch even though the swizzled
+        // `protocolClasses` getter still lists us for already-created sessions.
+        guard SwiftyDebugRuntime.isActive, NetworkMonitor.shared.isNetworkEnable else {
+            return false
+        }
+
         guard let scheme = request.url?.scheme, scheme == "http" || scheme == "https" else {
             return false
         }
@@ -399,6 +412,18 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
                         recursiveRequest.url = newURL
                     }
                 }
+                // Apply redirect last, so it rewrites the URL that already has
+                // the rule's query-param edits (the original query is preserved).
+                if let current = recursiveRequest.url,
+                   let redirected = rule.redirectedURL(for: current) {
+                    recursiveRequest.url = redirected
+                    // Keep Host consistent with the new destination unless the
+                    // rule explicitly overrides it.
+                    let overridesHost = rule.headerOverrides.contains { $0.key.lowercased() == "host" }
+                    if !overridesHost, let newHost = redirected.host {
+                        recursiveRequest.setValue(newHost, forHTTPHeaderField: "Host")
+                    }
+                }
                 // Save the modified request so stopLoading() reflects what was actually sent.
                 // Only set when a rule was applied; non-intercepted requests use self.request as before.
                 self.interceptedRequest = recursiveRequest as URLRequest
@@ -411,6 +436,21 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
         // Latch the thread we were called on, primarily for debugging purposes.
         self.clientThread = Thread.current
 
+        // Network Link Conditioner simulation (see NETWORK-SIM). Reads the fixed
+        // preset chosen on the Info tab and either fails the request (100% loss)
+        // or delays it by the preset's latency so loader/spinner states can be
+        // observed. Off by default.
+        let preset = Settings.shared.networkConditionerPreset
+        if preset.dropsAllRequests {
+            let error = NSError(
+                domain: NSURLErrorDomain,
+                code: NSURLErrorNotConnectedToInternet,
+                userInfo: [NSLocalizedDescriptionKey: "Dropped by SwiftyDebug network simulation (100% Loss)"]
+            )
+            self.client?.urlProtocol(self, didFailWithError: error)
+            return
+        }
+
         // Once everything is ready to go, create a data task with the new request.
         self._dataTask = type(of: self).sharedDemux().dataTask(
             with: recursiveRequest as URLRequest,
@@ -418,7 +458,17 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
             modes: self.modes
         )
 
-        self._dataTask?.resume()
+        let latency = preset.addedLatency
+        if latency > 0 {
+            // Defer resume (non-blocking) so the whole request is delayed by the
+            // preset's simulated latency. Never sleep the client thread.
+            let task = self._dataTask
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + latency) {
+                task?.resume()
+            }
+        } else {
+            self._dataTask?.resume()
+        }
     }
 
     override func stopLoading() {
@@ -510,6 +560,10 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
 
         // Handling errors 404...
         handleError(self.error, model: model)
+
+        // Build the searchable metadata index once, while the response body is
+        // still in memory (self.data). Avoids per-keystroke disk reads later.
+        model.buildSearchIndex(responseBody: self.data as Data?)
 
         if NetworkRequestStore.shared.addHttpRequset(model) {
             NotificationCenter.default.post(

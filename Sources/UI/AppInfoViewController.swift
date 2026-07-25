@@ -13,9 +13,10 @@ class AppInfoViewController: UITableViewController {
 
     private enum Section: Int, CaseIterable {
         case settings = 0
-        case interceptRules = 1
-        case actions = 2
-        case urls = 3
+        case simulation = 1
+        case interceptRules = 2
+        case actions = 3
+        case urls = 4
     }
 
     // MARK: - Toggle definitions
@@ -45,6 +46,34 @@ class AppInfoViewController: UITableViewController {
         ToggleItem(title: "Monitor Media",
                    subtitle: "Intercept images, video, audio & font requests",
                    keyPath: \.monitorMediaEnabled),
+        ToggleItem(title: "Full Stop on Disable",
+                   subtitle: "When on, shaking to disable fully stops all capture (0 CPU). When off, shake only hides the overlay.",
+                   keyPath: \.fullStopOnDisable),
+    ]
+
+    // MARK: - Inspector rows (ACTIONS section)
+
+    /// The storage/file inspectors, in order. "Clear Pinned Requests" is always
+    /// rendered after these.
+    private struct InspectorRow {
+        let title: String
+        let symbol: String
+        let make: () -> UIViewController
+    }
+
+    private static let inspectorRows: [InspectorRow] = [
+        InspectorRow(title: "Web View Storage", symbol: "externaldrive.badge.person.crop") {
+            WebViewStoragePickerViewController(style: .plain)
+        },
+        InspectorRow(title: "App Container Files", symbol: "folder") {
+            AppContainerBrowserViewController(directory: nil, title: "App Container", showsCloseButton: true)
+        },
+        InspectorRow(title: "User Defaults", symbol: "slider.horizontal.3") {
+            UserDefaultsBrowserViewController()
+        },
+        InspectorRow(title: "Keychain", symbol: "key.fill") {
+            KeychainBrowserViewController()
+        },
     ]
 
     // MARK: - Data
@@ -212,6 +241,59 @@ class AppInfoViewController: UITableViewController {
         Settings.shared[keyPath: toggle.keyPath] = sender.isOn
     }
 
+    /// Presents an action sheet to pick a fixed Network Link Conditioner preset.
+    /// Latency-only simulation, off by default. (See NETWORK-SIM.)
+    private func presentNetworkSimPicker() {
+        let current = Settings.shared.networkConditionerPreset
+        let alert = UIAlertController(
+            title: "Slow Network Simulation",
+            message: "Adds a fixed latency to every captured request so you can test loader / spinner states. Matches iOS Network Link Conditioner presets.",
+            preferredStyle: .actionSheet
+        )
+        for preset in NetworkConditionerPreset.allCases {
+            let checkmark = (preset == current) ? "  ✓" : ""
+            let title = preset == .off
+                ? "Off\(checkmark)"
+                : "\(preset.displayName) — \(preset.subtitle)\(checkmark)"
+            alert.addAction(UIAlertAction(title: title, style: .default) { [weak self] _ in
+                Settings.shared.networkConditionerPreset = preset
+                let indexPath = IndexPath(row: 0, section: Section.simulation.rawValue)
+                self?.tableView.reloadRows(at: [indexPath], with: .none)
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
+        }
+        present(alert, animated: true)
+    }
+
+    /// Presents an inspector **full screen** (these are screens you work in —
+    /// browse, edit, drill down — not quick sheets).
+    ///
+    /// Because a full-screen modal has no swipe-to-dismiss, this guarantees a
+    /// Close button exists: the view is loaded first so the screen's own
+    /// `viewDidLoad` can install its bar items, and one is only added when the
+    /// screen didn't provide its own.
+    private func presentInspector(_ vc: UIViewController) {
+        _ = vc.view   // force viewDidLoad so its own bar items are set first
+        if vc.navigationItem.leftBarButtonItem == nil {
+            let close = UIBarButtonItem(image: UIImage(systemName: "xmark"), style: .plain,
+                                        target: self, action: #selector(dismissInspector))
+            close.tintColor = DebugTheme.accentColor
+            vc.navigationItem.leftBarButtonItem = close
+        }
+        let nav = SwiftyDebugNavigationController(rootViewController: vc)
+        nav.modalPresentationStyle = .fullScreen
+        present(nav, animated: true)
+    }
+
+    @objc private func dismissInspector() {
+        presentedViewController?.dismiss(animated: true)
+    }
+
     private func clearPinnedRequests() {
         let alert = UIAlertController(
             title: "Clear Pinned Requests",
@@ -234,8 +316,9 @@ class AppInfoViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
         case .settings:       return toggles.count
+        case .simulation:     return 1 // network conditioner preset row
         case .interceptRules: return interceptRules.count + 1 // rules + "Add Rule" button
-        case .actions:        return 1
+        case .actions:        return Self.inspectorRows.count + 1 // inspectors + Clear Pinned
         case .urls:           return capturedURLs.count
         }
     }
@@ -261,6 +344,32 @@ class AppInfoViewController: UITableViewController {
             sw.tag = indexPath.row
             sw.addTarget(self, action: #selector(toggleChanged(_:)), for: .valueChanged)
             cell.accessoryView = sw
+            cell.forceLTR()
+            return cell
+
+        case .simulation:
+            let preset = Settings.shared.networkConditionerPreset
+            let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "NetworkSimCell")
+            cell.selectionStyle = .default
+            cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
+            cell.textLabel?.text = "Slow Network Simulation"
+            cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+            cell.textLabel?.textColor = .white
+            cell.detailTextLabel?.text = preset.isActive
+                ? "\(preset.displayName) · \(preset.subtitle)"
+                : "Off · adds latency to every request to test loaders"
+            cell.detailTextLabel?.font = .systemFont(ofSize: 11)
+            cell.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
+            cell.detailTextLabel?.numberOfLines = 2
+
+            // Show current preset name on the right (with a chevron glyph, since
+            // an accessoryView overrides the system disclosure indicator).
+            let valueLabel = UILabel()
+            valueLabel.text = "\(preset.displayName)  ›"
+            valueLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+            valueLabel.textColor = preset.isActive ? DebugTheme.accentColor : UIColor(white: 0.5, alpha: 1)
+            valueLabel.sizeToFit()
+            cell.accessoryView = valueLabel
             cell.forceLTR()
             return cell
 
@@ -348,13 +457,29 @@ class AppInfoViewController: UITableViewController {
 
         case .actions:
             let cell = UITableViewCell(style: .default, reuseIdentifier: "ActionCell")
-            cell.selectionStyle = .default
             cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
-            cell.textLabel?.text = "Clear Pinned Requests"
-            cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
-            cell.textLabel?.textColor = .systemRed
-            cell.textLabel?.textAlignment = .center
             cell.forceLTR()
+            cell.selectionStyle = .default
+            let iconConfig = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+
+            if indexPath.row < Self.inspectorRows.count {
+                let row = Self.inspectorRows[indexPath.row]
+                cell.imageView?.image = UIImage(systemName: row.symbol, withConfiguration: iconConfig)?
+                    .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
+                cell.textLabel?.text = row.title
+                cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+                cell.textLabel?.textColor = .white
+                cell.textLabel?.textAlignment = .natural
+                cell.accessoryType = .disclosureIndicator
+            } else {
+                // Clear Pinned Requests (always last)
+                cell.imageView?.image = nil
+                cell.textLabel?.text = "Clear Pinned Requests"
+                cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+                cell.textLabel?.textColor = .systemRed
+                cell.textLabel?.textAlignment = .center
+                cell.accessoryType = .none
+            }
             return cell
 
         case .urls:
@@ -372,6 +497,7 @@ class AppInfoViewController: UITableViewController {
         let title: String?
         switch Section(rawValue: section)! {
         case .settings:       title = "SETTINGS"
+        case .simulation:     title = "NETWORK SIMULATION"
         case .interceptRules: title = "INTERCEPT RULES\(interceptRules.isEmpty ? "" : " (\(interceptRules.count))")"
         case .actions:        title = "ACTIONS"
         case .urls:           title = capturedURLs.isEmpty ? nil : "MONITORED URLS (\(capturedURLs.count))"
@@ -401,6 +527,7 @@ class AppInfoViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
         switch Section(rawValue: section)! {
         case .settings:       return 40
+        case .simulation:     return 40
         case .interceptRules: return 40
         case .actions:        return 40
         case .urls:           return capturedURLs.isEmpty ? 0 : 40
@@ -429,6 +556,8 @@ class AppInfoViewController: UITableViewController {
         switch Section(rawValue: indexPath.section)! {
         case .settings:
             break
+        case .simulation:
+            presentNetworkSimPicker()
         case .interceptRules:
             if indexPath.row == interceptRules.count {
                 addRuleTapped()
@@ -436,7 +565,11 @@ class AppInfoViewController: UITableViewController {
                 editRuleFromAppTab(interceptRules[indexPath.row])
             }
         case .actions:
-            clearPinnedRequests()
+            if indexPath.row < Self.inspectorRows.count {
+                presentInspector(Self.inspectorRows[indexPath.row].make())
+            } else {
+                clearPinnedRequests()
+            }
         case .urls:
             guard indexPath.row < capturedURLs.count else { return }
             let text = capturedURLs[indexPath.row].url

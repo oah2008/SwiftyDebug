@@ -139,6 +139,11 @@ class InterceptRuleStore {
             if rule.isBlocked {
                 composite.isBlocked = true
             }
+            // Redirect: the last enabled rule (highest order) that defines one wins.
+            if rule.redirectMode != .none, !rule.redirectTarget.isEmpty {
+                composite.redirectMode = rule.redirectMode
+                composite.redirectTarget = rule.redirectTarget
+            }
             for pair in rule.headerOverrides {
                 if let idx = composite.headerOverrides.firstIndex(where: { $0.key.lowercased() == pair.key.lowercased() }) {
                     composite.headerOverrides[idx] = pair
@@ -314,7 +319,9 @@ class InterceptRuleStore {
                 "headerOverrides": rule.headerOverrides.map { ["key": $0.key, "value": $0.value] },
                 "queryParamOverrides": rule.queryParamOverrides.map { ["key": $0.key, "value": $0.value] },
                 "removedHeaderKeys": Array(rule.removedHeaderKeys),
-                "removedQueryParamKeys": Array(rule.removedQueryParamKeys)
+                "removedQueryParamKeys": Array(rule.removedQueryParamKeys),
+                "redirectMode": rule.redirectMode.rawValue,
+                "redirectTarget": rule.redirectTarget
             ]
             jsRules.append(dict)
         }

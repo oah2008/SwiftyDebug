@@ -139,11 +139,25 @@ final class LogModelDB {
             -1, &fetchRangeStmt, nil)
         sqlite3_prepare_v2(db,
             "SELECT COUNT(*) FROM logs WHERE logSource = ?", -1, &readCountBySourceStmt, nil)
+        // Rich search: match the query against content AND the metadata columns
+        // (source library, subsystem, category, type). Lets webview logs be found
+        // by their source/subsystem too, not just message text. (See SEARCH.)
         sqlite3_prepare_v2(db,
-            "SELECT COUNT(*) FROM logs WHERE logSource = ? AND content LIKE ?",
+            """
+            SELECT COUNT(*) FROM logs WHERE logSource = ? AND (
+                content LIKE ?2 OR sourceName LIKE ?2 OR subsystem LIKE ?2
+                OR category LIKE ?2 OR logTypeName LIKE ?2 OR fileInfo LIKE ?2
+            )
+            """,
             -1, &searchCountStmt, nil)
         sqlite3_prepare_v2(db,
-            "SELECT rowid, content, contentData, color, fileInfo, date, sourceName, logTypeName, subsystem, category, logSource, logType, isTag, isPinned FROM logs WHERE logSource = ? AND content LIKE ? ORDER BY rowid LIMIT ? OFFSET ?",
+            """
+            SELECT rowid, content, contentData, color, fileInfo, date, sourceName, logTypeName, subsystem, category, logSource, logType, isTag, isPinned
+            FROM logs WHERE logSource = ? AND (
+                content LIKE ?2 OR sourceName LIKE ?2 OR subsystem LIKE ?2
+                OR category LIKE ?2 OR logTypeName LIKE ?2 OR fileInfo LIKE ?2
+            ) ORDER BY rowid LIMIT ?3 OFFSET ?4
+            """,
             -1, &searchFetchRangeStmt, nil)
     }
 

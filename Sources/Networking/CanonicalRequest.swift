@@ -143,26 +143,47 @@ private func FixEmptyPath(_ url: URL, _ urlData: NSMutableData, _ bytesInserted:
 // MARK: - Other request canonicalization
 
 /// Canonicalize the request headers.
+///
+/// Historically this force-added default `Content-Type`, `Accept`,
+/// `Accept-Encoding` and `Accept-Language` headers. That defeats intercept
+/// rules that try to *remove* one of those headers: canonicalization runs first
+/// and re-adds the default, so the removal has nothing to remove and the header
+/// still goes out. To make header removal reliable (see WEBVIEW-HEADERS), we
+/// skip adding a default for any header that a matching, enabled intercept rule
+/// explicitly removes (and don't touch headers a rule overrides — the override
+/// is applied later in `startLoading`).
 private func CanonicaliseHeaders(_ request: NSMutableURLRequest) {
+    // Determine which default headers a matching rule wants gone, so we don't
+    // re-inject them here. Case-insensitive.
+    var removedByRule = Set<String>()
+    if let url = request.url, let rule = InterceptRuleStore.shared.resolvedRule(forURL: url) {
+        removedByRule = Set(rule.removedHeaderKeys.map { $0.lowercased() })
+    }
+
+    func shouldAddDefault(_ header: String) -> Bool {
+        return !removedByRule.contains(header.lowercased())
+    }
+
     // If there's no content type and the request is a POST with a body, add a default
     // content type of "application/x-www-form-urlencoded".
 
     if request.value(forHTTPHeaderField: "Content-Type") == nil
         && request.httpMethod.caseInsensitiveCompare("POST") == .orderedSame
         && (request.httpBody != nil || request.httpBodyStream != nil)
+        && shouldAddDefault("Content-Type")
     {
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     }
 
     // If there's no "Accept" header, add a default.
 
-    if request.value(forHTTPHeaderField: "Accept") == nil {
+    if request.value(forHTTPHeaderField: "Accept") == nil && shouldAddDefault("Accept") {
         request.setValue("*/*", forHTTPHeaderField: "Accept")
     }
 
     // If there's no "Accept-Encoding" header, add a default.
 
-    if request.value(forHTTPHeaderField: "Accept-Encoding") == nil {
+    if request.value(forHTTPHeaderField: "Accept-Encoding") == nil && shouldAddDefault("Accept-Encoding") {
         request.setValue("gzip, deflate", forHTTPHeaderField: "Accept-Encoding")
     }
 
@@ -174,7 +195,7 @@ private func CanonicaliseHeaders(_ request: NSMutableURLRequest) {
     // to base this value on -[NSBundle preferredLocalizations], so that the web page comes back in
     // the language that the app is running in.
 
-    if request.value(forHTTPHeaderField: "Accept-Language") == nil {
+    if request.value(forHTTPHeaderField: "Accept-Language") == nil && shouldAddDefault("Accept-Language") {
         request.setValue("en-us", forHTTPHeaderField: "Accept-Language")
     }
 }

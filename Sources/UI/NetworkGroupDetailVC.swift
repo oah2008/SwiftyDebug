@@ -318,11 +318,17 @@ class NetworkGroupDetailVC: UIViewController {
             }
         }
 
-        // Search text filter
+        // Search text filter — index-backed rich search (see SEARCH), matching
+        // the main list. Falls back to a plain URL contains for models without
+        // an index.
         if !searchText.isEmpty {
+            let raw = searchText
             let query = searchText.lowercased()
-            result = result.filter {
-                ($0.url?.absoluteString ?? "").lowercased().contains(query)
+            result = result.filter { model in
+                if let index = model.searchIndex {
+                    return index.matches(raw)
+                }
+                return (model.url?.absoluteString ?? "").lowercased().contains(query)
             }
         }
 

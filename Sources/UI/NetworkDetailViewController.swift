@@ -17,6 +17,11 @@ class NetworkDetailViewController: UITableViewController {
     
     var httpModel: NetworkTransaction?
     var httpModels: [NetworkTransaction]?
+
+    /// When true this screen is showing the **result of a replay**. The layout is
+    /// identical to a normal request detail — same sections, same close/pin/share
+    /// buttons — except the Intercept and Replay actions are hidden. (See REPLAY.)
+    var isReplayResult = false
     
     var detailModels: [NetworkDetailSection] = [NetworkDetailSection]()
 
@@ -139,9 +144,10 @@ class NetworkDetailViewController: UITableViewController {
         if let requestHeaderFields = httpModel?.requestHeaderFields, requestHeaderFields.count > 0 {
             model_2 = NetworkDetailSection(title: "REQUEST HEADER", content: requestHeaderFields.description, url: urlStr, httpModel: httpModel)
             model_2.requestHeaderFields = requestHeaderFields as? [String: Any]
-            if let data = try? JSONSerialization.data(withJSONObject: requestHeaderFields, options: [.prettyPrinted]),
+            if let data = try? JSONSerialization.data(withJSONObject: requestHeaderFields, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
                let jsonString = String(data: data, encoding: .utf8) {
                 model_2.content = jsonString
+                model_2.rawContent = jsonString
             }
         }
         model_2.showPreview = true
@@ -157,9 +163,10 @@ class NetworkDetailViewController: UITableViewController {
         if let responseHeaderFields = httpModel?.responseHeaderFields, responseHeaderFields.count > 0 {
             model_4 = NetworkDetailSection(title: "RESPONSE HEADER", content: responseHeaderFields.description, url: urlStr, httpModel: httpModel)
             model_4.responseHeaderFields = responseHeaderFields as? [String: Any]
-            if let data = try? JSONSerialization.data(withJSONObject: responseHeaderFields, options: [.prettyPrinted]),
+            if let data = try? JSONSerialization.data(withJSONObject: responseHeaderFields, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
                let jsonString = String(data: data, encoding: .utf8) {
                 model_4.content = jsonString
+                model_4.rawContent = jsonString
             }
         }
         model_4.showPreview = true
@@ -382,6 +389,14 @@ class NetworkDetailViewController: UITableViewController {
             modelSimilar.similarRequests = capped
             detailModels.append(modelSimilar)
         }
+
+        // MARK: Media — images parsed from the response JSON (see JSON-MEDIA)
+        let mediaURLs = httpModel?.imageURLs ?? []
+        if !mediaURLs.isEmpty {
+            var modelMedia = NetworkDetailSection(title: "MEDIA", content: nil, url: urlStr, httpModel: httpModel)
+            modelMedia.mediaImageURLs = mediaURLs
+            detailModels.append(modelMedia)
+        }
     }
     
     // MARK: - Helpers
@@ -453,15 +468,17 @@ class NetworkDetailViewController: UITableViewController {
     
     private func buildMessageBody() -> String {
         var body = ""
-        var string = ""
+        var seenSections = Set<String>()
 
         for model in detailModels {
-            if let title = model.title, let content = model.content, !content.isEmpty {
-                string = "\n\n" + "------- " + title + " -------" + "\n" + content
-            }
-            if !body.contains(string) {
-                body.append(string)
-            }
+            guard let title = model.title, let content = model.content, !content.isEmpty else { continue }
+            // Dedup by exact section identity, not substring-containment. The old
+            // `body.contains(string)` check could silently drop a section whose
+            // text happened to be a substring of an earlier one, producing an
+            // "incomplete" copy. (See COPY.)
+            let section = "\n\n" + "------- " + title + " -------" + "\n" + content
+            guard seenSections.insert(section).inserted else { continue }
+            body.append(section)
         }
 
         let url = httpModel?.url?.absoluteString ?? ""
@@ -519,6 +536,7 @@ class NetworkDetailViewController: UITableViewController {
         tableView.register(NetworkCell.self, forCellReuseIdentifier: "NetworkCell")
         tableView.register(NetworkDetailCell.self, forCellReuseIdentifier: "NetworkDetailCell")
         tableView.register(NetworkSimilarRequestsCell.self, forCellReuseIdentifier: "NetworkSimilarRequestsCell")
+        tableView.register(NetworkMediaGridCell.self, forCellReuseIdentifier: "NetworkMediaGridCell")
 
         // Table styling
         tableView.backgroundColor = .black
@@ -535,8 +553,16 @@ class NetworkDetailViewController: UITableViewController {
         pinItem = UIBarButtonItem(image: pinImage, style: .plain, target: self, action: #selector(togglePin))
         pinItem.tintColor = DebugTheme.accentColor
 
-        // Nav bar
-        navigationItem.rightBarButtonItems = [closeItem, pinItem]
+        // Share/export button — exports the response JSON as a .json file.
+        let shareItem = UIBarButtonItem(
+            image: UIImage(systemName: "square.and.arrow.up"),
+            style: .plain, target: self, action: #selector(exportResponseJSON(_:))
+        )
+        shareItem.tintColor = DebugTheme.accentColor
+
+        // Nav bar — close / pin / share are always available (including on a
+        // replay result). Intercept & Replay live in the header card instead.
+        navigationItem.rightBarButtonItems = [closeItem, pinItem, shareItem]
 
         //header
         headerCell = NetworkCell(style: .default, reuseIdentifier: "NetworkCell")
@@ -558,48 +584,50 @@ class NetworkDetailViewController: UITableViewController {
             self.present(activity, animated: true)
         }
 
-        headerCell?.showInterceptButton = true
+        // Replay sits directly under Intercept in the header card. Both are
+        // hidden when this screen is showing the result of a replay.
+        headerCell?.showReplayButton = !isReplayResult && RequestReplayViewController.canReplay(httpModel)
+        headerCell?.onReplayTapped = { [weak self] in
+            self?.replayTapped()
+        }
+
+        headerCell?.showInterceptButton = !isReplayResult
         headerCell?.onInterceptTapped = { [weak self] in
             guard let self = self, let model = self.httpModel else { return }
             guard let url = model.url as URL? else { return }
             let existingRules = InterceptRuleStore.shared.matchingRules(forURL: url)
 
             if existingRules.isEmpty {
-                // No rules yet — ask user which type to create
-                let alert = UIAlertController(title: "Intercept Rule", message: nil, preferredStyle: .actionSheet)
-
-                alert.addAction(UIAlertAction(title: "Intercept Endpoint", style: .default) { _ in
+                // No rules yet — ask which scope to create. Uses the custom picker
+                // (not a system action sheet) so long endpoints/hosts aren't
+                // truncated. (See INTERCEPT-UX.)
+                let openEditor: (EndpointMatchMode) -> Void = { [weak self] mode in
+                    guard let self else { return }
                     let editor = InterceptRuleEditorViewController()
                     editor.httpModel = model
-                    editor.initialMatchMode = .normalized
-                    let nav = SwiftyDebugNavigationController(rootViewController: editor)
-                    self.present(nav, animated: true)
-                })
-
-                alert.addAction(UIAlertAction(title: "Intercept Host", style: .default) { _ in
-                    let editor = InterceptRuleEditorViewController()
-                    editor.httpModel = model
-                    editor.initialMatchMode = .host
-                    let nav = SwiftyDebugNavigationController(rootViewController: editor)
-                    self.present(nav, animated: true)
-                })
-
-                alert.addAction(UIAlertAction(title: "Global Rule", style: .default) { _ in
-                    let editor = InterceptRuleEditorViewController()
-                    editor.httpModel = model
-                    editor.initialMatchMode = .global
-                    let nav = SwiftyDebugNavigationController(rootViewController: editor)
-                    self.present(nav, animated: true)
-                })
-
-                alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-
-                if let popover = alert.popoverPresentationController {
-                    popover.sourceView = self.view
-                    popover.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY, width: 0, height: 0)
-                    popover.permittedArrowDirections = []
+                    editor.initialMatchMode = mode
+                    self.present(SwiftyDebugNavigationController(rootViewController: editor), animated: true)
                 }
-                self.present(alert, animated: true)
+                let normalized = EndpointNormalizer.normalize(url.path)
+                let host = url.host ?? ""
+
+                OptionPickerSheetViewController.present(
+                    from: self,
+                    title: "Intercept Rule",
+                    message: "Choose what this rule should apply to.",
+                    options: [
+                        .init(title: "This Endpoint",
+                              subtitle: normalized.isEmpty ? url.path : normalized,
+                              symbol: "point.topleft.down.curvedto.point.bottomright.up",
+                              tint: DebugTheme.accentColor) { openEditor(.normalized) },
+                        .init(title: "This Host",
+                              subtitle: host.isEmpty ? "every request to this host" : host,
+                              symbol: "network", tint: .systemPurple) { openEditor(.host) },
+                        .init(title: "Global",
+                              subtitle: "Every request in the app and web views",
+                              symbol: "globe", tint: .systemPink) { openEditor(.global) },
+                    ]
+                )
             } else {
                 // Rules exist — show the rule list manager
                 let list = InterceptRuleListViewController()
@@ -652,6 +680,17 @@ class NetworkDetailViewController: UITableViewController {
         self.navigationController?.dismiss(animated: true)
     }
 
+    /// Opens the replay editor pre-filled with this request. (See REPLAY.)
+    @objc private func replayTapped() {
+        guard let model = httpModel else { return }
+        let replay = RequestReplayViewController(model: model)
+        if let nav = navigationController {
+            nav.pushViewController(replay, animated: true)
+        } else {
+            present(SwiftyDebugNavigationController(rootViewController: replay), animated: true)
+        }
+    }
+
     @objc private func togglePin() {
         guard let model = httpModel else { return }
         model.isPinned.toggle()
@@ -663,6 +702,64 @@ class NetworkDetailViewController: UITableViewController {
         pinItem.image = model.isPinned
             ? UIImage(systemName: "pin.slash.fill")
             : UIImage(systemName: "pin.fill")
+    }
+
+    /// Export/share menu for the current request. Offers exporting the response
+    /// JSON as a `.json` file (share sheet), plus the existing text/cURL shares.
+    /// (See EXPORT-SHARE.)
+    @objc func exportResponseJSON(_ sender: UIBarButtonItem) {
+        let alert = UIAlertController(title: "Export / Share", message: nil, preferredStyle: .actionSheet)
+
+        // Response JSON as a file (the primary new capability).
+        let responseString = httpModel?.responseData?.dataToPrettyPrintString()
+        if let responseString, !responseString.isEmpty {
+            alert.addAction(UIAlertAction(title: "Export Response as .json file", style: .default) { [weak self] _ in
+                self?.shareAsFile(jsonText: responseString, kind: "response", sourceItem: sender)
+            })
+        }
+
+        // Request body as a file, when present.
+        let requestString = httpModel?.requestData?.dataToPrettyPrintString()
+        if let requestString, !requestString.isEmpty {
+            alert.addAction(UIAlertAction(title: "Export Request as .json file", style: .default) { [weak self] _ in
+                self?.shareAsFile(jsonText: requestString, kind: "request", sourceItem: sender)
+            })
+        }
+
+        // Full text (all sections) — copy + share as before.
+        alert.addAction(UIAlertAction(title: "Share full details (text)", style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            let items: [Any] = [self.messageBody]
+            let activity = UIActivityViewController(activityItems: items, applicationActivities: nil)
+            self.presentActivity(activity, sourceItem: sender)
+        })
+
+        alert.addAction(UIAlertAction(title: "Copy cURL", style: .default) { [weak self] _ in
+            UIPasteboard.general.string = self?.rawCurlString
+        })
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        // iPad anchor
+        alert.popoverPresentationController?.barButtonItem = sender
+        present(alert, animated: true)
+    }
+
+    /// Writes a JSON string to a temp file and shares the file URL.
+    private func shareAsFile(jsonText: String, kind: String, sourceItem: UIBarButtonItem) {
+        // Ensure the exported bytes are valid JSON (or verbatim if not JSON).
+        let contents = JSONExporter.clipboardString(from: jsonText)
+        let host = httpModel?.url?.host ?? "request"
+        let path = (httpModel?.url?.path ?? "").replacingOccurrences(of: "/", with: "-")
+        let name = "\(host)\(path)-\(kind)"
+        guard let fileURL = JSONExporter.writeTemporaryFile(contents: contents, suggestedName: name) else { return }
+        let activity = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
+        presentActivity(activity, sourceItem: sourceItem)
+    }
+
+    private func presentActivity(_ activity: UIActivityViewController, sourceItem: UIBarButtonItem) {
+        activity.popoverPresentationController?.barButtonItem = sourceItem
+        present(activity, animated: true)
     }
 
     @objc func didTapMail(_ sender: UIBarButtonItem) {
@@ -734,6 +831,22 @@ extension NetworkDetailViewController {
                 vc.httpModels = self.httpModels
                 self.navigationController?.pushViewController(vc, animated: true)
             }
+            return cell
+        }
+
+        // Media grid — images parsed from the response JSON (see JSON-MEDIA)
+        if let mediaURLs = model.mediaImageURLs, !mediaURLs.isEmpty {
+            let cell = tableView.dequeueReusableCell(withIdentifier: "NetworkMediaGridCell", for: indexPath)
+                as! NetworkMediaGridCell
+            cell.configure(imageURLs: mediaURLs)
+            let openGallery: (Int) -> Void = { [weak self] startIndex in
+                guard let self = self else { return }
+                let gallery = MediaGalleryViewController(imageURLs: mediaURLs, title: "Media")
+                self.navigationController?.pushViewController(gallery, animated: true)
+                _ = startIndex
+            }
+            cell.onSelectImage = openGallery
+            cell.onShowAll = { openGallery(0) }
             return cell
         }
 

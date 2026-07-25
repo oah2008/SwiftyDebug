@@ -38,7 +38,15 @@ class Settings: NSObject {
     var consoleLogsEnabled: Bool = true {
         didSet {
             save(.consoleLogsEnabled, value: consoleLogsEnabled)
-            PrintInterceptor.shared.enable = consoleLogsEnabled && SwiftyDebug.enableConsoleLog
+            let on = consoleLogsEnabled && SwiftyDebug.enableConsoleLog
+            PrintInterceptor.shared.enable = on
+            // Start/stop the expensive OSLog poll timer + stdout pipe so turning
+            // console logs off has (near) zero CPU cost. (See CONSOLE-COST.)
+            if on {
+                NSLogHook.enableIfNeeded()
+            } else {
+                NSLogHook.disable()
+            }
         }
     }
 
@@ -58,6 +66,19 @@ class Settings: NSObject {
             save(.monitorMedia, value: monitorMediaEnabled)
             SwiftyDebug.monitorMedia = monitorMediaEnabled
         }
+    }
+
+    /// When `true`, shaking to "disable" performs a full stop (see
+    /// `SettingsKey.fullStopOnDisable`). Default `false` — legacy behavior where
+    /// shake only hides the overlay bubble.
+    var fullStopOnDisable: Bool = false {
+        didSet { save(.fullStopOnDisable, value: fullStopOnDisable) }
+    }
+
+    /// Fixed network-link-conditioner preset applied to every captured request.
+    /// `.off` by default.
+    var networkConditionerPreset: NetworkConditionerPreset = .off {
+        didSet { saveString(.networkConditionerPreset, value: networkConditionerPreset.rawValue) }
     }
 
     private override init() {
@@ -86,11 +107,22 @@ class Settings: NSObject {
         // Toggle defaults: OFF
         monitorAllRequests = ud.bool(forKey: SettingsKey.monitorAllRequests.rawValue)
         monitorMediaEnabled = ud.bool(forKey: SettingsKey.monitorMedia.rawValue)
+
+        // Kill-switch behavior: OFF by default (shake only hides overlay)
+        fullStopOnDisable = ud.bool(forKey: SettingsKey.fullStopOnDisable.rawValue)
+
+        // Network conditioner: OFF by default
+        let presetRaw = ud.string(forKey: SettingsKey.networkConditionerPreset.rawValue) ?? ""
+        networkConditionerPreset = NetworkConditionerPreset(rawValue: presetRaw) ?? .off
     }
 
     // MARK: - Private
 
     private func save(_ key: SettingsKey, value: Bool) {
+        UserDefaults.standard.set(value, forKey: key.rawValue)
+    }
+
+    private func saveString(_ key: SettingsKey, value: String) {
         UserDefaults.standard.set(value, forKey: key.rawValue)
     }
 

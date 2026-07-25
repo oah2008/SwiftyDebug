@@ -76,6 +76,11 @@ class NetworkCell: UITableViewCell {
     private let interceptButton = UIButton(type: .system)
     var onInterceptTapped: (() -> Void)?
 
+    // MARK: - Replay action row (detail header only)
+
+    private let replayButton = UIButton(type: .system)
+    var onReplayTapped: (() -> Void)?
+
     // MARK: - Layout containers
 
     private let topRow = UIStackView()
@@ -100,6 +105,11 @@ class NetworkCell: UITableViewCell {
     /// Set to true to show the intercept button (used in detail page header)
     var showInterceptButton: Bool = false {
         didSet { interceptButton.isHidden = !showInterceptButton }
+    }
+
+    /// Set to true to show the replay button (detail page header, under Intercept)
+    var showReplayButton: Bool = false {
+        didSet { replayButton.isHidden = !showReplayButton }
     }
 
     var httpModel: NetworkTransaction? {
@@ -323,6 +333,31 @@ class NetworkCell: UITableViewCell {
         interceptButton.setTitle("Intercept Request", for: .normal)
         interceptButton.setTitleColor(.systemOrange, for: .normal)
 
+        // --- Replay button (hidden by default, sits directly under Intercept) ---
+
+        replayButton.isHidden = true
+        replayButton.backgroundColor = UIColor(white: 0.18, alpha: 1)
+        replayButton.layer.cornerRadius = 8
+        replayButton.clipsToBounds = true
+        var replayBtnConfig = UIButton.Configuration.plain()
+        replayBtnConfig.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16)
+        replayBtnConfig.imagePadding = 6
+        replayBtnConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attr in
+            var attr = attr
+            attr.font = .systemFont(ofSize: 13, weight: .semibold)
+            return attr
+        }
+        replayBtnConfig.baseForegroundColor = DebugTheme.accentColor
+        replayButton.configuration = replayBtnConfig
+        replayButton.addTarget(self, action: #selector(replayButtonTapped), for: .touchUpInside)
+
+        let replayIconConfig = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        let replayIcon = UIImage(systemName: "paperplane.fill", withConfiguration: replayIconConfig)?
+            .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
+        replayButton.setImage(replayIcon, for: .normal)
+        replayButton.setTitle("Replay Request", for: .normal)
+        replayButton.setTitleColor(DebugTheme.accentColor, for: .normal)
+
         // --- Main stack ---
 
         mainStack.axis = .vertical
@@ -335,6 +370,7 @@ class NetworkCell: UITableViewCell {
         mainStack.addArrangedSubview(curlButton)
         mainStack.setCustomSpacing(12, after: curlButton)
         mainStack.addArrangedSubview(interceptButton)
+        mainStack.addArrangedSubview(replayButton)
         cardView.addSubview(mainStack)
 
         // --- Constraints ---
@@ -625,6 +661,10 @@ class NetworkCell: UITableViewCell {
 
     @objc private func curlButtonTapped() {
         onCurlTapped?()
+    }
+
+    @objc private func replayButtonTapped() {
+        onReplayTapped?()
     }
 
     @objc private func interceptButtonTapped() {

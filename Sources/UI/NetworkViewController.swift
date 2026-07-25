@@ -89,6 +89,65 @@ class NetworkViewController: UIViewController {
         return img.withRenderingMode(.alwaysTemplate)
     }
 
+    /// Whether a transaction is **media** (image/video/audio/font).
+    ///
+    /// Media responses are routed to the **Media tab** and hidden from the
+    /// App/Web network lists so real API traffic isn't drowned out by sprite
+    /// sheets, avatars and web fonts. They stay visible on **Pinned** when the
+    /// user explicitly pinned them. (See MEDIA-TAB.)
+    /// File extensions that identify a media asset straight from the URL.
+    /// Checking the path is essential: many CDNs return no/!generic Content-Type,
+    /// so MIME alone lets media leak into the App tab.
+    private static let mediaPathExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "tiff", "tif", "heic", "heif", "avif",
+        "mp4", "mov", "avi", "m4v", "mkv", "webm", "m3u8", "ts",
+        "mp3", "m4a", "wav", "aac", "ogg", "flac",
+        "woff", "woff2", "ttf", "otf", "eot",
+    ]
+
+    static func isMediaTransaction(_ model: NetworkTransaction) -> Bool {
+        if model.isImage { return true }
+
+        // 1. MIME type, when the server gave us a useful one.
+        if let mime = model.mineType?.lowercased(), !mime.isEmpty {
+            for prefix in ["image/", "video/", "audio/", "font/"] where mime.hasPrefix(prefix) {
+                return true
+            }
+        }
+
+        // 2. URL path extension — works even with no/incorrect Content-Type.
+        if let url = model.url as URL? {
+            let ext = url.pathExtension.lowercased()
+            if !ext.isEmpty, mediaPathExtensions.contains(ext) { return true }
+            // Extensionless CDN URLs sometimes carry the type in the last path
+            // component or a query (e.g. ".../image.jpg?w=200" already handled,
+            // or ".../format=webp").
+            let lower = url.absoluteString.lowercased()
+            for ext in mediaPathExtensions where lower.contains(".\(ext)?") || lower.hasSuffix(".\(ext)") {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// The App/Web tabs show non-media traffic only; Pinned shows everything the
+    /// user pinned. Shared by the list, the filter sheet and the endpoint sheet
+    /// so a media host can never leak into one of them.
+    private func tabModels(from cache: [NetworkTransaction]) -> [NetworkTransaction] {
+        switch currentTab {
+        case .app:
+            return Settings.shared.networkRequestsEnabled
+                ? cache.filter { !$0.isWebViewRequest && !Self.isMediaTransaction($0) }
+                : []
+        case .web:
+            return Settings.shared.webNetworkRequestsEnabled
+                ? cache.filter { $0.isWebViewRequest && !Self.isMediaTransaction($0) }
+                : []
+        case .pinned:
+            return cache.filter { $0.isPinned }
+        }
+    }
+
     private func stripScheme(_ url: String) -> String {
         var result = url
         for prefix in ["https://", "http://", "HTTPS://", "HTTP://"] {
@@ -105,23 +164,16 @@ class NetworkViewController: UIViewController {
     private func buildFilterEntries() -> [(display: String, filterKeys: [(key: String, isPathFilter: Bool)], isWeb: Bool)] {
         let allCacheModels = cacheModels ?? []
 
-        // Filter by current tab first (respecting settings toggles)
-        let allModels: [NetworkTransaction]
-        switch currentTab {
-        case .app:
-            allModels = Settings.shared.networkRequestsEnabled
-                ? allCacheModels.filter { !$0.isWebViewRequest }
-                : []
-        case .web:
-            allModels = Settings.shared.webNetworkRequestsEnabled
-                ? allCacheModels.filter { $0.isWebViewRequest }
-                : []
-        case .pinned: allModels = allCacheModels.filter { $0.isPinned }
-        }
+        // Filter by current tab first (respecting settings toggles). Media is
+        // excluded here too, so media hosts/endpoints never pollute the sheet.
+        let allModels = tabModels(from: allCacheModels)
 
         let onlyURLs = SwiftyDebug.urls
         var rawEntries: [(display: String, filterKey: String, isPathFilter: Bool, isWeb: Bool)] = []
         var coveredHosts = Set<String>()
+        // Tracks filter keys already added (lowercased) so no duplicate rows are
+        // created across the onlyURLs, path-tag, host, and selected-filter passes.
+        var addedFilterKeys = Set<String>()
 
         for urlString in onlyURLs {
             var stripped = stripScheme(urlString)
@@ -144,6 +196,33 @@ class NetworkViewController: UIViewController {
                 let display = tagLabel(forURLString: urlString) ?? stripped
                 rawEntries.append((display: display, filterKey: stripped, isPathFilter: true, isWeb: pathIsWeb))
                 coveredHosts.insert(host.lowercased())
+                addedFilterKeys.insert(stripped.lowercased())
+            }
+        }
+
+        // Path-scoped tag keywords (e.g. "google.com/products") become their own
+        // path-filter entries, distinct from a bare-host entry — this is what
+        // keeps two tags that share a host but differ by path from collapsing.
+        // (See TAGS-FILTER.)
+        var coveredByPathTag = Set<String>()   // model URLs already claimed by a path-tag
+        for (keyword, label) in SwiftyDebug._tags where keyword.contains("/") {
+            let key = stripScheme(keyword).lowercased()
+            let trimmedKey = key.hasSuffix("/") ? String(key.dropLast()) : key
+            guard !trimmedKey.isEmpty else { continue }
+
+            var hasMatch = false
+            var isWeb = false
+            for model in allModels {
+                let modelURL = stripScheme(model.url?.absoluteString ?? "").lowercased()
+                if modelURL.hasPrefix(trimmedKey + "/") || modelURL == trimmedKey {
+                    hasMatch = true
+                    coveredByPathTag.insert(modelURL)
+                    if model.isWebViewRequest { isWeb = true }
+                }
+            }
+            if hasMatch, !addedFilterKeys.contains(trimmedKey) {
+                addedFilterKeys.insert(trimmedKey)
+                rawEntries.append((display: label, filterKey: trimmedKey, isPathFilter: true, isWeb: isWeb))
             }
         }
 
@@ -165,12 +244,11 @@ class NetworkViewController: UIViewController {
 
         // Add currently-selected filters that are not already in the list (exact match)
         let state = currentTabState
-        var addedKeys = Set<String>(rawEntries.map { $0.filterKey.lowercased() })
 
         for key in state.selectedPathFilters {
             let lower = key.lowercased()
-            if !addedKeys.contains(lower) {
-                addedKeys.insert(lower)
+            if !addedFilterKeys.contains(lower) {
+                addedFilterKeys.insert(lower)
                 // Find original URL from SwiftyDebug.urls to resolve tag correctly
                 let originalURL = onlyURLs.first { stripScheme($0).lowercased().hasPrefix(lower) }
                 let display = tagLabel(forURLString: originalURL ?? key) ?? tagLabel(forHost: lower.components(separatedBy: "/").first ?? lower) ?? key
@@ -179,8 +257,8 @@ class NetworkViewController: UIViewController {
         }
         for key in state.selectedHostFilters {
             let lower = key.lowercased()
-            if !addedKeys.contains(lower) {
-                addedKeys.insert(lower)
+            if !addedFilterKeys.contains(lower) {
+                addedFilterKeys.insert(lower)
                 let originalURL = onlyURLs.first { stripScheme($0).lowercased().hasPrefix(lower) }
                 let display = tagLabel(forURLString: originalURL ?? key) ?? tagLabel(forHost: lower) ?? key
                 rawEntries.append((display: display, filterKey: key, isPathFilter: false, isWeb: false))
@@ -195,64 +273,83 @@ class NetworkViewController: UIViewController {
             return $0.display.lowercased() < $1.display.lowercased()
         }
 
-        // Deduplicate by display label — merge all filterKeys under the same tag into one row
-        var displayOrder: [String] = []
-        var mergedMap: [String: (filterKeys: [(key: String, isPathFilter: Bool)], isWeb: Bool)] = [:]
+        // Merge entries into rows. Path filters are keyed by their *filterKey* so
+        // two tags that share a display label but target different paths (e.g.
+        // "Algolia Proxy" → /products and another → /events) stay as separate
+        // rows. Host filters keep merging by display label so http/https and
+        // duplicate hosts collapse as before. (See TAGS-FILTER.)
+        var rowOrder: [String] = []
+        var mergedMap: [String: (display: String, filterKeys: [(key: String, isPathFilter: Bool)], isWeb: Bool)] = [:]
         for entry in sorted {
-            let key = entry.display.lowercased()
-            if mergedMap[key] == nil {
-                displayOrder.append(entry.display)
-                mergedMap[key] = (filterKeys: [], isWeb: false)
+            // Distinct merge key: path filters never merge across different keys.
+            let mergeKey = entry.isPathFilter
+                ? "path|" + entry.filterKey.lowercased()
+                : "host|" + entry.display.lowercased()
+            if mergedMap[mergeKey] == nil {
+                rowOrder.append(mergeKey)
+                mergedMap[mergeKey] = (display: entry.display, filterKeys: [], isWeb: false)
             }
-            mergedMap[key]!.filterKeys.append((key: entry.filterKey, isPathFilter: entry.isPathFilter))
-            if entry.isWeb { mergedMap[key]!.isWeb = true }
+            mergedMap[mergeKey]!.filterKeys.append((key: entry.filterKey, isPathFilter: entry.isPathFilter))
+            if entry.isWeb { mergedMap[mergeKey]!.isWeb = true }
         }
-        return displayOrder.map { display in
-            let info = mergedMap[display.lowercased()]!
-            return (display: display, filterKeys: info.filterKeys, isWeb: info.isWeb)
+        return rowOrder.map { mergeKey in
+            let info = mergedMap[mergeKey]!
+            return (display: info.display, filterKeys: info.filterKeys, isWeb: info.isWeb)
         }
     }
 
-    /// Returns the tag label from networkTagMap whose key is a substring of the full URL,
+    /// Returns the tag label from the tag map that best matches the full URL,
     /// or nil if no custom tag matches.
+    ///
+    /// Matching is **deterministic** and **path-aware** (see TAGS-FILTER): when
+    /// two tag keywords could match, the *longest* keyword wins (most specific),
+    /// so path-scoped keywords like `google.com/products` beat a bare host
+    /// keyword like `google.com`, and dictionary iteration order no longer
+    /// affects the result.
     private func tagLabel(forURLString urlString: String) -> String? {
         let map = SwiftyDebug._tags
         guard !map.isEmpty else { return nil }
-        let lower = urlString.lowercased()
         // Direct key lookup first (most common case: urls key == tag keyword)
         if let label = map[urlString] { return label }
-        // Substring match fallback
+
+        let lower = urlString.lowercased()
+        // Longest-keyword-wins substring match for determinism + path awareness.
+        var best: (keyword: String, label: String)?
         for (keyword, label) in map where lower.contains(keyword.lowercased()) {
-            return label
+            if best == nil || keyword.count > best!.keyword.count {
+                best = (keyword, label)
+            }
         }
-        return nil
+        return best?.label
     }
 
     /// Returns the tag label whose keyword matches the given host, or nil.
+    ///
+    /// Only *host-scoped* keywords (those without a `/` path segment) can match a
+    /// bare host; a path-scoped keyword like `google.com/products` intentionally
+    /// does NOT match the bare host `google.com` (it needs the full URL — see
+    /// `tagLabel(forURLString:)`). Longest keyword wins for determinism.
     private func tagLabel(forHost host: String) -> String? {
         let map = SwiftyDebug._tags
         guard !map.isEmpty else { return nil }
-        for (keyword, label) in map where host.contains(keyword.lowercased()) {
-            return label
+        let lowerHost = host.lowercased()
+        var best: (keyword: String, label: String)?
+        for (keyword, label) in map {
+            let k = keyword.lowercased()
+            // Skip path-scoped keywords here — they belong to the full-URL matcher.
+            if k.contains("/") { continue }
+            guard lowerHost.contains(k) else { continue }
+            if best == nil || keyword.count > best!.keyword.count {
+                best = (keyword, label)
+            }
         }
-        return nil
+        return best?.label
     }
 
     private func uniqueEndpointsForFilters(pathFilters: Set<String>, hostFilters: Set<String>) -> [FilterableEndpoint] {
         guard let allCache = cacheModels else { return [] }
-        // Filter by current tab (respecting settings toggles)
-        let models: [NetworkTransaction]
-        switch currentTab {
-        case .app:
-            models = Settings.shared.networkRequestsEnabled
-                ? allCache.filter { !$0.isWebViewRequest }
-                : []
-        case .web:
-            models = Settings.shared.webNetworkRequestsEnabled
-                ? allCache.filter { $0.isWebViewRequest }
-                : []
-        case .pinned: models = allCache.filter { $0.isPinned }
-        }
+        // Filter by current tab (respecting settings toggles + media routing)
+        let models = tabModels(from: allCache)
         if pathFilters.isEmpty && hostFilters.isEmpty { return [] }
 
         let onlyURLs = SwiftyDebug.urls
@@ -388,19 +485,10 @@ class NetworkViewController: UIViewController {
 
         let state = currentTabState
 
-        // 1. Tab segment filter (respecting settings toggles)
-        var filtered: [NetworkTransaction]
-        switch currentTab {
-        case .app:
-            filtered = Settings.shared.networkRequestsEnabled
-                ? cacheModels.filter { !$0.isWebViewRequest }
-                : []
-        case .web:
-            filtered = Settings.shared.webNetworkRequestsEnabled
-                ? cacheModels.filter { $0.isWebViewRequest }
-                : []
-        case .pinned: filtered = cacheModels.filter { $0.isPinned }
-        }
+        // 1. Tab segment filter (respecting settings toggles). Media requests are
+        //    routed to the Media tab and hidden here — except on Pinned, where a
+        //    pinned item is always shown.
+        var filtered = tabModels(from: cacheModels)
 
         // 2. Path / host filters
         let pathFilters = state.selectedPathFilters
@@ -432,11 +520,18 @@ class NetworkViewController: UIViewController {
             }
         }
 
-        // 4. Search text filter
+        // 4. Search text filter — index-backed rich search over URL parts,
+        //    method, status, header names, query params, and response-derived
+        //    metadata (see SEARCH). Falls back to a plain URL contains for any
+        //    model that predates the index.
         if !state.searchText.isEmpty {
-            let query = state.searchText.lowercased()
+            let raw = state.searchText
+            let plain = raw.lowercased()
             filtered = filtered.filter { model in
-                (model.url?.absoluteString ?? "").lowercased().contains(query)
+                if let index = model.searchIndex {
+                    return index.matches(raw)
+                }
+                return (model.url?.absoluteString ?? "").lowercased().contains(plain)
             }
         }
 
@@ -630,7 +725,7 @@ class NetworkViewController: UIViewController {
             tf.layer.borderColor = UIColor(white: 0.22, alpha: 1).cgColor
         }
         tf.attributedPlaceholder = NSAttributedString(
-            string: "Search URL...",
+            string: "Search URL, header:, status:, param:…",
             attributes: [.foregroundColor: UIColor(white: 0.4, alpha: 1)]
         )
         tf.leftView?.tintColor = UIColor(white: 0.4, alpha: 1)
