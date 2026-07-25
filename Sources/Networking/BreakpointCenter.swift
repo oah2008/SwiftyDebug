@@ -41,7 +41,23 @@ final class BreakpointCenter {
         /// Called to fail the request instead of delivering it.
         fileprivate let abortHandler: () -> Void
 
-        fileprivate var isSettled = false
+        /// True once the request has been resumed, aborted, or expired. Read by
+        /// `CustomHTTPProtocol` so it doesn't expire a row it already delivered.
+        fileprivate(set) var isSettled = false
+
+        /// True when the host app abandoned the request while it was held, so
+        /// there is no longer a client to deliver to. Distinguishes "you released
+        /// it" from "it was taken away from you".
+        fileprivate(set) var didExpire = false
+
+        /// How long this request has been held.
+        var heldFor: TimeInterval { Date().timeIntervalSince(pausedAt) }
+
+        /// Seconds left before the hold budget runs out, or nil once settled.
+        var remainingHoldTime: TimeInterval? {
+            guard !isSettled else { return nil }
+            return max(0, Settings.shared.breakpointHoldSeconds - heldFor)
+        }
 
         init(stage: BreakpointMode,
              request: URLRequest,
@@ -62,9 +78,22 @@ final class BreakpointCenter {
         var statusCode: Int? { response?.statusCode }
 
         /// Response body as text, pretty-printed when it's JSON.
+        ///
+        /// Falls back to the raw UTF-8 text for non-JSON payloads (HTML, plain
+        /// text, XML). Returning "" for those would let the editor deliver an
+        /// empty body to the app.
         var responseBodyText: String {
             guard let data = responseBody, !data.isEmpty else { return "" }
-            return data.dataToPrettyPrintString() ?? ""
+            if let pretty = data.dataToPrettyPrintString() { return pretty }
+            return String(data: data, encoding: .utf8) ?? ""
+        }
+
+        /// True when the body isn't representable as text at all (images, binary
+        /// protobuf, …). Such a body must be delivered byte-for-byte, never
+        /// re-encoded from the editor's string.
+        var isResponseBodyBinary: Bool {
+            guard let data = responseBody, !data.isEmpty else { return false }
+            return String(data: data, encoding: .utf8) == nil
         }
     }
 
@@ -94,16 +123,36 @@ final class BreakpointCenter {
     // MARK: - Releasing
 
     /// Lets a paused request continue, applying whatever edits were made to it.
-    func resume(_ request: PausedRequest) {
-        guard take(request) else { return }
+    ///
+    /// Returns `false` when the request was already settled — almost always
+    /// because the host app gave up on it first. Callers **must** surface that:
+    /// a delivery that silently does nothing is indistinguishable from a delivery
+    /// that worked but produced an empty screen.
+    @discardableResult
+    func resume(_ request: PausedRequest) -> Bool {
+        guard take(request) else { return false }
         request.resumeHandler(request)
         notifyChanged()
+        return true
     }
 
     /// Fails a paused request instead of delivering it.
-    func abort(_ request: PausedRequest) {
-        guard take(request) else { return }
+    @discardableResult
+    func abort(_ request: PausedRequest) -> Bool {
+        guard take(request) else { return false }
         request.abortHandler()
+        notifyChanged()
+        return true
+    }
+
+    /// Drops a paused request without resuming or aborting it. Used when the app
+    /// itself gave up first — it cancelled the request, or its own
+    /// `timeoutIntervalForRequest` elapsed while the request sat on hold. There is
+    /// no live client left to deliver to, so the row is removed instead of
+    /// offering a "Deliver" button that would silently do nothing.
+    func expire(_ request: PausedRequest) {
+        guard take(request) else { return }
+        request.didExpire = true
         notifyChanged()
     }
 

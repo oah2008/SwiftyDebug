@@ -41,11 +41,29 @@ class InterceptRuleEditorViewController: UITableViewController {
         case availableParams = 5
     }
 
-    private struct EditItem {
+    struct EditItem {
         var key: String
         var value: String
         var isRemoving: Bool
         var isKeyEditable: Bool
+        /// Only active items are written into the saved rule. A row you can see
+        /// but did not switch on changes nothing about the outgoing request.
+        var isActive: Bool = true
+    }
+
+    /// Splits editor rows into the two things a rule stores: value overrides and
+    /// removals. Pure and `internal` so the "nothing applies unless it is checked"
+    /// guarantee is covered by tests rather than by inspection.
+    ///
+    /// `lowercaseRemovals` matches how the rule stores removed keys: headers are
+    /// case-insensitive, query parameters are not.
+    static func partition(_ items: [EditItem],
+                          lowercaseRemovals: Bool) -> (overrides: [KVPair], removed: Set<String>) {
+        let active = items.filter { $0.isActive && !$0.key.isEmpty }
+        let overrides = active.filter { !$0.isRemoving }.map { KVPair(key: $0.key, value: $0.value) }
+        let removed = Set(active.filter { $0.isRemoving }
+            .map { lowercaseRemovals ? $0.key.lowercased() : $0.key })
+        return (overrides, removed)
     }
 
     // MARK: - State
@@ -151,7 +169,45 @@ class InterceptRuleEditorViewController: UITableViewController {
         } else {
             matchMode = initialMatchMode ?? .normalized
             if matchMode == .host && !requestHost.isEmpty { selectedHosts = [requestHost] }
+            // For a NEW endpoint-scoped rule, pre-load every header and query
+            // parameter this endpoint actually sends, already filled in with
+            // their real values — so you edit what's there instead of hunting
+            // for it. Host/global rules stay empty on purpose: they match many
+            // endpoints, so one endpoint's headers would be misleading.
+            if matchMode == .exact || matchMode == .normalized {
+                prefillFromEndpoint()
+            }
         }
+    }
+
+    /// Seeds a NEW endpoint-scoped rule with the headers and query parameters
+    /// **this request actually sent**, already switched on — the same set the
+    /// replay screen shows you.
+    ///
+    /// Strictly the current request: headers remembered from *other* requests are
+    /// left in AVAILABLE HEADERS to be added deliberately. Pulling those in was
+    /// how rules ended up setting headers nobody chose.
+    private func prefillFromEndpoint() {
+        guard let model = httpModel else { return }
+
+        var headers: [(String, String)] = []
+        var params: [(String, String)] = []
+
+        if let dict = model.requestHeaderFields as? [String: Any] {
+            headers = dict.map { ($0.key, "\($0.value)") }
+        }
+        if let url = model.url as URL?,
+           let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let items = comps.queryItems {
+            params = items.map { ($0.name, $0.value ?? "") }
+        }
+
+        headerItems = headers
+            .sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
+            .map { EditItem(key: $0.0, value: $0.1, isRemoving: false, isKeyEditable: false, isActive: true) }
+        queryParamItems = params
+            .sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
+            .map { EditItem(key: $0.0, value: $0.1, isRemoving: false, isKeyEditable: false, isActive: true) }
     }
 
     /// Rebuilds the "available" lists for the current scope, merging the current
@@ -228,12 +284,14 @@ class InterceptRuleEditorViewController: UITableViewController {
         rule.mock = mock
         rule.breakpointMode = breakpointMode
 
-        rule.headerOverrides = headerItems.filter { !$0.isRemoving && !$0.key.isEmpty }
-            .map { KVPair(key: $0.key, value: $0.value) }
-        rule.removedHeaderKeys = Set(headerItems.filter { $0.isRemoving && !$0.key.isEmpty }.map { $0.key.lowercased() })
-        rule.queryParamOverrides = queryParamItems.filter { !$0.isRemoving && !$0.key.isEmpty }
-            .map { KVPair(key: $0.key, value: $0.value) }
-        rule.removedQueryParamKeys = Set(queryParamItems.filter { $0.isRemoving && !$0.key.isEmpty }.map { $0.key })
+        // `isActive` is the guarantee that a rule only ever carries what was
+        // explicitly switched on. Everything else is inert editor state.
+        let headers = Self.partition(headerItems, lowercaseRemovals: true)
+        let params = Self.partition(queryParamItems, lowercaseRemovals: false)
+        rule.headerOverrides = headers.overrides
+        rule.removedHeaderKeys = headers.removed
+        rule.queryParamOverrides = params.overrides
+        rule.removedQueryParamKeys = params.removed
 
         let hasEffect = rule.isBlocked
             || rule.mock.isEnabled
@@ -333,6 +391,10 @@ class InterceptRuleEditorViewController: UITableViewController {
         // Offer the endpoint's real response as a starting point.
         let currentBody = httpModel?.responseData?.dataToPrettyPrintString()
         let editor = MockResponseEditorViewController(mock: mock, currentResponseText: currentBody)
+        // Pre-fills "Add to profile…" so a mock copied into a scenario answers the
+        // same requests this rule does.
+        editor.endpointMatchMode = matchMode
+        editor.endpointPattern = mockPatternForCurrentScope
         editor.onSave = { [weak self] updated in
             self?.mock = updated
             self?.tableView.reloadData()
@@ -341,6 +403,17 @@ class InterceptRuleEditorViewController: UITableViewController {
             nav.pushViewController(editor, animated: true)
         } else {
             present(SwiftyDebugNavigationController(rootViewController: editor), animated: true)
+        }
+    }
+
+    /// What a mock copied out of this rule should match on. Mirrors the scope the
+    /// rule itself uses, so the profile entry fires on the same requests.
+    private var mockPatternForCurrentScope: String {
+        switch matchMode {
+        case .exact:      return requestPath
+        case .normalized: return normalizedPath
+        case .host:       return selectedHosts.first ?? requestHost
+        case .global:     return ""
         }
     }
 
@@ -360,8 +433,33 @@ class InterceptRuleEditorViewController: UITableViewController {
         }
         OptionPickerSheetViewController.present(
             from: self, title: "Breakpoint",
-            message: "Paused requests appear in the Paused inbox — the app waits until you release them.",
+            message: "Paused requests appear in the Paused inbox — the app waits until you release them, "
+                + "for up to \(Self.holdBudgetText()). After that the request is let go on its own.",
             options: options, selectedIndex: modes.firstIndex(of: breakpointMode))
+    }
+
+    // MARK: - Breakpoint hold budget
+
+    /// How long a paused request is actually held (`Settings.breakpointHoldSeconds`),
+    /// written the way a human reads it: "10 min", "45 s", "2 hr".
+    static func holdBudgetText(seconds: TimeInterval = Settings.shared.breakpointHoldSeconds) -> String {
+        func trim(_ value: Double, _ unit: String) -> String {
+            return value == value.rounded()
+                ? "\(Int(value)) \(unit)"
+                : String(format: "%.1f %@", value, unit)
+        }
+        if seconds >= 3600 { return trim(seconds / 3600, "hr") }
+        if seconds >= 60   { return trim(seconds / 60, "min") }
+        return "\(max(1, Int(seconds.rounded()))) s"
+    }
+
+    /// The one short line the Breakpoint row appends once a stage is armed.
+    /// Says out loud whether the host app's own timeout can cut the hold short.
+    static func holdBudgetPhrase() -> String {
+        let budget = holdBudgetText()
+        return Settings.shared.extendTimeoutsForBreakpoints
+            ? "held up to \(budget) while you edit"
+            : "held up to \(budget), or until the app's own timeout"
     }
 
     /// Full list of available headers/params in a searchable sheet.
@@ -625,9 +723,11 @@ class InterceptRuleEditorViewController: UITableViewController {
             c.textLabel?.text = "Breakpoint"
             c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
             c.textLabel?.textColor = .white
+            // An armed breakpoint holds the request for a *budget*, not forever — say so
+            // here, because nothing else in the UI mentions it. (See BREAKPOINTS.)
             c.detailTextLabel?.text = breakpointMode == .off
                 ? "Off — requests are never paused"
-                : breakpointMode.title + " · " + breakpointMode.detail
+                : breakpointMode.title + " · " + breakpointMode.detail + " · " + Self.holdBudgetPhrase()
             c.detailTextLabel?.font = .systemFont(ofSize: 11)
             c.detailTextLabel?.textColor = breakpointMode == .off ? UIColor(white: 0.45, alpha: 1) : .systemOrange
             c.detailTextLabel?.numberOfLines = 3
@@ -646,8 +746,17 @@ class InterceptRuleEditorViewController: UITableViewController {
     private func cardCell(_ ip: IndexPath, isHeader: Bool) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "Card", for: ip) as! KeyValueCardCell
         let item = isHeader ? headerItems[ip.row] : queryParamItems[ip.row]
-        cell.configure(key: item.key, value: item.value, removing: item.isRemoving, keyEditable: item.isKeyEditable)
+        cell.showsActiveControl = true
+        cell.configure(key: item.key, value: item.value, removing: item.isRemoving,
+                       keyEditable: item.isKeyEditable, active: item.isActive)
 
+        cell.onActiveToggled = { [weak self] in
+            guard let self else { return }
+            if isHeader { self.headerItems[ip.row].isActive.toggle() }
+            else { self.queryParamItems[ip.row].isActive.toggle() }
+            // Whole section, not just the row: the header shows the active count.
+            self.tableView.reloadSections([ip.section], with: .none)
+        }
         cell.onKeyChanged = { [weak self] k in
             guard let self else { return }
             if isHeader { self.headerItems[ip.row].key = k } else { self.queryParamItems[ip.row].key = k }
@@ -773,11 +882,17 @@ class InterceptRuleEditorViewController: UITableViewController {
         switch s {
         case .endpoint: return matchMode == .global ? "SCOPE" : matchMode == .host ? "URLS" : "ENDPOINT"
         case .action:   return "ACTION"
-        case .headers:  return isBlocked ? nil : "HEADERS\(headerItems.isEmpty ? "" : " (\(headerItems.count))")"
+        case .headers:
+            guard !isBlocked else { return nil }
+            return headerItems.isEmpty ? "HEADERS"
+                : "HEADERS (\(headerItems.filter { $0.isActive }.count) of \(headerItems.count) active)"
         case .availableHeaders:
             guard !isBlocked, !availableHeaders.isEmpty else { return nil }
             return "AVAILABLE HEADERS (\(availableHeaders.count))"
-        case .queryParams: return isBlocked ? nil : "QUERY PARAMETERS\(queryParamItems.isEmpty ? "" : " (\(queryParamItems.count))")"
+        case .queryParams:
+            guard !isBlocked else { return nil }
+            return queryParamItems.isEmpty ? "QUERY PARAMETERS"
+                : "QUERY PARAMETERS (\(queryParamItems.filter { $0.isActive }.count) of \(queryParamItems.count) active)"
         case .availableParams:
             guard !isBlocked, !availableParams.isEmpty else { return nil }
             return "AVAILABLE PARAMETERS (\(availableParams.count))"
@@ -798,7 +913,13 @@ class InterceptRuleEditorViewController: UITableViewController {
         hint.font = .systemFont(ofSize: 10)
         hint.textColor = UIColor(white: 0.4, alpha: 1)
         hint.translatesAutoresizingMaskIntoConstraints = false
-        if s == .availableHeaders || s == .availableParams { hint.text = "tap to add" }
+        switch s {
+        case .availableHeaders, .availableParams: hint.text = "tap to add"
+        case .headers, .queryParams:
+            // Say out loud that the checkbox is what makes a row take effect.
+            hint.text = isBlocked ? nil : "only checked rows apply"
+        default: break
+        }
         header.addSubview(hint)
 
         NSLayoutConstraint.activate([

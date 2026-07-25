@@ -58,7 +58,19 @@ class AppInfoViewController: UITableViewController {
     private struct InspectorRow {
         let title: String
         let symbol: String
+        /// Optional live one-liner under the title. Evaluated in `cellForRowAt`, so it
+        /// must stay cheap — in-memory state only, never a disk read.
+        let subtitle: (() -> String)?
         let make: () -> UIViewController
+
+        init(title: String, symbol: String,
+             subtitle: (() -> String)? = nil,
+             make: @escaping () -> UIViewController) {
+            self.title = title
+            self.symbol = symbol
+            self.subtitle = subtitle
+            self.make = make
+        }
     }
 
     private static let inspectorRows: [InspectorRow] = [
@@ -85,6 +97,13 @@ class AppInfoViewController: UITableViewController {
         },
         InspectorRow(title: "Paused Requests", symbol: "pause.circle.fill") {
             BreakpointInboxViewController()
+        },
+        InspectorRow(
+            title: "Share Rules",
+            symbol: "square.and.arrow.up.on.square",
+            subtitle: { "Export intercept rules as JSON, or import a teammate's" }
+        ) {
+            RuleTransferViewController()
         },
     ]
 
@@ -476,20 +495,28 @@ class AppInfoViewController: UITableViewController {
             return cell
 
         case .actions:
-            let cell = UITableViewCell(style: .default, reuseIdentifier: "ActionCell")
+            // Subtitle style only where a row actually has one — a `.subtitle` cell with
+            // an empty detail label lays its title out differently.
+            let inspector = indexPath.row < Self.inspectorRows.count ? Self.inspectorRows[indexPath.row] : nil
+            let hasSubtitle = inspector?.subtitle != nil
+            let cell = UITableViewCell(style: hasSubtitle ? .subtitle : .default,
+                                       reuseIdentifier: hasSubtitle ? "ActionSubtitleCell" : "ActionCell")
             cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
             cell.forceLTR()
             cell.selectionStyle = .default
             let iconConfig = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
 
-            if indexPath.row < Self.inspectorRows.count {
-                let row = Self.inspectorRows[indexPath.row]
+            if let row = inspector {
                 cell.imageView?.image = UIImage(systemName: row.symbol, withConfiguration: iconConfig)?
                     .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
                 cell.textLabel?.text = row.title
                 cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
                 cell.textLabel?.textColor = .white
                 cell.textLabel?.textAlignment = .natural
+                cell.detailTextLabel?.text = row.subtitle?()
+                cell.detailTextLabel?.font = .systemFont(ofSize: 11)
+                cell.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
+                cell.detailTextLabel?.numberOfLines = 2
                 cell.accessoryType = .disclosureIndicator
             } else {
                 // Clear Pinned Requests (always last)

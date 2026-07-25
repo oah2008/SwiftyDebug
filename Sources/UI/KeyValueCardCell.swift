@@ -30,6 +30,8 @@ final class KeyValueCardCell: UITableViewCell {
     var onValueChanged: ((String) -> Void)?
     /// Fired when the SET/REMOVE pill is tapped. Only shown when `showsModeControl`.
     var onModeToggled: (() -> Void)?
+    /// Fired when the active checkbox is tapped. Only shown when `showsActiveControl`.
+    var onActiveToggled: (() -> Void)?
 
     /// Key-field autocomplete provider.
     var keySuggestionsProvider: ((String) -> [String])?
@@ -43,6 +45,22 @@ final class KeyValueCardCell: UITableViewCell {
     /// entry is simply a value you set).
     var showsModeControl: Bool = true {
         didSet { modeButton.isHidden = !showsModeControl }
+    }
+
+    /// When false the active checkbox is hidden (contexts where every row is
+    /// applied by definition, e.g. the storage editor).
+    var showsActiveControl: Bool = false {
+        didSet { activeButton.isHidden = !showsActiveControl }
+    }
+
+    /// `true` = this entry is applied to matching requests.
+    ///
+    /// Exists because a rule silently applying a header the developer never chose
+    /// is a trap: the request goes out modified with no visible trace of why.
+    /// Inactive rows stay in the editor (so you can flip them back on) but
+    /// contribute nothing to the saved rule.
+    var isActive: Bool = true {
+        didSet { updateModeAppearance() }
     }
 
     /// `true` = this entry removes the header/param from the request.
@@ -61,6 +79,7 @@ final class KeyValueCardCell: UITableViewCell {
     private let valueCaption = UILabel()
     private let separator = UIView()
     private let modeButton = UIButton(type: .system)
+    private let activeButton = UIButton(type: .system)
     private let stack = UIStackView()
 
     // Autocomplete accessory
@@ -114,8 +133,13 @@ final class KeyValueCardCell: UITableViewCell {
         modeButton.addTarget(self, action: #selector(modeTapped), for: .touchUpInside)
         modeButton.setContentHuggingPriority(.required, for: .horizontal)
 
-        // Key row: caption + mode pill
-        let keyRow = UIStackView(arrangedSubviews: [keyCaption, UIView(), modeButton])
+        // Active checkbox — leads the row so "is this on?" is the first thing read.
+        activeButton.addTarget(self, action: #selector(activeTapped), for: .touchUpInside)
+        activeButton.setContentHuggingPriority(.required, for: .horizontal)
+        activeButton.isHidden = !showsActiveControl
+
+        // Key row: checkbox + caption + mode pill
+        let keyRow = UIStackView(arrangedSubviews: [activeButton, keyCaption, UIView(), modeButton])
         keyRow.axis = .horizontal
         keyRow.alignment = .center
         keyRow.spacing = 6
@@ -175,14 +199,31 @@ final class KeyValueCardCell: UITableViewCell {
 
     // MARK: - Configure
 
-    func configure(key: String, value: String, removing: Bool = false, keyEditable: Bool = true) {
+    func configure(key: String, value: String, removing: Bool = false, keyEditable: Bool = true,
+                   active: Bool = true) {
         keyField.text = key
         valueField.text = value
         isRemoving = removing
         isKeyEditable = keyEditable
+        isActive = active
     }
 
     private func updateModeAppearance() {
+        let cfg = UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+        activeButton.setImage(
+            UIImage(systemName: isActive ? "checkmark.circle.fill" : "circle", withConfiguration: cfg)?
+                .withTintColor(isActive ? Self.teal : UIColor(white: 0.35, alpha: 1),
+                               renderingMode: .alwaysOriginal),
+            for: .normal)
+
+        // An inactive row is visibly inert — it must never read as "this applies".
+        let dim: CGFloat = (showsActiveControl && !isActive) ? 0.4 : 1
+        keyField.alpha = dim
+        valueField.alpha = dim
+        valueCaption.alpha = dim
+        keyCaption.alpha = dim
+        modeButton.alpha = dim
+
         if isRemoving {
             modeButton.setTitle("REMOVE", for: .normal)
             modeButton.setTitleColor(.white, for: .normal)
@@ -205,23 +246,33 @@ final class KeyValueCardCell: UITableViewCell {
 
     override func prepareForReuse() {
         super.prepareForReuse()
+        // Resign before anything else: UIKit recycles cells while a field can
+        // still be first responder, and an editing-end callback firing during
+        // that teardown can re-enter the table's own reload. (See the crash in
+        // the UserDefaults/Keychain inspectors.)
+        if keyField.isFirstResponder { keyField.resignFirstResponder() }
+        if valueField.isFirstResponder { valueField.resignFirstResponder() }
         keyField.text = nil
         valueField.text = nil
         onKeyChanged = nil
         onValueChanged = nil
         onModeToggled = nil
+        onActiveToggled = nil
         keySuggestionsProvider = nil
         onKeySuggestionPicked = nil
         valueSuggestionsProvider = nil
         currentKeyText = nil
         showsModeControl = true
+        showsActiveControl = false
         isRemoving = false
         isKeyEditable = true
+        isActive = true
     }
 
     // MARK: - Actions
 
     @objc private func modeTapped() { onModeToggled?() }
+    @objc private func activeTapped() { onActiveToggled?() }
     @objc private func keyDidChange() {
         onKeyChanged?(keyField.text ?? "")
         if activeField == .key { refreshSuggestions() }

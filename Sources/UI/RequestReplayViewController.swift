@@ -42,6 +42,12 @@ final class RequestReplayViewController: UITableViewController {
     private var headers: [KV] = []
     private var bodyText: String = ""
 
+    /// The request as captured, before any edits — the most relevant source of
+    /// header names to offer back after the user deletes one.
+    private let originalHeaders: [(name: String, value: String)]
+    private let originHost: String
+    private let originPath: String
+
     private static let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
     private var methodSupportsBody: Bool { !["GET", "HEAD", "DELETE"].contains(method) }
 
@@ -79,6 +85,11 @@ final class RequestReplayViewController: UITableViewController {
             // Pretty-print JSON bodies so they're editable on a phone.
             bodyText = JSONExporter.prettyJSONString(from: s) ?? s
         }
+
+        originalHeaders = headers.map { (name: $0.key, value: $0.value) }
+        originHost = (url?.host ?? "").lowercased()
+        originPath = url?.path ?? ""
+
         super.init(style: .grouped)
     }
 
@@ -114,6 +125,7 @@ final class RequestReplayViewController: UITableViewController {
         tableView.estimatedRowHeight = 120
         tableView.keyboardDismissMode = .interactive
         tableView.contentInset.bottom = 24
+        refreshAvailableHeaders()
         view.forceLTR()
     }
 
@@ -224,6 +236,135 @@ final class RequestReplayViewController: UITableViewController {
         present(a, animated: true)
     }
 
+    // MARK: - Available headers
+
+    /// One header offered by the "Available headers" picker.
+    struct HeaderSuggestion: Equatable {
+        /// Where the name came from — drives the row's icon and subtitle.
+        enum Origin { case thisRequest, remembered, catalog }
+        let name: String
+        let value: String
+        let origin: Origin
+    }
+
+    /// Ordered list of headers the user can add, minus the ones already in the
+    /// replay. Only recomputed at points that also reload the headers section,
+    /// so the row count never drifts from what the table believes.
+    private var availableHeaders: [HeaderSuggestion] = []
+
+    /// Everything `RequestMetadataStore` remembers for this endpoint/host, then
+    /// globally. Fetched once: the store only grows as new requests are captured,
+    /// and this screen replays a fixed one.
+    private lazy var rememberedHeaders: [RequestMetadataStore.Entry] = {
+        RequestMetadataStore.shared.headers(
+            forMode: .normalized,
+            endpoint: originPath,
+            hosts: originHost.isEmpty ? [] : [originHost])
+    }()
+
+    private func refreshAvailableHeaders() {
+        let present = Set(headers.map { $0.key.lowercased() }.filter { !$0.isEmpty })
+        availableHeaders = Self.headerSuggestions(
+            current: originalHeaders,
+            remembered: rememberedHeaders,
+            catalog: HTTPHeaderCatalog.allHeaderNames,
+            excluding: present)
+    }
+
+    /// Builds the picker list, most relevant first: this request's own headers,
+    /// then everything remembered for the endpoint, the host and globally (the
+    /// order `RequestMetadataStore` already returns), then well-known names that
+    /// have never been seen.
+    ///
+    /// A name with no remembered value falls back to a `HTTPHeaderCatalog`
+    /// template so picking it still prefills a usable shape (`Authorization` →
+    /// `Bearer `). `excluding` must already be lowercased.
+    static func headerSuggestions(
+        current: [(name: String, value: String)],
+        remembered: [RequestMetadataStore.Entry],
+        catalog: [String],
+        excluding present: Set<String>
+    ) -> [HeaderSuggestion] {
+        var seen = present
+        var out: [HeaderSuggestion] = []
+
+        func add(_ name: String, _ value: String, _ origin: HeaderSuggestion.Origin) {
+            guard !name.isEmpty, seen.insert(name.lowercased()).inserted else { return }
+            let resolved = value.isEmpty
+                ? (HTTPHeaderCatalog.valueTemplates(forHeader: name).first ?? "")
+                : value
+            out.append(HeaderSuggestion(name: name, value: resolved, origin: origin))
+        }
+
+        for h in current { add(h.name, h.value, .thisRequest) }
+        for e in remembered { add(e.name, e.value, .remembered) }
+        for n in catalog { add(n, "", .catalog) }
+        return out
+    }
+
+    /// Cookies and bearer tokens run to thousands of characters and the picker's
+    /// subtitle has no line limit — one row would swallow the whole sheet.
+    static func suggestionSubtitle(for suggestion: HeaderSuggestion, limit: Int = 90) -> String {
+        let origin: String
+        switch suggestion.origin {
+        case .thisRequest: origin = "this request"
+        case .remembered:  origin = "previously sent"
+        case .catalog:     origin = "well-known header"
+        }
+        guard !suggestion.value.isEmpty else { return origin }
+        let shown: String
+        if suggestion.value == HTTPHeaderCatalog.UUIDPlaceholder {
+            shown = "a new UUID"
+        } else if suggestion.value.count > limit {
+            shown = String(suggestion.value.prefix(limit)) + "…"
+        } else {
+            shown = suggestion.value
+        }
+        return origin + " · " + shown
+    }
+
+    private func presentAvailableHeaders() {
+        guard !availableHeaders.isEmpty else { return }
+        let options = availableHeaders.map { entry in
+            OptionPickerSheetViewController.Option(
+                title: entry.name,
+                subtitle: Self.suggestionSubtitle(for: entry),
+                symbol: entry.origin == .catalog ? "plus.circle.dashed" : "plus.circle",
+                tint: entry.origin == .catalog ? UIColor(white: 0.72, alpha: 1) : DebugTheme.accentColor
+            ) { [weak self] in
+                self?.addHeader(entry)
+            }
+        }
+        OptionPickerSheetViewController.present(
+            from: self,
+            title: "Available Headers",
+            message: "Every header seen for this endpoint and host — including requests you've already cleared — plus well-known ones. Tap to add it with its last value.",
+            options: options)
+    }
+
+    private func addHeader(_ suggestion: HeaderSuggestion) {
+        // The catalog uses a sentinel for headers whose value should be unique.
+        let value = suggestion.value == HTTPHeaderCatalog.UUIDPlaceholder
+            ? UUID().uuidString
+            : suggestion.value
+        headers.append(KV(key: suggestion.name, value: value))
+        refreshAvailableHeaders()
+        tableView.reloadSections(IndexSet(integer: Section.headers.rawValue), with: .automatic)
+        focusValue(atHeaderRow: headers.count - 1)
+    }
+
+    /// The picker dismisses and the section reloads first, so the cell only exists
+    /// a runloop turn later.
+    private func focusValue(atHeaderRow row: Int) {
+        let ip = IndexPath(row: row, section: Section.headers.rawValue)
+        tableView.scrollToRow(at: ip, at: .middle, animated: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, self.headers.indices.contains(row),
+                  let cell = self.tableView.cellForRow(at: ip) as? KeyValueCardCell else { return }
+            cell.valueField.becomeFirstResponder()
+        }
+    }
+
     // MARK: - Table
 
     override func numberOfSections(in tableView: UITableView) -> Int { Section.allCases.count }
@@ -232,7 +373,7 @@ final class RequestReplayViewController: UITableViewController {
         switch Section(rawValue: section)! {
         case .request: return 2                      // method picker + URL
         case .params:  return params.count + 1       // +Add
-        case .headers: return headers.count + 1      // +Add
+        case .headers: return headers.count + 1 + (availableHeaders.isEmpty ? 0 : 1)
         case .body:    return methodSupportsBody ? 1 : 0
         }
     }
@@ -245,8 +386,9 @@ final class RequestReplayViewController: UITableViewController {
             if ip.row == params.count { return addCell("Add parameter") }
             return kvCell(ip, list: .params)
         case .headers:
+            if headers.indices.contains(ip.row) { return kvCell(ip, list: .headers) }
             if ip.row == headers.count { return addCell("Add header") }
-            return kvCell(ip, list: .headers)
+            return availableHeadersCell()
         case .body:
             return bodyCell()
         }
@@ -387,6 +529,27 @@ final class RequestReplayViewController: UITableViewController {
         return c
     }
 
+    /// Sits directly under "Add header" — typing a header name from memory is the
+    /// slow path, so the remembered ones get their own entry point.
+    private func availableHeadersCell() -> UITableViewCell {
+        let c = card("available")
+        c.selectionStyle = .default
+        let cfg = UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        c.imageView?.image = UIImage(systemName: "list.bullet.rectangle", withConfiguration: cfg)?
+            .withTintColor(UIColor(white: 0.78, alpha: 1), renderingMode: .alwaysOriginal)
+        c.textLabel?.text = "Available headers"
+        c.textLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+        c.textLabel?.textColor = UIColor(white: 0.85, alpha: 1)
+
+        let badge = UILabel()
+        badge.text = "\(availableHeaders.count)  ›"
+        badge.font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
+        badge.textColor = UIColor(white: 0.5, alpha: 1)
+        badge.sizeToFit()
+        c.accessoryView = badge
+        return c
+    }
+
     private func bodyCell() -> UITableViewCell {
         let c = card("body")
         let tv = UITextView()
@@ -422,7 +585,10 @@ final class RequestReplayViewController: UITableViewController {
             tableView.reloadSections(IndexSet(integer: ip.section), with: .automatic)
         case .headers where ip.row == headers.count:
             headers.append(KV(key: "", value: ""))
+            refreshAvailableHeaders()
             tableView.reloadSections(IndexSet(integer: ip.section), with: .automatic)
+        case .headers where ip.row > headers.count:
+            presentAvailableHeaders()
         default: break
         }
     }
@@ -439,7 +605,10 @@ final class RequestReplayViewController: UITableViewController {
         guard style == .delete else { return }
         switch Section(rawValue: ip.section)! {
         case .params:  params.remove(at: ip.row)
-        case .headers: headers.remove(at: ip.row)
+        case .headers:
+            headers.remove(at: ip.row)
+            // A deleted header becomes available again.
+            refreshAvailableHeaders()
         default: return
         }
         tableView.reloadSections(IndexSet(integer: ip.section), with: .automatic)

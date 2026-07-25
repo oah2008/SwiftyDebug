@@ -81,6 +81,24 @@ struct MockResponse: Codable, Equatable {
         self.delay = delay
     }
 
+    /// Lenient decoding, matching `InterceptRule`'s own.
+    ///
+    /// Synthesized `Codable` makes every field required, so a rule exported by a
+    /// build that predates one of these fields — or a hand-written document —
+    /// fails to decode the mock and takes the entire rule down with it. Every
+    /// field falls back to its default instead.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Defaults to true, unlike the memberwise init: an absent `mock` key
+        // yields no MockResponse at all, so reaching here means a mock object was
+        // written deliberately and omitting the flag should not disarm it.
+        isEnabled = try c.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        statusCode = try c.decodeIfPresent(Int.self, forKey: .statusCode) ?? 200
+        body = try c.decodeIfPresent(String.self, forKey: .body) ?? ""
+        headers = try c.decodeIfPresent([KVPair].self, forKey: .headers) ?? []
+        delay = try c.decodeIfPresent(Double.self, forKey: .delay) ?? 0
+    }
+
     /// Common scenarios offered as one-tap presets.
     struct Scenario {
         let title: String
@@ -118,6 +136,31 @@ struct MockResponse: Codable, Equatable {
         .init(title: "Empty list", subtitle: "Common empty-state test",
               statusCode: 200, body: "{\n  \"data\" : [\n\n  ],\n  \"total\" : 0\n}"),
     ]
+}
+
+extension MockResponse {
+
+    /// Response headers this mock should be served with.
+    ///
+    /// `Content-Length` is always recomputed from the body — a stale one makes
+    /// CFNetwork truncate the delivered bytes, which is the same class of bug
+    /// that made edited breakpoint responses arrive empty. A `Content-Type` the
+    /// mock declares itself wins over the JSON default.
+    var headerFields: [String: String] {
+        var out: [String: String] = [:]
+        for pair in headers where !pair.key.isEmpty { out[pair.key] = pair.value }
+        if !out.keys.contains(where: { $0.lowercased() == "content-type" }) {
+            out["Content-Type"] = "application/json"
+        }
+        out["Content-Length"] = "\(body.utf8.count)"
+        return out
+    }
+
+    /// The synthetic response handed to the app in place of a real one.
+    func httpResponse(for url: URL) -> HTTPURLResponse? {
+        HTTPURLResponse(url: url, statusCode: statusCode,
+                        httpVersion: "HTTP/1.1", headerFields: headerFields)
+    }
 }
 
 /// How the rule matches incoming requests.
@@ -275,10 +318,14 @@ struct InterceptRule: Codable {
         isEnabled = try c.decode(Bool.self, forKey: .isEnabled)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
-        redirectMode = try c.decodeIfPresent(RedirectMode.self, forKey: .redirectMode) ?? .none
+        // `try?` on the enums, not `try`: decodeIfPresent THROWS on an unknown raw
+        // value, so a rule exported by a newer build (a redirect or breakpoint mode
+        // this build has never heard of) would fail to decode entirely instead of
+        // losing just that one setting.
+        redirectMode = (try? c.decodeIfPresent(RedirectMode.self, forKey: .redirectMode)) as? RedirectMode ?? .none
         redirectTarget = try c.decodeIfPresent(String.self, forKey: .redirectTarget) ?? ""
         mock = try c.decodeIfPresent(MockResponse.self, forKey: .mock) ?? MockResponse()
-        breakpointMode = try c.decodeIfPresent(BreakpointMode.self, forKey: .breakpointMode) ?? .off
+        breakpointMode = (try? c.decodeIfPresent(BreakpointMode.self, forKey: .breakpointMode)) as? BreakpointMode ?? .off
     }
 
     func encode(to encoder: Encoder) throws {

@@ -132,6 +132,12 @@ final class MediaDetailViewController: UIViewController {
         infoCard.setRows(makeInfoRows())
         stack.addArrangedSubview(infoCard)
 
+        // When this asset came from a captured request, offer a jump to that
+        // request's full detail screen — "where did this image come from?"
+        if item.transaction != nil {
+            stack.addArrangedSubview(makeSourceRequestButton())
+        }
+
         if let headers = item.transaction?.requestHeaderFields as? [String: Any], !headers.isEmpty {
             let card = MediaInfoCard(title: "REQUEST HEADERS")
             card.setRows(headerRows(from: headers))
@@ -336,6 +342,71 @@ final class MediaDetailViewController: UIViewController {
     }
 
     // MARK: - Actions
+
+    /// Tappable card linking to the request this asset was downloaded by.
+    private func makeSourceRequestButton() -> UIView {
+        let card = UIView()
+        card.backgroundColor = UIColor(white: 0.13, alpha: 1)
+        card.layer.cornerRadius = 14
+        card.layer.cornerCurve = .continuous
+        card.layer.borderWidth = 1
+        card.layer.borderColor = DebugTheme.accentColor.withAlphaComponent(0.5).cgColor
+
+        let title = UILabel()
+        title.text = "View source request"
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        title.textColor = DebugTheme.accentColor
+
+        let subtitle = UILabel()
+        let tx = item.transaction
+        let method = (tx?.method ?? "GET").uppercased()
+        let path = (tx?.url as URL?)?.path ?? item.urlString
+        subtitle.text = "\(method)  \(path)"
+        subtitle.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        subtitle.textColor = UIColor(white: 0.55, alpha: 1)
+        subtitle.numberOfLines = 2
+        subtitle.lineBreakMode = .byTruncatingMiddle
+
+        let chevron = UIImageView(image: UIImage(systemName: "chevron.right",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold))?
+            .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal))
+        chevron.setContentHuggingPriority(.required, for: .horizontal)
+        chevron.translatesAutoresizingMaskIntoConstraints = false
+
+        let textStack = UIStackView(arrangedSubviews: [title, subtitle])
+        textStack.axis = .vertical
+        textStack.spacing = 3
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(textStack)
+        card.addSubview(chevron)
+
+        NSLayoutConstraint.activate([
+            textStack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            textStack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            textStack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
+            textStack.trailingAnchor.constraint(equalTo: chevron.leadingAnchor, constant: -10),
+            chevron.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            chevron.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            chevron.widthAnchor.constraint(equalToConstant: 12),
+        ])
+        card.isUserInteractionEnabled = true
+        card.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(openSourceRequest)))
+        card.semanticContentAttribute = .forceLeftToRight
+        return card
+    }
+
+    /// Opens the standard request detail screen for the originating request.
+    @objc private func openSourceRequest() {
+        guard let tx = item.transaction else { return }
+        let detail = NetworkDetailViewController()
+        detail.httpModel = tx
+        detail.httpModels = [tx]
+        if let nav = navigationController {
+            nav.pushViewController(detail, animated: true)
+        } else {
+            present(SwiftyDebugNavigationController(rootViewController: detail), animated: true)
+        }
+    }
 
     @objc private func openFullscreen() {
         let pager = MediaPagerViewController(imageURLs: items.map { $0.urlString }, startIndex: index)

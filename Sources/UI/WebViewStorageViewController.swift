@@ -251,6 +251,12 @@ final class WebViewStorageViewController: UITableViewController {
     private let service: WebViewStorageService
     private var scope: WebViewStorageService.Scope = .local
     private var items: [WebViewStorageService.Item] = []
+    /// Preview text computed ONCE per reload. Stored values can be hundreds of
+    /// KB (cached payloads, session blobs); parsing + re-serializing them inside
+    /// `cellForRowAt` — and handing the full string to a label, which forces
+    /// TextKit to lay out every character just to truncate it — blew up while
+    /// scrolling. Everything the cell needs is precomputed and length-capped.
+    private var displays: [StorageRowDisplay] = []
     /// Keys added in this session that haven't been written yet (blank cards).
     private var draftKeys = Set<Int>()
 
@@ -293,7 +299,7 @@ final class WebViewStorageViewController: UITableViewController {
         header.addSubview(segment)
         tableView.tableHeaderView = header
 
-        tableView.register(KeyValueCardCell.self, forCellReuseIdentifier: "Card")
+        tableView.register(StorageRowCell.self, forCellReuseIdentifier: "Card")
         tableView.backgroundColor = .black
         tableView.separatorStyle = .none
         tableView.rowHeight = UITableView.automaticDimension
@@ -308,6 +314,11 @@ final class WebViewStorageViewController: UITableViewController {
         service.loadItems(scope: scope) { [weak self] items in
             guard let self else { return }
             self.items = items
+            self.displays = items.map { item in
+                var detail: String?
+                if self.scope == .cookies, let c = item.cookie { detail = "\(c.domain)\(c.path)" }
+                return StorageRowDisplay(key: item.key, value: item.value, detail: detail)
+            }
             self.draftKeys.removeAll()
             self.tableView.reloadData()
         }
@@ -322,14 +333,7 @@ final class WebViewStorageViewController: UITableViewController {
     }
 
     @objc private func addTapped() {
-        items.append(WebViewStorageService.Item(key: "", value: "", cookie: nil))
-        draftKeys.insert(items.count - 1)
-        tableView.insertRows(at: [IndexPath(row: items.count - 1, section: 0)], with: .automatic)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self else { return }
-            let ip = IndexPath(row: self.items.count - 1, section: 0)
-            (self.tableView.cellForRow(at: ip) as? KeyValueCardCell)?.keyField.becomeFirstResponder()
-        }
+        presentEditor(for: WebViewStorageService.Item(key: "", value: "", cookie: nil), isNew: true)
     }
 
     /// Writes an entry back to the web view.
@@ -358,7 +362,7 @@ final class WebViewStorageViewController: UITableViewController {
         // row 0 when the array is empty — and an async storage reload can shrink
         // `items` between the row count and this call. Indexing without this
         // guard crashed while scrolling.
-        guard indexPath.row < items.count else {
+        guard indexPath.row < items.count, indexPath.row < displays.count else {
             let c = UITableViewCell(style: .subtitle, reuseIdentifier: "empty")
             c.backgroundColor = .clear
             c.selectionStyle = .none
@@ -374,24 +378,56 @@ final class WebViewStorageViewController: UITableViewController {
             return c
         }
 
-        let cell = tableView.dequeueReusableCell(withIdentifier: "Card", for: indexPath) as! KeyValueCardCell
-        let item = items[indexPath.row]
-        // Storage entries are always "set" — no SET/REMOVE mode control.
-        cell.showsModeControl = false
-        // Cookie names identify the cookie, so they're locked once created.
-        let keyEditable = (scope != .cookies) || item.cookie == nil
-        cell.configure(key: item.key, value: item.value, removing: false, keyEditable: keyEditable)
-
-        cell.onKeyChanged = { [weak self] k in
-            guard let self, indexPath.row < self.items.count else { return }
-            self.items[indexPath.row].key = k
+        guard let cell = tableView.dequeueReusableCell(withIdentifier: "Card", for: indexPath) as? StorageRowCell,
+              indexPath.row < displays.count else {
+            // Never dequeue twice for one index path — build a plain cell.
+            let fallback = UITableViewCell(style: .default, reuseIdentifier: nil)
+            fallback.backgroundColor = .clear
+            fallback.selectionStyle = .none
+            return fallback
         }
-        cell.onValueChanged = { [weak self] v in
-            guard let self, indexPath.row < self.items.count else { return }
-            self.items[indexPath.row].value = v
-            self.commit(row: indexPath.row)
-        }
+        cell.apply(displays[indexPath.row])
         return cell
+    }
+
+    /// Tapping a row opens the focused, JSON-aware editor. Editing inline inside
+    /// a reusable cell was both fragile and painful for JSON values.
+    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        guard indexPath.row < items.count else { return }
+        let item = items[indexPath.row]
+        presentEditor(for: item, isNew: false)
+    }
+
+    private func presentEditor(for item: WebViewStorageService.Item, isNew: Bool) {
+        var subtitle: String?
+        if scope == .cookies, let c = item.cookie {
+            subtitle = "Domain \(c.domain) · Path \(c.path)" + (c.isSecure ? " · Secure" : "")
+        }
+        // Cookie names identify the cookie, so they're locked once created.
+        let keyEditable = isNew || (scope != .cookies) || item.cookie == nil
+
+        let editor = StorageValueEditorViewController(
+            key: item.key, value: item.value, subtitle: subtitle, isKeyEditable: keyEditable)
+        editor.onSave = { [weak self] newKey, newValue in
+            guard let self else { return }
+            if self.scope == .cookies, let cookie = item.cookie {
+                self.service.updateCookie(cookie, newValue: newValue) { _ in self.reload() }
+            } else {
+                // A renamed web-storage key means remove the old one, set the new.
+                if !isNew, newKey != item.key, !item.key.isEmpty {
+                    self.service.deleteItem(scope: self.scope, item: item) { _ in }
+                }
+                self.service.setItem(scope: self.scope, key: newKey, value: newValue) { _ in self.reload() }
+            }
+        }
+        if !isNew {
+            editor.onDelete = { [weak self] in
+                guard let self else { return }
+                self.service.deleteItem(scope: self.scope, item: item) { _ in self.reload() }
+            }
+        }
+        navigationController?.pushViewController(editor, animated: true)
     }
 
     override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
@@ -416,5 +452,174 @@ final class WebViewStorageViewController: UITableViewController {
         case .session: return "sessionStorage is cleared when the page's tab/session ends."
         case .cookies: return "Cookies from this web view's data store. Editing keeps the original domain & path."
         }
+    }
+}
+
+// MARK: - Storage row display model
+
+/// Everything a storage row needs to draw, precomputed and **length-capped**.
+///
+/// This exists because stored values are unbounded: a single localStorage entry
+/// can hold a multi-megabyte cached payload. Parsing that per cell (and letting a
+/// label lay out the whole string) crashed while scrolling, so detection and
+/// truncation happen exactly once, here.
+struct StorageRowDisplay {
+
+    /// Hard cap on what ever reaches a label. Well beyond 3 visible lines.
+    private static let previewLimit = 220
+    /// Only try to parse JSON for values below this size — anything larger is
+    /// summarised by size instead. Parsing megabytes for a preview is never worth it.
+    private static let jsonParseLimit = 64 * 1024
+
+    let key: String
+    let preview: String
+    let detail: String?
+    /// "JSON · 12 keys" when the value is a JSON payload, else nil.
+    let jsonBadge: String?
+    let isEmptyValue: Bool
+
+    init(key: String, value: String, detail: String?) {
+        self.key = key
+        self.detail = detail
+
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.isEmptyValue = trimmed.isEmpty
+
+        var badge: String?
+        var text: String
+
+        let looksStructured = trimmed.hasPrefix("{") || trimmed.hasPrefix("[")
+        if looksStructured, trimmed.utf8.count <= Self.jsonParseLimit,
+           JSONDocument.validate(trimmed).isValid, let doc = JSONDocument(text: trimmed) {
+            if let arr = doc.root as? [Any] { badge = "JSON · \(arr.count)" }
+            else if let obj = doc.root as? [String: Any] { badge = "JSON · \(obj.count)" }
+            else { badge = "JSON" }
+            // Minify only the prefix we will actually show.
+            text = String(doc.minifiedText().prefix(Self.previewLimit))
+        } else if looksStructured, trimmed.utf8.count > Self.jsonParseLimit {
+            // Too big to parse for a preview — say so rather than stalling.
+            badge = "JSON?"
+            text = String(trimmed.prefix(Self.previewLimit))
+        } else {
+            text = trimmed.isEmpty ? "(empty)" : String(trimmed.prefix(Self.previewLimit))
+        }
+
+        // Collapse newlines so a row can't grow unexpectedly tall.
+        text = text.replacingOccurrences(of: "\n", with: " ")
+        if value.count > Self.previewLimit {
+            let bytes = ByteCountFormatter().string(fromByteCount: Int64(value.utf8.count))
+            text += "…  (\(bytes))"
+        }
+        self.preview = text
+        self.jsonBadge = badge
+    }
+}
+
+// MARK: - Storage row cell
+
+/// A display-only row for one stored entry: key, a capped value preview, and a
+/// JSON badge when the value is structured. Editing happens on a dedicated
+/// screen (`StorageValueEditorViewController`), never inline in a reusable cell.
+final class StorageRowCell: UITableViewCell {
+
+    private let card = UIView()
+    private let keyLabel = UILabel()
+    private let valueLabel = UILabel()
+    private let detailLabel = UILabel()
+    private let jsonBadge = PaddedPill()
+    private let chevron = UIImageView()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+        selectionStyle = .none
+
+        card.backgroundColor = UIColor(white: 0.13, alpha: 1)
+        card.layer.cornerRadius = 14
+        card.layer.cornerCurve = .continuous
+        card.layer.borderWidth = 1
+        card.layer.borderColor = UIColor(white: 0.24, alpha: 1).cgColor
+        card.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(card)
+
+        keyLabel.font = .monospacedSystemFont(ofSize: 14, weight: .semibold)
+        keyLabel.textColor = DebugTheme.accentColor
+        keyLabel.numberOfLines = 2
+        keyLabel.lineBreakMode = .byTruncatingMiddle
+
+        valueLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        valueLabel.textColor = UIColor(white: 0.8, alpha: 1)
+        valueLabel.numberOfLines = 3
+        valueLabel.lineBreakMode = .byTruncatingTail
+
+        detailLabel.font = .systemFont(ofSize: 10)
+        detailLabel.textColor = UIColor(white: 0.42, alpha: 1)
+        detailLabel.numberOfLines = 1
+        detailLabel.lineBreakMode = .byTruncatingMiddle
+
+        chevron.image = UIImage(systemName: "chevron.right",
+                                withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold))?
+            .withTintColor(UIColor(white: 0.4, alpha: 1), renderingMode: .alwaysOriginal)
+        chevron.setContentHuggingPriority(.required, for: .horizontal)
+        chevron.translatesAutoresizingMaskIntoConstraints = false
+
+        let keyRow = UIStackView(arrangedSubviews: [keyLabel, jsonBadge, UIView()])
+        keyRow.axis = .horizontal
+        keyRow.spacing = 6
+        keyRow.alignment = .center
+
+        let stack = UIStackView(arrangedSubviews: [keyRow, valueLabel, detailLabel])
+        stack.axis = .vertical
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        card.addSubview(chevron)
+
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+            card.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
+            card.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 5),
+            card.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -5),
+
+            // Text drives the row height — pinned top AND bottom.
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -11),
+            stack.trailingAnchor.constraint(equalTo: chevron.leadingAnchor, constant: -8),
+
+            chevron.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            chevron.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            chevron.widthAnchor.constraint(equalToConstant: 11),
+        ])
+        forceLTR()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func setHighlighted(_ highlighted: Bool, animated: Bool) {
+        super.setHighlighted(highlighted, animated: animated)
+        UIView.animate(withDuration: 0.1) {
+            self.card.backgroundColor = highlighted
+                ? UIColor(white: 0.20, alpha: 1) : UIColor(white: 0.13, alpha: 1)
+        }
+    }
+
+    /// Pure assignment — no parsing, no allocation of large strings.
+    func apply(_ display: StorageRowDisplay) {
+        keyLabel.text = display.key.isEmpty ? "(no key)" : display.key
+        valueLabel.text = display.preview
+        valueLabel.textColor = display.isEmptyValue
+            ? UIColor(white: 0.4, alpha: 1) : UIColor(white: 0.8, alpha: 1)
+
+        if let badge = display.jsonBadge {
+            jsonBadge.isHidden = false
+            jsonBadge.set(text: badge, color: .black, background: DebugTheme.accentColor)
+        } else {
+            jsonBadge.isHidden = true
+        }
+
+        detailLabel.text = display.detail
+        detailLabel.isHidden = (display.detail?.isEmpty ?? true)
     }
 }

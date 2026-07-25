@@ -607,24 +607,60 @@ enum KeychainInspector {
 
 /// Read/write inspector for the app's keychain, scoped by item class.
 ///
-/// Password items get an inline-editable secret card (masked until you tap the
-/// eye); certificates, keys and identities are read-only and labelled as such.
+/// Rows are **display-only**: one card per item showing its name, the
+/// attributes worth scanning, and a masked (or revealed) preview of the secret
+/// with the representation it decoded into. Tapping a password row pushes
+/// `StorageValueEditorViewController` — the same focused, JSON-aware editor the
+/// other storage inspectors use — and the save handler re-encodes the text back
+/// into the *same* representation before `SecItemUpdate`. Certificates, keys and
+/// identities are never writable, so tapping one opens the read-only attribute
+/// dump instead; nothing about those rows offers an editor.
+///
+/// There is deliberately **no inline editing inside a reusable cell**: a text
+/// view whose lifetime is tied to cell reuse, plus a per-row reveal button that
+/// reloaded the very section it lived in, was the fragile part of this screen.
 final class KeychainBrowserViewController: UITableViewController {
+
+    // MARK: Row model
+
+    /// Everything a row needs, derived **once** per reload. Decoding a secret or
+    /// parsing JSON inside `cellForRowAt` would re-run on every layout pass.
+    private struct Row {
+        let item: KeychainItem
+        /// `"JSON · n keys"` when the decoded secret is a JSON container.
+        let jsonBadge: String?
+        /// `true` when the secret can actually be re-encoded and written back.
+        let isEditable: Bool
+
+        init(item: KeychainItem) {
+            self.item = item
+            let text = item.decodedSecret?.text ?? ""
+            self.jsonBadge = StorageJSONBadge.summary(for: text)
+            // A body this big can't be rendered into an editor safely, and
+            // saving a truncated copy would destroy what never reached screen.
+            self.isEditable = item.isSecretEditable && text.count <= 20_000
+        }
+
+        var identity: String { item.identity }
+    }
 
     // MARK: State
 
     private var itemClass: KeychainItemClass = .genericPassword
     /// Defaults to the container app's own items — see `KeychainOwnership`.
     private var scope: KeychainScope = .thisApp
-    private var items: [KeychainItem] = []
+    private var rows: [Row] = []
     private var lastStatus: OSStatus = errSecSuccess
     /// How many rows the scope filter removed from the current class.
     private var hiddenCount = 0
     private var counts: [KeychainItemClass: Int] = [:]
-    /// Items whose secret is currently shown in the clear, keyed by
-    /// `KeychainItem.identity` — **never** by section index, which shifts under
-    /// the list on every reload.
-    private var revealed = Set<String>()
+    /// One switch for the whole list rather than a button inside every cell:
+    /// a per-row reveal had to reload the section it was tapped in, from inside
+    /// that section's own cell.
+    private var secretsRevealed = false
+    /// Error raised by a save/delete that happened as the editor was popping.
+    /// Shown from `viewDidAppear`, never mid-transition.
+    private var pendingError: (title: String, message: String)?
 
     private let segment = UISegmentedControl(items: KeychainItemClass.allCases.map { $0.shortTitle })
     private let headerContainer = UIView()
@@ -632,10 +668,8 @@ final class KeychainBrowserViewController: UITableViewController {
     private let footerContainer = UIView()
     private lazy var scopeButton = UIBarButtonItem(title: scope.buttonTitle, style: .plain,
                                                    target: self, action: #selector(scopeTapped))
-
-    private static let cardBG = UIColor(white: 0.13, alpha: 1)
-    private static let cardBorder = UIColor(white: 0.24, alpha: 1)
-    private static let caption = UIColor(white: 0.45, alpha: 1)
+    private lazy var revealButton = UIBarButtonItem(image: UIImage(systemName: "eye.fill"), style: .plain,
+                                                    target: self, action: #selector(revealTapped))
 
     // MARK: Init
 
@@ -657,13 +691,12 @@ final class KeychainBrowserViewController: UITableViewController {
 
         let reload = UIBarButtonItem(image: UIImage(systemName: "arrow.clockwise"), style: .plain,
                                      target: self, action: #selector(reloadTapped))
-        reload.tintColor = DebugTheme.accentColor
-        scopeButton.tintColor = DebugTheme.accentColor
+        for item in [reload, scopeButton, revealButton] { item.tintColor = DebugTheme.accentColor }
         scopeButton.setTitleTextAttributes([.font: UIFont.systemFont(ofSize: 13, weight: .semibold)],
                                            for: .normal)
         scopeButton.setTitleTextAttributes([.font: UIFont.systemFont(ofSize: 13, weight: .semibold)],
                                            for: .highlighted)
-        navigationItem.rightBarButtonItems = [reload, scopeButton]
+        navigationItem.rightBarButtonItems = [reload, revealButton, scopeButton]
 
         segment.selectedSegmentIndex = 0
         segment.selectedSegmentTintColor = DebugTheme.accentColor
@@ -693,14 +726,13 @@ final class KeychainBrowserViewController: UITableViewController {
         footerContainer.addSubview(footerLabel)
         tableView.tableFooterView = footerContainer
 
-        tableView.register(KeychainSecretCell.self, forCellReuseIdentifier: KeychainSecretCell.reuseID)
-        tableView.register(KeychainMetaCell.self, forCellReuseIdentifier: "Meta")
+        tableView.register(KeychainRowCell.self, forCellReuseIdentifier: KeychainRowCell.reuseID)
         tableView.register(KeychainMessageCell.self, forCellReuseIdentifier: "Message")
         tableView.backgroundColor = .black
         tableView.separatorStyle = .none
         tableView.rowHeight = UITableView.automaticDimension
-        tableView.estimatedRowHeight = 120
-        tableView.keyboardDismissMode = .interactive
+        tableView.estimatedRowHeight = 140
+        tableView.contentInset = UIEdgeInsets(top: 4, left: 0, bottom: 16, right: 0)
 
         reloadCounts()
         reloadItems()
@@ -710,6 +742,13 @@ final class KeychainBrowserViewController: UITableViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         layoutHeader()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard let error = pendingError else { return }
+        pendingError = nil
+        presentAlert(title: error.title, message: error.message)
     }
 
     override func viewDidLayoutSubviews() {
@@ -745,20 +784,20 @@ final class KeychainBrowserViewController: UITableViewController {
 
     private func reloadItems() {
         let result = KeychainInspector.fetch(itemClass, scope: scope)
-        items = result.items
+        rows = result.items.map { Row(item: $0) }
         lastStatus = result.status
         hiddenCount = result.hiddenCount
-        counts[itemClass] = items.count
+        counts[itemClass] = rows.count
         if let index = KeychainItemClass.allCases.firstIndex(of: itemClass),
            index < segment.numberOfSegments {
-            segment.setTitle("\(itemClass.shortTitle) \(items.count)", forSegmentAt: index)
+            segment.setTitle("\(itemClass.shortTitle) \(rows.count)", forSegmentAt: index)
         }
-        // Reveal state is keyed by item identity, so it survives a reload of the
-        // same items; entries for items that vanished are dropped.
-        let living = Set(items.map { $0.identity })
-        revealed.formIntersection(living)
         tableView.reloadData()
         layoutFooter()
+    }
+
+    private func row(withIdentity identity: String) -> Row? {
+        rows.first { $0.identity == identity }
     }
 
     /// Sizes the explainer footer by hand — `tableFooterView` gets no automatic
@@ -779,6 +818,9 @@ final class KeychainBrowserViewController: UITableViewController {
         case .all:
             lines.append("Scope: everything this process can see, including shared access groups and system entries. Tap “This app” to filter back to \(KeychainOwnership.scopeDescription).")
         }
+        lines.append(itemClass.isEditable
+                     ? "Tap a row to open the value editor — JSON secrets get the full tree editor, and a save is re-encoded into the same representation before SecItemUpdate. Swipe left to delete or inspect the raw attributes."
+                     : "Tap a row to inspect its raw attributes. This class is read-only.")
         return lines.joined(separator: "\n\n")
     }
 
@@ -798,7 +840,6 @@ final class KeychainBrowserViewController: UITableViewController {
     // MARK: Actions
 
     @objc private func reloadTapped() {
-        view.endEditing(true)
         // The app may have written its first item since the last scan, which is
         // what makes the real access group discoverable.
         KeychainOwnership.invalidate()
@@ -809,91 +850,79 @@ final class KeychainBrowserViewController: UITableViewController {
     /// Toggles between the container app's own items (the default) and every
     /// item the process can see. Scoping itself lives in `KeychainScope.includes`.
     @objc private func scopeTapped() {
-        view.endEditing(true)
         scope = scope.toggled
         scopeButton.title = scope.buttonTitle
-        // Row identity changes with the scope, so drop per-item UI state.
-        revealed.removeAll()
         reloadCounts()
         reloadItems()
     }
 
     @objc private func classChanged() {
-        view.endEditing(true)
         itemClass = KeychainItemClass(rawValue: segment.selectedSegmentIndex) ?? .genericPassword
-        revealed.removeAll()
         reloadItems()
     }
 
-    /// Toggles the clear-text reveal for one item. Keyed by identity and
-    /// re-resolved to a section here, so a list that shifted between the tap and
-    /// the handler can never reload the wrong (or an out-of-range) section.
-    private func toggleReveal(identity: String) {
-        if revealed.contains(identity) {
-            revealed.remove(identity)
-            view.endEditing(true)
-        } else {
-            revealed.insert(identity)
-        }
-        guard let section = items.firstIndex(where: { $0.identity == identity }) else {
-            tableView.reloadData()
-            return
-        }
-        tableView.reloadSections(IndexSet(integer: section), with: .none)
+    @objc private func revealTapped() {
+        secretsRevealed.toggle()
+        revealButton.image = UIImage(systemName: secretsRevealed ? "eye.slash.fill" : "eye.fill")
+        tableView.reloadData()
     }
+
+    // MARK: Writing
 
     /// Writes an edited secret back with `SecItemUpdate`, **as Data**: the text
     /// is re-encoded into the representation it was decoded from. A re-encoding
-    /// failure is reported inline on the card and nothing is written.
-    private func commit(identity: String, text: String, from cell: KeychainSecretCell) {
-        guard let item = items.first(where: { $0.identity == identity }) else {
-            cell.showError("This item is no longer in the keychain — reload the list.")
+    /// failure writes nothing and parks a message for `viewDidAppear`.
+    private func commit(identity: String, text: String) {
+        guard let item = row(withIdentity: identity)?.item else {
+            pendingError = ("Item is gone", "This item is no longer in the keychain — reload the list.")
             return
         }
         guard item.itemClass.isEditable else {
-            cell.showError("\(item.itemClass.title) are read-only in the inspector.")
+            pendingError = ("Read-only", "\(item.itemClass.title) are read-only in the inspector.")
             return
         }
         guard let decoded = item.decodedSecret else {
-            cell.showError("This item's data was not exported, so it can't be rewritten.")
+            pendingError = ("Nothing to write", "This item's data was not exported, so it can't be rewritten.")
             return
         }
         guard decoded.isEditable else {
-            cell.showError(decoded.representation.editHint)
+            pendingError = ("Can't re-encode", decoded.representation.editHint)
             return
         }
-        guard text != decoded.text else {
-            cell.clearError()
-            return
-        }
+        guard text != decoded.text else { return }
 
         let encoded: Data
         do {
             encoded = try DataValueDecoder.encode(text, like: decoded)
         } catch let error as DataValueDecoder.EncodeError {
-            cell.showError(error.message)
+            pendingError = ("Can't save \(decoded.representation.rawValue)", error.message)
             return
         } catch {
-            cell.showError(error.localizedDescription)
+            pendingError = ("Can't save", error.localizedDescription)
             return
         }
 
-        cell.clearError()
         let status = KeychainInspector.update(item, data: encoded)
-        view.endEditing(true)
-        // Deferred: the field is still resigning first responder when the row
-        // would be rebuilt underneath it.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if status != errSecSuccess {
-                self.presentStatus(status, title: "Could not update item")
-            }
-            self.reloadItems()
+        if status != errSecSuccess {
+            pendingError = ("Could not update item", KeychainInspector.message(for: status))
         }
+        reloadItems()
+    }
+
+    /// Deletes without a second confirmation — the caller (the editor's Delete
+    /// button) already asked.
+    private func delete(identity: String) {
+        guard let item = row(withIdentity: identity)?.item else { return }
+        let status = KeychainInspector.delete(item)
+        if status != errSecSuccess {
+            pendingError = ("Could not delete item", KeychainInspector.message(for: status))
+        }
+        reloadCounts()
+        reloadItems()
     }
 
     private func confirmDelete(identity: String) {
-        guard let item = items.first(where: { $0.identity == identity }) else { return }
+        guard let item = row(withIdentity: identity)?.item else { return }
         let alert = UIAlertController(
             title: "Delete keychain item?",
             message: "\(item.displayName)\n\nThis removes the item from the \(item.itemClass.title.lowercased()) class permanently.",
@@ -904,7 +933,8 @@ final class KeychainBrowserViewController: UITableViewController {
             guard let self else { return }
             let status = KeychainInspector.delete(item)
             if status != errSecSuccess {
-                self.presentStatus(status, title: "Could not delete item")
+                self.presentAlert(title: "Could not delete item",
+                                  message: KeychainInspector.message(for: status))
             }
             self.reloadCounts()
             self.reloadItems()
@@ -913,10 +943,8 @@ final class KeychainBrowserViewController: UITableViewController {
         present(alert, animated: true)
     }
 
-    private func presentStatus(_ status: OSStatus, title: String) {
-        let alert = UIAlertController(title: title,
-                                      message: KeychainInspector.message(for: status),
-                                      preferredStyle: .alert)
+    private func presentAlert(title: String, message: String) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         alert.view.forceLTR()
         present(alert, animated: true)
@@ -955,115 +983,146 @@ final class KeychainBrowserViewController: UITableViewController {
 
     // MARK: - Table
 
-    override func numberOfSections(in tableView: UITableView) -> Int {
-        items.isEmpty ? 1 : items.count
-    }
+    override func numberOfSections(in tableView: UITableView) -> Int { 1 }
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        // The empty state borrows section 0 row 0, so nothing below may assume
-        // a section index maps to an item — every accessor range-checks first.
-        guard items.indices.contains(section) else { return 1 }
-        return items[section].itemClass.isEditable ? 2 : 1
-    }
-
-    override func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
-        let spacer = UIView()
-        spacer.backgroundColor = .clear
-        return spacer
-    }
-
-    override func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
-        section == 0 ? 4 : 14
+        // The empty state borrows row 0, so nothing below may assume a row index
+        // maps to an item — every accessor range-checks first.
+        max(rows.count, 1)
     }
 
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        guard items.indices.contains(indexPath.section) else {
-            return messageCell(at: indexPath)
+        // Each branch dequeues at most **once**: dequeuing a second cell for the
+        // same index path (which the old fallback path did, after a failed cast)
+        // is an assertion failure in UIKit.
+        guard rows.indices.contains(indexPath.row) else {
+            let cell = tableView.dequeueReusableCell(
+                withIdentifier: "Message", for: indexPath) as? KeychainMessageCell
+            let text = emptyStateText
+            cell?.configure(title: text.title, body: text.body)
+            return cell ?? Self.plainFallbackCell()
         }
 
-        let item = items[indexPath.section]
+        let row = rows[indexPath.row]
+        let cell = tableView.dequeueReusableCell(
+            withIdentifier: KeychainRowCell.reuseID, for: indexPath) as? KeychainRowCell
+        cell?.configure(item: row.item,
+                        jsonBadge: row.jsonBadge,
+                        editable: row.isEditable,
+                        revealed: secretsRevealed)
+        return cell ?? Self.plainFallbackCell()
+    }
 
-        // Row 0 — the attribute summary card (tap for all raw attributes).
-        if indexPath.row == 0 {
-            guard let cell = tableView.dequeueReusableCell(
-                withIdentifier: "Meta", for: indexPath) as? KeychainMetaCell else {
-                return messageCell(at: indexPath)
-            }
-            cell.configure(item: item, revealed: revealed.contains(item.identity))
-            return cell
-        }
-
-        // Row 1 — the decoded, editable secret (password classes only).
-        guard let cell = tableView.dequeueReusableCell(
-            withIdentifier: KeychainSecretCell.reuseID, for: indexPath) as? KeychainSecretCell else {
-            return messageCell(at: indexPath)
-        }
-        let identity = item.identity
-        let isRevealed = revealed.contains(identity)
-        cell.configure(item: item, revealed: isRevealed)
-        // Item identity travels in the closures — never a section index, which
-        // is stale the moment a reload lands.
-        cell.onToggleReveal = { [weak self] in self?.toggleReveal(identity: identity) }
-        cell.onCopy = { text in UIPasteboard.general.string = text }
-        cell.onSave = { [weak self, weak cell] text in
-            guard let self, let cell else { return }
-            self.commit(identity: identity, text: text, from: cell)
-        }
+    private static func plainFallbackCell() -> UITableViewCell {
+        let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+        cell.backgroundColor = .clear
+        cell.contentView.backgroundColor = .clear
+        cell.selectionStyle = .none
         return cell
     }
 
-    private func messageCell(at indexPath: IndexPath) -> UITableViewCell {
-        guard let cell = tableView.dequeueReusableCell(
-            withIdentifier: "Message", for: indexPath) as? KeychainMessageCell else {
-            let fallback = UITableViewCell(style: .default, reuseIdentifier: nil)
-            fallback.backgroundColor = .clear
-            fallback.contentView.backgroundColor = .clear
-            fallback.selectionStyle = .none
-            return fallback
-        }
-        let text = emptyStateText
-        cell.configure(title: text.title, body: text.body)
-        return cell
-    }
-
+    /// Tapping a row opens the editor for a writable secret and the read-only
+    /// attribute dump for everything else. Nothing here mutates `rows`, resigns a
+    /// first responder or reloads the table, so a tap can never re-enter the
+    /// table's own update cycle.
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        guard indexPath.row == 0, items.indices.contains(indexPath.section) else { return }
-        let detail = KeychainItemDetailViewController(item: items[indexPath.section])
-        navigationController?.pushViewController(detail, animated: true)
+        guard rows.indices.contains(indexPath.row) else { return }
+        let row = rows[indexPath.row]
+        if row.isEditable {
+            pushEditor(for: row)
+        } else {
+            pushDetail(for: row.item)
+        }
     }
 
+    private func pushEditor(for row: Row) {
+        let identity = row.identity
+        let item = row.item
+        let editor = StorageValueEditorViewController(
+            key: item.displayName,
+            value: item.decodedSecret?.text ?? "",
+            subtitle: Self.editorSubtitle(for: item),
+            // The "key" here is the item's display name, which is derived from
+            // its primary attributes — renaming it would mean deleting and
+            // re-adding the item, so it stays locked.
+            isKeyEditable: false)
+        // Item identity travels in the closures — never a row index, which is
+        // stale the moment a reload lands.
+        editor.onSave = { [weak self] _, newValue in
+            self?.commit(identity: identity, text: newValue)
+        }
+        editor.onDelete = { [weak self] in
+            self?.delete(identity: identity)
+        }
+        navigationController?.pushViewController(editor, animated: true)
+    }
+
+    private func pushDetail(for item: KeychainItem) {
+        navigationController?.pushViewController(KeychainItemDetailViewController(item: item), animated: true)
+    }
+
+    private static func editorSubtitle(for item: KeychainItem) -> String {
+        var parts: [String] = [item.itemClass.title]
+        if let account = item.account, !account.isEmpty { parts.append("account \(account)") }
+        if let service = item.service, !service.isEmpty { parts.append("service \(service)") }
+        if let server = item.server, !server.isEmpty { parts.append("server \(server)") }
+        if let group = item.accessGroup, !group.isEmpty { parts.append("group \(group)") }
+        var text = parts.joined(separator: "  ·  ")
+        if let decoded = item.decodedSecret {
+            text += "\n\(decoded.representation.rawValue) · \(decoded.byteCountText) — \(decoded.representation.editHint)"
+        }
+        return text
+    }
+
+    // MARK: Swipe actions
+
     override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
-        items.indices.contains(indexPath.section)
+        rows.indices.contains(indexPath.row)
     }
 
     override func tableView(_ tableView: UITableView,
                             trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath)
     -> UISwipeActionsConfiguration? {
-        guard items.indices.contains(indexPath.section) else { return nil }
-        let identity = items[indexPath.section].identity
+        guard rows.indices.contains(indexPath.row) else { return nil }
+        let identity = rows[indexPath.row].identity
         let delete = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, completion in
             self?.confirmDelete(identity: identity)
             completion(true)
         }
-        let config = UISwipeActionsConfiguration(actions: [delete])
+        let attributes = UIContextualAction(style: .normal, title: "Attributes") { [weak self] _, _, completion in
+            completion(true)
+            guard let self, let item = self.row(withIdentity: identity)?.item else { return }
+            self.pushDetail(for: item)
+        }
+        attributes.backgroundColor = UIColor(white: 0.26, alpha: 1)
+        let config = UISwipeActionsConfiguration(actions: [delete, attributes])
         config.performsFirstActionWithFullSwipe = false
         return config
     }
 }
 
-// MARK: - Summary card
+// MARK: - Row card
 
-/// Read-only card listing the translated attributes of one keychain item, with a
-/// READ-ONLY badge for the classes that cannot be edited.
-final class KeychainMetaCell: UITableViewCell {
+/// **Display-only** card for one keychain item: name, the attributes worth
+/// scanning, and the secret masked (or revealed) with the representation it
+/// decoded into. Editing happens on `StorageValueEditorViewController`.
+final class KeychainRowCell: UITableViewCell {
+
+    static let reuseID = "KeychainRowCell"
 
     private let card = UIView()
-    private let titleLabel = UILabel()
     private let classPill = PaddedPillLabel()
     private let readOnlyPill = PaddedPillLabel()
-    private let chevron = UIImageView(image: UIImage(systemName: "chevron.right"))
-    private let rowsStack = UIStackView()
+    private let formatPill = PaddedPillLabel()
+    private let jsonPill = PaddedPillLabel()
+    private let chevron = UIImageView()
+    private let titleLabel = UILabel()
+    private let attributesStack = UIStackView()
+    private let separator = UIView()
+    private let secretCaption = UILabel()
+    private let byteLabel = UILabel()
+    private let secretLabel = UILabel()
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -1093,33 +1152,64 @@ final class KeychainMetaCell: UITableViewCell {
         readOnlyPill.configureAsPill(background: UIColor(red: 0.95, green: 0.60, blue: 0.35, alpha: 0.22),
                                      textColor: UIColor(red: 0.98, green: 0.72, blue: 0.48, alpha: 1))
         readOnlyPill.text = "READ-ONLY"
+        formatPill.configureAsPill(background: UIColor(white: 0.22, alpha: 1),
+                                   textColor: UIColor(white: 0.85, alpha: 1))
+        jsonPill.configureAsPill(background: StorageJSONBadge.color, textColor: .black)
 
-        chevron.tintColor = UIColor(white: 0.38, alpha: 1)
-        chevron.contentMode = .scaleAspectFit
+        chevron.image = UIImage(systemName: "chevron.right",
+                                withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold))?
+            .withTintColor(UIColor(white: 0.40, alpha: 1), renderingMode: .alwaysOriginal)
         chevron.setContentHuggingPriority(.required, for: .horizontal)
         chevron.translatesAutoresizingMaskIntoConstraints = false
-        chevron.widthAnchor.constraint(equalToConstant: 10).isActive = true
+        chevron.widthAnchor.constraint(equalToConstant: 11).isActive = true
 
-        let pillRow = UIStackView(arrangedSubviews: [classPill, readOnlyPill, UIView(), chevron])
+        attributesStack.axis = .vertical
+        attributesStack.spacing = 7
+
+        separator.backgroundColor = UIColor(white: 0.22, alpha: 1)
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+
+        secretCaption.text = "SECRET"
+        secretCaption.font = .systemFont(ofSize: 10, weight: .heavy)
+        secretCaption.textColor = UIColor(white: 0.45, alpha: 1)
+
+        byteLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        byteLabel.textColor = UIColor(white: 0.45, alpha: 1)
+
+        secretLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        secretLabel.textColor = UIColor(white: 0.85, alpha: 1)
+        secretLabel.numberOfLines = 3
+        secretLabel.lineBreakMode = .byTruncatingTail
+
+        let pillRow = UIStackView(arrangedSubviews: [classPill, readOnlyPill, jsonPill, formatPill,
+                                                     UIView(), chevron])
         pillRow.axis = .horizontal
         pillRow.spacing = 6
         pillRow.alignment = .center
 
-        rowsStack.axis = .vertical
-        rowsStack.spacing = 8
+        let secretRow = UIStackView(arrangedSubviews: [secretCaption, byteLabel, UIView()])
+        secretRow.axis = .horizontal
+        secretRow.spacing = 8
+        secretRow.alignment = .center
 
-        let stack = UIStackView(arrangedSubviews: [pillRow, titleLabel, rowsStack])
+        let stack = UIStackView(arrangedSubviews: [pillRow, titleLabel, attributesStack,
+                                                   separator, secretRow, secretLabel])
         stack.axis = .vertical
         stack.spacing = 8
+        stack.setCustomSpacing(10, after: attributesStack)
+        stack.setCustomSpacing(10, after: separator)
+        stack.setCustomSpacing(4, after: secretRow)
         stack.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(stack)
 
         NSLayoutConstraint.activate([
             card.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
             card.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
-            card.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 5),
-            card.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -5),
+            card.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 6),
+            card.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -6),
 
+            // Text drives the row height: pinned to BOTH top and bottom.
             stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
             stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
             stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
@@ -1128,16 +1218,40 @@ final class KeychainMetaCell: UITableViewCell {
         forceLTR()
     }
 
-    func configure(item: KeychainItem, revealed: Bool) {
+    override func setHighlighted(_ highlighted: Bool, animated: Bool) {
+        super.setHighlighted(highlighted, animated: animated)
+        UIView.animate(withDuration: 0.1) {
+            self.card.backgroundColor = highlighted
+                ? UIColor(white: 0.20, alpha: 1) : UIColor(white: 0.13, alpha: 1)
+        }
+    }
+
+    func configure(item: KeychainItem, jsonBadge: String?, editable: Bool, revealed: Bool) {
         titleLabel.text = item.displayName
         classPill.text = item.itemClass.shortTitle.uppercased()
-        readOnlyPill.isHidden = item.itemClass.isEditable
+        readOnlyPill.isHidden = editable
 
-        rowsStack.arrangedSubviews.forEach {
-            rowsStack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
+        if let decoded = item.decodedSecret {
+            formatPill.text = decoded.representation.rawValue
+            formatPill.isHidden = false
+            byteLabel.text = "·  \(decoded.byteCountText)"
+        } else {
+            formatPill.isHidden = true
+            byteLabel.text = nil
         }
 
+        if let jsonBadge {
+            jsonPill.text = jsonBadge
+            jsonPill.isHidden = false
+        } else {
+            jsonPill.isHidden = true
+        }
+
+        // Attributes worth scanning without opening the item.
+        attributesStack.arrangedSubviews.forEach {
+            attributesStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
         var pairs: [(String, String)] = []
         func add(_ caption: String, _ value: String?) {
             guard let value, !value.isEmpty else { return }
@@ -1149,20 +1263,30 @@ final class KeychainMetaCell: UITableViewCell {
         add("LABEL", item.label)
         add("ACCESS GROUP", item.accessGroup)
         add("ACCESSIBLE", item.accessibleDescription)
-        add("CREATED", item.created.map { KeychainInspector.dateFormatter.string(from: $0) })
         add("MODIFIED", item.modified.map { KeychainInspector.dateFormatter.string(from: $0) })
-        if !item.itemClass.isEditable {
-            add("VALUE", revealed ? item.revealedSecretDisplay : item.maskedSecretDisplay)
-        }
         if pairs.isEmpty { pairs.append(("ATTRIBUTES", "(none reported)")) }
-
         for (caption, value) in pairs {
-            rowsStack.addArrangedSubview(makeRow(caption: caption, value: value))
+            attributesStack.addArrangedSubview(Self.makeRow(caption: caption, value: value))
         }
+
+        let preview = revealed ? Self.revealedPreview(for: item) : item.maskedSecretDisplay
+        secretLabel.text = preview
+        secretLabel.textColor = revealed
+            ? UIColor(white: 0.85, alpha: 1) : UIColor(white: 0.62, alpha: 1)
+
         forceLTR()
     }
 
-    private func makeRow(caption: String, value: String) -> UIView {
+    /// A single clipped line — the whole value belongs on the editor screen, not
+    /// in a list row.
+    private static func revealedPreview(for item: KeychainItem) -> String {
+        guard let decoded = item.decodedSecret else {
+            return item.itemClass.returnsData ? "(no data)" : "(not exported for this class)"
+        }
+        return decoded.text.isEmpty ? "(empty)" : decoded.previewText
+    }
+
+    private static func makeRow(caption: String, value: String) -> UIView {
         let captionLabel = UILabel()
         captionLabel.text = caption
         captionLabel.font = .systemFont(ofSize: 10, weight: .heavy)
@@ -1177,290 +1301,8 @@ final class KeychainMetaCell: UITableViewCell {
         let stack = UIStackView(arrangedSubviews: [captionLabel, valueLabel])
         stack.axis = .vertical
         stack.spacing = 2
+        stack.semanticContentAttribute = .forceLeftToRight
         return stack
-    }
-}
-
-// MARK: - Secret card
-
-/// The secret of a password item: masked until the eye is tapped, then shown as
-/// whatever the blob decoded into (JSON / plist / archive / text / hex) with the
-/// winning representation on a pill.
-///
-/// Editing goes through an explicit SAVE rather than `editingDidEnd`, so the
-/// write is never triggered by a cell being recycled mid-edit, and the caller
-/// re-encodes the text back into the *same* representation before `SecItemUpdate`.
-final class KeychainSecretCell: UITableViewCell {
-
-    static let reuseID = "KeychainSecretCell"
-
-    var onToggleReveal: (() -> Void)?
-    var onSave: ((String) -> Void)?
-    var onCopy: ((String) -> Void)?
-
-    private let card = UIView()
-    private let caption = UILabel()
-    private let nameLabel = UILabel()
-    private let formatPill = PaddedPillLabel()
-    private let lockPill = PaddedPillLabel()
-    private let byteLabel = UILabel()
-    private let separator = UIView()
-    private let valueCaption = UILabel()
-    private let maskedLabel = UILabel()
-    private let textView = UITextView()
-    private let errorLabel = UILabel()
-    private let note = UILabel()
-    private let eyeButton = UIButton(type: .system)
-    private let copyButton = UIButton(type: .system)
-    private let saveButton = UIButton(type: .system)
-    private let revertButton = UIButton(type: .system)
-    private let buttonRow = UIStackView()
-
-    private var originalText = ""
-
-    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
-        super.init(style: style, reuseIdentifier: reuseIdentifier)
-        setup()
-    }
-    required init?(coder: NSCoder) { super.init(coder: coder); setup() }
-
-    private func setup() {
-        selectionStyle = .none
-        backgroundColor = .clear
-        contentView.backgroundColor = .clear
-
-        card.backgroundColor = UIColor(white: 0.13, alpha: 1)
-        card.layer.cornerRadius = 14
-        card.layer.cornerCurve = .continuous
-        card.layer.borderWidth = 1
-        card.layer.borderColor = UIColor(white: 0.24, alpha: 1).cgColor
-        card.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(card)
-
-        for label in [caption, valueCaption] {
-            label.font = .systemFont(ofSize: 10, weight: .heavy)
-            label.textColor = UIColor(white: 0.45, alpha: 1)
-        }
-        caption.text = "ITEM"
-        valueCaption.text = "SECRET"
-
-        nameLabel.font = .monospacedSystemFont(ofSize: 14, weight: .semibold)
-        nameLabel.textColor = DebugTheme.accentColor
-        nameLabel.numberOfLines = 2
-
-        byteLabel.font = .systemFont(ofSize: 10, weight: .semibold)
-        byteLabel.textColor = UIColor(white: 0.45, alpha: 1)
-
-        formatPill.configureAsPill(background: UIColor(white: 0.22, alpha: 1),
-                                   textColor: UIColor(white: 0.85, alpha: 1))
-        lockPill.configureAsPill(background: UIColor(red: 0.95, green: 0.60, blue: 0.35, alpha: 0.22),
-                                 textColor: UIColor(red: 0.98, green: 0.72, blue: 0.48, alpha: 1))
-        lockPill.text = "READ-ONLY"
-
-        maskedLabel.font = .monospacedSystemFont(ofSize: 15, weight: .semibold)
-        maskedLabel.textColor = UIColor(white: 0.70, alpha: 1)
-        maskedLabel.numberOfLines = 1
-
-        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        textView.textColor = UIColor(white: 0.90, alpha: 1)
-        textView.backgroundColor = UIColor(white: 0.09, alpha: 1)
-        textView.layer.cornerRadius = 9
-        textView.layer.cornerCurve = .continuous
-        textView.layer.borderWidth = 1
-        textView.layer.borderColor = UIColor(white: 0.22, alpha: 1).cgColor
-        textView.autocapitalizationType = .none
-        textView.autocorrectionType = .no
-        textView.spellCheckingType = .no
-        textView.keyboardAppearance = .dark
-        textView.isScrollEnabled = false
-        textView.textContainerInset = UIEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
-        textView.translatesAutoresizingMaskIntoConstraints = false
-        textView.heightAnchor.constraint(greaterThanOrEqualToConstant: 74).isActive = true
-        textView.inputAccessoryView = makeKeyboardBar()
-
-        errorLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        errorLabel.textColor = .systemRed
-        errorLabel.numberOfLines = 0
-        errorLabel.isHidden = true
-
-        note.font = .systemFont(ofSize: 10, weight: .medium)
-        note.textColor = UIColor(white: 0.45, alpha: 1)
-        note.numberOfLines = 0
-
-        separator.backgroundColor = UIColor(white: 0.22, alpha: 1)
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
-
-        eyeButton.tintColor = DebugTheme.accentColor
-        eyeButton.setImage(UIImage(systemName: "eye.fill"), for: .normal)
-        eyeButton.setContentHuggingPriority(.required, for: .horizontal)
-        eyeButton.addTarget(self, action: #selector(eyeTapped), for: .touchUpInside)
-
-        style(copyButton, title: "COPY", filled: false)
-        style(revertButton, title: "REVERT", filled: false)
-        style(saveButton, title: "SAVE AS DATA", filled: true)
-        copyButton.addTarget(self, action: #selector(copyTapped), for: .touchUpInside)
-        revertButton.addTarget(self, action: #selector(revertTapped), for: .touchUpInside)
-        saveButton.addTarget(self, action: #selector(saveTapped), for: .touchUpInside)
-
-        let topRow = UIStackView(arrangedSubviews: [caption, UIView(), lockPill, formatPill, eyeButton])
-        topRow.axis = .horizontal
-        topRow.alignment = .center
-        topRow.spacing = 6
-
-        let valueRow = UIStackView(arrangedSubviews: [valueCaption, byteLabel, UIView(), copyButton])
-        valueRow.axis = .horizontal
-        valueRow.alignment = .center
-        valueRow.spacing = 8
-
-        buttonRow.axis = .horizontal
-        buttonRow.alignment = .center
-        buttonRow.spacing = 8
-        buttonRow.addArrangedSubview(saveButton)
-        buttonRow.addArrangedSubview(revertButton)
-        buttonRow.addArrangedSubview(UIView())
-
-        let stack = UIStackView(arrangedSubviews: [topRow, nameLabel, separator, valueRow,
-                                                   maskedLabel, textView, errorLabel, buttonRow, note])
-        stack.axis = .vertical
-        stack.spacing = 6
-        stack.setCustomSpacing(10, after: nameLabel)
-        stack.setCustomSpacing(10, after: separator)
-        stack.setCustomSpacing(10, after: textView)
-        stack.setCustomSpacing(10, after: buttonRow)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(stack)
-
-        NSLayoutConstraint.activate([
-            card.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
-            card.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
-            card.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 5),
-            card.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -5),
-
-            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
-            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
-        ])
-        forceLTR()
-    }
-
-    private func style(_ button: UIButton, title: String, filled: Bool) {
-        var config = filled ? UIButton.Configuration.filled() : UIButton.Configuration.plain()
-        config.title = title
-        config.baseForegroundColor = filled ? .black : DebugTheme.accentColor
-        config.baseBackgroundColor = DebugTheme.accentColor
-        config.cornerStyle = .medium
-        config.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 12, bottom: 5, trailing: 12)
-        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attrs in
-            var attrs = attrs
-            attrs.font = .systemFont(ofSize: 10, weight: .heavy)
-            return attrs
-        }
-        button.configuration = config
-        if !filled {
-            button.backgroundColor = UIColor(white: 0.23, alpha: 1)
-            button.layer.cornerRadius = 9
-            button.clipsToBounds = true
-        }
-        button.setContentHuggingPriority(.required, for: .horizontal)
-    }
-
-    private func makeKeyboardBar() -> UIToolbar {
-        let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: 320, height: 44))
-        bar.barStyle = .black
-        bar.tintColor = DebugTheme.accentColor
-        let done = UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(doneTapped))
-        bar.items = [UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil), done]
-        bar.sizeToFit()
-        return bar
-    }
-
-    // MARK: Actions
-
-    @objc private func doneTapped() { textView.resignFirstResponder() }
-    @objc private func eyeTapped() { onToggleReveal?() }
-    @objc private func copyTapped() { onCopy?(textView.isHidden ? "" : (textView.text ?? "")) }
-    @objc private func saveTapped() { onSave?(textView.text ?? "") }
-    @objc private func revertTapped() {
-        textView.text = originalText
-        clearError()
-    }
-
-    // MARK: Configure
-
-    override func prepareForReuse() {
-        super.prepareForReuse()
-        // The editor can still be first responder when this row is recycled.
-        if textView.isFirstResponder { textView.resignFirstResponder() }
-        onToggleReveal = nil
-        onSave = nil
-        onCopy = nil
-        originalText = ""
-        clearError()
-    }
-
-    func configure(item: KeychainItem, revealed: Bool) {
-        nameLabel.text = item.displayName
-        eyeButton.isHidden = item.secretData == nil
-        eyeButton.setImage(UIImage(systemName: revealed ? "eye.slash.fill" : "eye.fill"), for: .normal)
-
-        let decoded = item.decodedSecret
-        if let decoded {
-            formatPill.text = decoded.representation.rawValue
-            formatPill.isHidden = false
-            byteLabel.text = "·  \(decoded.byteCountText)"
-        } else {
-            formatPill.isHidden = true
-            byteLabel.text = nil
-        }
-
-        let full = revealed ? (decoded?.text ?? item.revealedSecretDisplay) : ""
-        // A truncated body must never be editable — saving it would destroy the
-        // part that isn't on screen.
-        let capped = full.count > 20_000
-        let body = capped ? String(full.prefix(20_000)) + "\n… truncated" : full
-        let editable = item.isSecretEditable && revealed && !capped
-        lockPill.isHidden = editable
-
-        maskedLabel.isHidden = revealed
-        maskedLabel.text = item.maskedSecretDisplay
-        textView.isHidden = !revealed
-        copyButton.isHidden = !revealed
-        buttonRow.isHidden = !editable
-
-        originalText = body
-        textView.text = body
-        textView.isEditable = editable
-        textView.textColor = editable ? UIColor(white: 0.90, alpha: 1) : UIColor(white: 0.70, alpha: 1)
-
-        if !revealed {
-            note.text = "Tap the eye to decode and reveal this secret."
-        } else if capped {
-            note.text = "Too large to edit safely — shown truncated, read-only."
-        } else if let decoded {
-            note.text = decoded.representation.editHint
-                + (item.itemClass.isEditable ? "" : " This class is read-only in the inspector.")
-        } else {
-            note.text = item.itemClass.returnsData
-                ? "This item has no kSecValueData."
-                : "Data is not exported for \(item.itemClass.title.lowercased())."
-        }
-
-        clearError()
-        forceLTR()
-    }
-
-    func showError(_ message: String) {
-        errorLabel.text = message
-        errorLabel.isHidden = false
-        textView.layer.borderColor = UIColor.systemRed.withAlphaComponent(0.7).cgColor
-    }
-
-    func clearError() {
-        errorLabel.text = nil
-        errorLabel.isHidden = true
-        textView.layer.borderColor = UIColor(white: 0.22, alpha: 1).cgColor
     }
 }
 

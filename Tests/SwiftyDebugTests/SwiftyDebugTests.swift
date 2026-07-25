@@ -46,6 +46,139 @@ final class SwiftyDebugTests: XCTestCase {
         XCTAssertEqual(JSONExporter.clipboardString(from: plain), "hello world")
     }
 
+    // MARK: - Breakpoint response delivery
+
+    func testEditedBodyHeadersAreCorrected() {
+        // Delivering an edited body behind the ORIGINAL headers is what stopped
+        // the app seeing edited data: Content-Length truncated it back to the old
+        // length, and a stale Content-Encoding made the client try to gunzip
+        // plain text.
+        let original: [AnyHashable: Any] = [
+            "Content-Length": "12",
+            "Content-Encoding": "gzip",
+            "Transfer-Encoding": "chunked",
+            "Content-Type": "application/json",
+            "X-Custom": "keep-me",
+        ]
+        let edited = CustomHTTPProtocol.headersForEditedBody(original: original, bodyLength: 4096)
+
+        XCTAssertEqual(edited["Content-Length"], "4096")     // corrected
+        XCTAssertNil(edited["Content-Encoding"])             // body is already decoded
+        XCTAssertNil(edited["Transfer-Encoding"])
+        XCTAssertEqual(edited["Content-Type"], "application/json")  // preserved
+        XCTAssertEqual(edited["X-Custom"], "keep-me")               // preserved
+    }
+
+    func testEditedBodyHeaderMatchingIsCaseInsensitive() {
+        // Servers send these in any casing; a case-sensitive check would leave a
+        // stale content-length behind and truncate the edited body.
+        let original: [AnyHashable: Any] = [
+            "content-length": "9999",
+            "CONTENT-ENCODING": "br",
+        ]
+        let edited = CustomHTTPProtocol.headersForEditedBody(original: original, bodyLength: 10)
+        XCTAssertEqual(edited["Content-Length"], "10")
+        XCTAssertEqual(edited.keys.filter { $0.lowercased() == "content-length" }.count, 1)
+        XCTAssertTrue(edited.keys.allSatisfy { $0.lowercased() != "content-encoding" })
+    }
+
+    func testResponseForEditedBodyRebuildsStatusAndHeaders() {
+        let url = URL(string: "https://a.com/x")!
+        let original = HTTPURLResponse(url: url, statusCode: 201, httpVersion: "HTTP/1.1",
+                                       headerFields: ["Content-Length": "1", "Content-Type": "application/json"])!
+        let rebuilt = CustomHTTPProtocol.responseForEditedBody(original: original, bodyLength: 250)
+        XCTAssertEqual(rebuilt?.statusCode, 201)
+        XCTAssertEqual(rebuilt?.url, url)
+        let len = (rebuilt?.allHeaderFields["Content-Length"] as? String)
+            ?? (rebuilt?.allHeaderFields["content-length"] as? String)
+        XCTAssertEqual(len, "250")
+    }
+
+    func testPausedResponseBodyTextFallsBackToPlainText() {
+        // Returning "" for non-JSON was the second reason the app saw no data:
+        // the editor seeded an empty string and then delivered it.
+        let html = "<html><body>hi</body></html>"
+        let paused = BreakpointCenter.PausedRequest(
+            stage: .afterResponse,
+            request: URLRequest(url: URL(string: "https://a.com")!),
+            responseBody: html.data(using: .utf8),
+            resume: { _ in }, abort: {})
+        XCTAssertEqual(paused.responseBodyText, html)
+        XCTAssertFalse(paused.isResponseBodyBinary)
+    }
+
+    func testPausedBinaryResponseBodyIsFlagged() {
+        let binary = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10])   // JPEG header
+        let paused = BreakpointCenter.PausedRequest(
+            stage: .afterResponse,
+            request: URLRequest(url: URL(string: "https://a.com/x.jpg")!),
+            responseBody: binary,
+            resume: { _ in }, abort: {})
+        XCTAssertTrue(paused.isResponseBodyBinary)
+    }
+
+    func testExpireRemovesPausedRequestWithoutResumingIt() {
+        // The app timed out while the request sat on hold: neither handler may run.
+        var resumed = false, aborted = false
+        let paused = BreakpointCenter.PausedRequest(
+            stage: .afterResponse,
+            request: URLRequest(url: URL(string: "https://a.com")!),
+            resume: { _ in resumed = true }, abort: { aborted = true })
+
+        BreakpointCenter.shared.park(paused)
+        XCTAssertTrue(BreakpointCenter.shared.pausedRequests.contains { $0 === paused })
+
+        BreakpointCenter.shared.expire(paused)
+        XCTAssertFalse(BreakpointCenter.shared.pausedRequests.contains { $0 === paused })
+        XCTAssertTrue(paused.isSettled)
+        XCTAssertFalse(resumed)
+        XCTAssertFalse(aborted)
+
+        // An expired request can never be delivered afterwards.
+        BreakpointCenter.shared.resume(paused)
+        XCTAssertFalse(resumed)
+    }
+
+    // MARK: - Rule composition (mock / breakpoint must survive)
+
+    func testResolvedRuleCarriesMockAndBreakpoint() {
+        let store = InterceptRuleStore.shared
+        store.removeAll()
+        defer { store.removeAll() }
+
+        let url = URL(string: "https://compose-test.example.com/api/items/42")!
+        var rule = InterceptRule(matchEndpoint: EndpointNormalizer.normalize(url.path), matchMode: .normalized)
+        rule.mock = MockResponse(isEnabled: true, statusCode: 418, body: "{\"a\":1}", headers: [], delay: 0)
+        rule.breakpointMode = .afterResponse
+        rule.isEnabled = true
+        store.addOrUpdate(rule)
+
+        // The composite is a NEW InterceptRule — mock/breakpoint were previously
+        // dropped here, which silently disabled both features entirely.
+        guard let composite = store.resolvedRule(forURL: url) else {
+            return XCTFail("rule should match")
+        }
+        XCTAssertTrue(composite.mock.isEnabled)
+        XCTAssertEqual(composite.mock.statusCode, 418)
+        XCTAssertEqual(composite.mock.body, "{\"a\":1}")
+        XCTAssertEqual(composite.breakpointMode, .afterResponse)
+    }
+
+    func testDisabledRuleContributesNoMockOrBreakpoint() {
+        let store = InterceptRuleStore.shared
+        store.removeAll()
+        defer { store.removeAll() }
+
+        let url = URL(string: "https://compose-off.example.com/api/x")!
+        var rule = InterceptRule(matchEndpoint: EndpointNormalizer.normalize(url.path), matchMode: .normalized)
+        rule.mock = MockResponse(isEnabled: true, statusCode: 500, body: "", headers: [], delay: 0)
+        rule.breakpointMode = .beforeSend
+        rule.isEnabled = false          // disabled → must not apply
+        store.addOrUpdate(rule)
+
+        XCTAssertNil(store.resolvedRule(forURL: url))
+    }
+
     // MARK: - JSON editor engine
 
     private func makeDoc() -> JSONDocument {

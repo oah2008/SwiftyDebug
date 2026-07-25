@@ -23,6 +23,8 @@ class InterceptRuleListViewController: UITableViewController {
     // MARK: - State
 
     private var ruleList: [InterceptRule] = []
+    /// Kept so the share sheet has a popover anchor on iPad.
+    private var transferItem: UIBarButtonItem?
 
     // MARK: - Lifecycle
 
@@ -50,7 +52,15 @@ class InterceptRuleListViewController: UITableViewController {
         )
         editItem.tintColor = DebugTheme.accentColor
 
-        navigationItem.rightBarButtonItems = [addItem, editItem]
+        // Export / import moves *every* rule on the device, not just the ones matching
+        // this request — a menu keeps that out of the way of the per-request actions.
+        let transferItem = UIBarButtonItem(
+            image: UIImage(systemName: "ellipsis.circle"), menu: makeTransferMenu()
+        )
+        transferItem.tintColor = DebugTheme.accentColor
+        self.transferItem = transferItem
+
+        navigationItem.rightBarButtonItems = [addItem, transferItem, editItem]
 
         tableView.backgroundColor = .black
         tableView.separatorStyle = .none
@@ -115,6 +125,68 @@ class InterceptRuleListViewController: UITableViewController {
             popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
             popover.permittedArrowDirections = []
         }
+        present(alert, animated: true)
+    }
+
+    // MARK: - Export / import
+
+    private func makeTransferMenu() -> UIMenu {
+        let export = UIAction(
+            title: "Export All Rules…",
+            image: UIImage(systemName: "square.and.arrow.up")
+        ) { [weak self] _ in
+            self?.exportAllRules()
+        }
+        let importRules = UIAction(
+            title: "Import Rules…",
+            image: UIImage(systemName: "square.and.arrow.down")
+        ) { [weak self] _ in
+            self?.presentTransferHub()
+        }
+        let pickRules = UIAction(
+            title: "Choose Rules to Export…",
+            image: UIImage(systemName: "checklist")
+        ) { [weak self] _ in
+            self?.presentTransferHub()
+        }
+        return UIMenu(title: "Rules", children: [export, pickRules, importRules])
+    }
+
+    /// One tap → a JSON file of every rule in the share sheet. Selective export and
+    /// the import flows (file / pasted JSON, both previewed) live in the transfer hub.
+    private func exportAllRules() {
+        let rules = InterceptRuleStore.shared.allRules()
+        guard !rules.isEmpty else {
+            showAlert(title: "No Rules", message: "There are no intercept rules on this device to export.")
+            return
+        }
+
+        let document = RuleExporter.makeDocument(from: rules)
+        let url: URL
+        do {
+            url = try RuleExporter.writeToTemporaryFile(document)
+        } catch {
+            showAlert(title: "Export Failed", message: error.localizedDescription)
+            return
+        }
+
+        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        activity.popoverPresentationController?.barButtonItem = transferItem
+        present(activity, animated: true)
+    }
+
+    private func presentTransferHub() {
+        let hub = RuleTransferViewController()
+        let nav = SwiftyDebugNavigationController(rootViewController: hub)
+        // Full screen so this list gets `viewWillAppear` back on dismissal and picks up
+        // whatever the import added — a sheet would leave the rows stale.
+        nav.modalPresentationStyle = .fullScreen
+        present(nav, animated: true)
+    }
+
+    private func showAlert(title: String, message: String) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
     }
 

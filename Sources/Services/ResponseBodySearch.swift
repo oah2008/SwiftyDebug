@@ -11,7 +11,7 @@ import Foundation
 
 /// Which body a hit came from. Surfaced in the UI as a badge so the user knows
 /// whether the term was found in what the app *sent* or what the server *returned*.
-enum BodySearchSide: String {
+enum BodySearchSide: String, CaseIterable {
     case request = "REQUEST"
     case response = "RESPONSE"
 }

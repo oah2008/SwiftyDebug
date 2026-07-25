@@ -31,6 +31,19 @@ enum SettingsKey: String {
     /// Network-link-conditioner preset (raw value of `NetworkConditionerPreset`).
     /// Adds a fixed latency to every captured request. Off by default.
     case networkConditionerPreset = "networkConditionerPreset_SwiftyDebug"
+
+    /// Raises any host-app request timeout below `breakpointHoldSeconds` so a
+    /// request can actually sit at a breakpoint while you edit it.
+    ///
+    /// Without this a breakpoint is useless in most apps: `timeoutIntervalForRequest`
+    /// is an *idle* timer, and a held request delivers nothing to the client, so the
+    /// app gives up (NSURLErrorTimedOut) long before you finish editing — the demo
+    /// app's own stack sets 10 seconds. ON by default. (See BREAKPOINTS.)
+    case extendTimeoutsForBreakpoints = "extendTimeoutsForBreakpoints_SwiftyDebug"
+
+    /// How long (seconds) a request may be held at a breakpoint. Also the floor
+    /// applied to host-app request timeouts when `extendTimeoutsForBreakpoints` is on.
+    case breakpointHoldSeconds = "breakpointHoldSeconds_SwiftyDebug"
 }
 
 extension SettingsKey {
@@ -56,6 +69,7 @@ extension SettingsKey {
             .networkRequestsEnabled, .webNetworkRequestsEnabled, .consoleLogsEnabled,
             .webLogsEnabled, .monitorAllRequests, .monitorMedia,
             .fullStopOnDisable, .networkConditionerPreset,
+            .extendTimeoutsForBreakpoints, .breakpointHoldSeconds,
         ].map { $0.rawValue })
     }()
 }

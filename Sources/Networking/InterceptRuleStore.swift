@@ -144,6 +144,16 @@ class InterceptRuleStore {
                 composite.redirectMode = rule.redirectMode
                 composite.redirectTarget = rule.redirectTarget
             }
+            // Mock: last enabled rule with a mock wins. WITHOUT this the
+            // composite kept its default (disabled) mock and mocks never fired.
+            if rule.mock.isEnabled {
+                composite.mock = rule.mock
+            }
+            // Breakpoint: last enabled rule that arms one wins. Same bug class —
+            // omitting this silently dropped every breakpoint.
+            if rule.breakpointMode != .off {
+                composite.breakpointMode = rule.breakpointMode
+            }
             for pair in rule.headerOverrides {
                 if let idx = composite.headerOverrides.firstIndex(where: { $0.key.lowercased() == pair.key.lowercased() }) {
                     composite.headerOverrides[idx] = pair

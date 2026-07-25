@@ -209,9 +209,19 @@ private final class BreakpointRowCell: UITableViewCell {
         refreshHeldFor()
     }
 
+    /// Shows how long the request has been held **and how long is left** before
+    /// the app stops waiting. Without the countdown there is no way to tell a
+    /// request you can still edit from one that is about to be abandoned.
     func refreshHeldFor() {
         guard let item else { return }
-        heldLabel.text = "held \(Int(Date().timeIntervalSince(item.pausedAt)))s"
+        let held = Int(item.heldFor)
+        if let left = item.remainingHoldTime {
+            heldLabel.text = "held \(held)s · \(Int(left))s left"
+            heldLabel.textColor = left < 30 ? .systemOrange : UIColor(white: 0.45, alpha: 1)
+        } else {
+            heldLabel.text = "held \(held)s"
+            heldLabel.textColor = UIColor(white: 0.45, alpha: 1)
+        }
     }
 }
 
@@ -247,8 +257,33 @@ private final class BreakpointDetailViewController: UITableViewController {
 
     private let paused: BreakpointCenter.PausedRequest
     private var editedBody: String
+    /// Only overwrite the response body when the developer actually changed it.
+    /// Otherwise the original bytes are delivered untouched — which matters for
+    /// binary payloads and for anything the pretty-printer can't round-trip.
+    private var bodyWasEdited = false
 
     private enum Row: Int, CaseIterable { case summary, requestHeaders, body, resume, abort }
+
+    /// A body can only be edited after the response arrived, and only when it's
+    /// text — binary payloads are passed through byte-for-byte.
+    private var isBodyEditable: Bool {
+        paused.stage == .afterResponse && !paused.isResponseBodyBinary
+    }
+
+    /// The app abandoned the request while it was held, so there is nothing left
+    /// to deliver to. Say so — this used to be a silent no-op that looked exactly
+    /// like a successful delivery producing an empty screen.
+    private func showGaveUpAlert() {
+        let held = Int(paused.heldFor)
+        let a = UIAlertController(
+            title: "App Gave Up On This Request",
+            message: "It was held for \(held)s and the app stopped waiting, so the edited response has nowhere to go.\n\nRaise \"Breakpoint hold\" in Settings, or re-run the request and release it sooner.",
+            preferredStyle: .alert)
+        a.addAction(UIAlertAction(title: "OK", style: .default) { [weak self] _ in
+            self?.navigationController?.popViewController(animated: true)
+        })
+        present(a, animated: true)
+    }
 
     init(paused: BreakpointCenter.PausedRequest) {
         self.paused = paused
@@ -301,11 +336,17 @@ private final class BreakpointDetailViewController: UITableViewController {
             c.detailTextLabel?.text = headers.keys.sorted()
                 .map { "\($0): \(headers[$0] ?? "")" }.joined(separator: "\n")
         case .body:
-            c.textLabel?.text = paused.stage == .afterResponse ? "Edit response body" : "Response body"
-            let preview = editedBody.trimmingCharacters(in: .whitespacesAndNewlines)
-            c.detailTextLabel?.text = preview.isEmpty ? "(empty)" : String(preview.prefix(300))
-            c.accessoryType = paused.stage == .afterResponse ? .disclosureIndicator : .none
-            c.selectionStyle = paused.stage == .afterResponse ? .default : .none
+            let editable = isBodyEditable
+            c.textLabel?.text = editable ? "Edit response body" : "Response body"
+            if paused.isResponseBodyBinary {
+                let bytes = paused.responseBody?.count ?? 0
+                c.detailTextLabel?.text = "Binary payload — \(bytes) bytes, delivered unchanged"
+            } else {
+                let preview = editedBody.trimmingCharacters(in: .whitespacesAndNewlines)
+                c.detailTextLabel?.text = preview.isEmpty ? "(empty)" : String(preview.prefix(300))
+            }
+            c.accessoryType = editable ? .disclosureIndicator : .none
+            c.selectionStyle = editable ? .default : .none
         case .resume:
             c.textLabel?.text = paused.stage == .afterResponse ? "Deliver to app" : "Send request"
             c.textLabel?.textColor = DebugTheme.accentColor
@@ -324,20 +365,23 @@ private final class BreakpointDetailViewController: UITableViewController {
         tableView.deselectRow(at: ip, animated: true)
         switch Row(rawValue: ip.row)! {
         case .body:
-            guard paused.stage == .afterResponse else { return }
+            guard isBodyEditable else { return }
             let editor = JSONEditorViewController(text: editedBody, title: "Response Body")
             editor.saveButtonTitle = "Use Body"
             editor.onSave = { [weak self] doc in
                 self?.editedBody = doc.prettyText()
+                self?.bodyWasEdited = true
                 self?.tableView.reloadData()
             }
             navigationController?.pushViewController(editor, animated: true)
         case .resume:
-            paused.responseBody = editedBody.data(using: .utf8)
-            BreakpointCenter.shared.resume(paused)
+            if bodyWasEdited, let data = editedBody.data(using: .utf8) {
+                paused.responseBody = data
+            }
+            guard BreakpointCenter.shared.resume(paused) else { showGaveUpAlert(); return }
             navigationController?.popViewController(animated: true)
         case .abort:
-            BreakpointCenter.shared.abort(paused)
+            guard BreakpointCenter.shared.abort(paused) else { showGaveUpAlert(); return }
             navigationController?.popViewController(animated: true)
         default:
             break

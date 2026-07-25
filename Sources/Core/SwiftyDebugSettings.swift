@@ -81,6 +81,21 @@ class Settings: NSObject {
         didSet { saveString(.networkConditionerPreset, value: networkConditionerPreset.rawValue) }
     }
 
+    /// Raises host-app request timeouts to `breakpointHoldSeconds` so a paused
+    /// request survives long enough to be edited. ON by default — see
+    /// `SettingsKey.extendTimeoutsForBreakpoints` for why a breakpoint is
+    /// otherwise unusable in an app that sets a short timeout.
+    var extendTimeoutsForBreakpoints: Bool = true {
+        didSet { save(.extendTimeoutsForBreakpoints, value: extendTimeoutsForBreakpoints) }
+    }
+
+    /// Seconds a request may be held at a breakpoint. Default 10 minutes —
+    /// long enough to reshape a payload by hand, short enough that a forgotten
+    /// breakpoint doesn't wedge the app forever.
+    var breakpointHoldSeconds: TimeInterval = 600 {
+        didSet { saveDouble(.breakpointHoldSeconds, value: breakpointHoldSeconds) }
+    }
+
     private override init() {
         let ud = UserDefaults.standard
 
@@ -114,6 +129,14 @@ class Settings: NSObject {
         // Network conditioner: OFF by default
         let presetRaw = ud.string(forKey: SettingsKey.networkConditionerPreset.rawValue) ?? ""
         networkConditionerPreset = NetworkConditionerPreset(rawValue: presetRaw) ?? .off
+
+        // Breakpoint hold: ON by default — a breakpoint that the host app times
+        // out from is worse than no breakpoint at all.
+        extendTimeoutsForBreakpoints = ud.object(forKey: SettingsKey.extendTimeoutsForBreakpoints.rawValue) == nil
+            ? true
+            : ud.bool(forKey: SettingsKey.extendTimeoutsForBreakpoints.rawValue)
+        let hold = ud.double(forKey: SettingsKey.breakpointHoldSeconds.rawValue)
+        breakpointHoldSeconds = hold > 0 ? hold : 600
     }
 
     // MARK: - Private
@@ -123,6 +146,10 @@ class Settings: NSObject {
     }
 
     private func saveString(_ key: SettingsKey, value: String) {
+        UserDefaults.standard.set(value, forKey: key.rawValue)
+    }
+
+    private func saveDouble(_ key: SettingsKey, value: Double) {
         UserDefaults.standard.set(value, forKey: key.rawValue)
     }
 

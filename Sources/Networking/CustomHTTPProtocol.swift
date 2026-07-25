@@ -57,11 +57,15 @@ private var orig_defaultSessionConfiguration: IMP?
 private var orig_ephemeralSessionConfiguration: IMP?
 /// Store original IMP for protocolClasses getter.
 private var orig_protocolClassesGetter: IMP?
+/// Store original IMP for the request-timeout setter.
+private var orig_setTimeoutIntervalForRequest: IMP?
 
 /// Type alias for the original session configuration constructor.
 private typealias SessionConfigConstructor = @convention(c) (AnyObject, Selector) -> URLSessionConfiguration
 /// Type alias for the protocolClasses getter.
 private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selector) -> NSArray?
+/// Type alias for `-[NSURLSessionConfiguration setTimeoutIntervalForRequest:]`.
+private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeInterval) -> Void
 
 // MARK: - CustomHTTPProtocolDelegate
 
@@ -211,6 +215,46 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
 
                 method_setImplementation(getterMethod, imp_implementationWithBlock(replacedGetter))
             }
+
+            swizzleRequestTimeoutSetter(on: configClass)
+    }
+
+    /// Raises any request timeout the host app sets below the breakpoint hold
+    /// budget.
+    ///
+    /// This is what makes breakpoints work at all. `timeoutIntervalForRequest` is
+    /// an **idle** timer: it resets only when real bytes reach the client. A
+    /// request held at an `.afterResponse` breakpoint delivers nothing until you
+    /// tap Deliver, so the timer runs uninterrupted and the app gives up with
+    /// NSURLErrorTimedOut — the demo's own stack sets 10 seconds, which is gone
+    /// before you have finished reading the payload, let alone editing it. The
+    /// edited body is then delivered to a task that no longer exists, and the
+    /// screen stays empty with no error.
+    ///
+    /// Swizzling the *setter* (rather than only the config constructors) is
+    /// required because apps typically do `URLSessionConfiguration.default` and
+    /// then assign their own timeout, which would overwrite anything we set at
+    /// construction. (See BREAKPOINTS.)
+    private class func swizzleRequestTimeoutSetter(on configClass: AnyClass) {
+        let sel = NSSelectorFromString("setTimeoutIntervalForRequest:")
+        guard let method = class_getInstanceMethod(configClass, sel) else { return }
+        orig_setTimeoutIntervalForRequest = method_getImplementation(method)
+
+        let replaced: @convention(block) (AnyObject, TimeInterval) -> Void = { configObj, value in
+            let original = unsafeBitCast(orig_setTimeoutIntervalForRequest!, to: TimeoutSetterFunc.self)
+            original(configObj, sel, Self.effectiveRequestTimeout(value))
+        }
+        method_setImplementation(method, imp_implementationWithBlock(replaced))
+    }
+
+    /// The timeout to actually apply, given what the host app asked for.
+    /// Pure and `internal` so it can be unit-tested without CFNetwork.
+    static func effectiveRequestTimeout(_ requested: TimeInterval) -> TimeInterval {
+        guard SwiftyDebugRuntime.isActive,
+              Settings.shared.extendTimeoutsForBreakpoints else { return requested }
+        let floor = Settings.shared.breakpointHoldSeconds
+        // A host app asking for MORE than the hold budget keeps its own value.
+        return max(requested, floor)
     }
 
     /// Injects `CustomHTTPProtocol` at the front of the given configuration's `protocolClasses`.
@@ -224,6 +268,9 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
             }
             config.protocolClasses = urlProtocolClasses
         }
+        // Covers configs the app never assigns a timeout to (the setter swizzle
+        // covers the ones it does).
+        config.timeoutIntervalForRequest = effectiveRequestTimeout(config.timeoutIntervalForRequest)
     }
 
     // MARK: Instance properties
@@ -253,6 +300,15 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
     /// instead of streaming it to the client, so the body can be edited first.
     private var isHoldingResponse = false
     private var heldResponse: URLResponse?
+    /// The breakpoint entry parked for this request, if any. Held so that if the
+    /// app gives up first (timeout / cancellation) we can drop it from the inbox
+    /// instead of leaving a row that can never be delivered.
+    ///
+    /// Strong on purpose: a weak reference could be nil by the time `stopLoading`
+    /// runs, which would skip the expiry and leave a row whose Deliver button
+    /// silently does nothing. No cycle — the parked entry's handlers capture this
+    /// protocol weakly.
+    private var parkedBreakpoint: BreakpointCenter.PausedRequest?
 
     // MARK: Recursive request flag
 
@@ -461,7 +517,17 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
         }
 
         // --- Mock response: answer locally, never touch the network. ---
-        if let mock = self.resolvedRule?.mock, mock.isEnabled {
+        // The active mock profile is consulted too, not just this rule. A rule's
+        // own mock wins — the specific beats the general — which is what
+        // `resolvedMock` encodes. Without this call an activated profile is
+        // inert and the UI's "N mocks active" is a lie.
+        // While the profiles feature is hidden, only the rule's own mock applies.
+        let profileMock = MockProfileStore.isFeatureEnabled
+            ? (recursiveRequest as URLRequest).url.flatMap {
+                MockProfileStore.shared.resolvedMock(forURL: $0, ruleMock: self.resolvedRule?.mock)
+              }
+            : MockProfileStore.resolveMock(ruleMock: self.resolvedRule?.mock, profileMock: nil)
+        if let mock = profileMock {
             deliverMock(mock, for: recursiveRequest as URLRequest)
             return
         }
@@ -486,6 +552,7 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
                     }
                 }
             )
+            self.parkedBreakpoint = paused
             BreakpointCenter.shared.park(paused)
             return
         }
@@ -519,13 +586,8 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
     /// any network access. (See MOCK.)
     private func deliverMock(_ mock: MockResponse, for request: URLRequest) {
         let body = mock.body.data(using: .utf8) ?? Data()
-        var headers: [String: String] = ["Content-Type": "application/json"]
-        for pair in mock.headers where !pair.key.isEmpty { headers[pair.key] = pair.value }
-        headers["Content-Length"] = "\(body.count)"
-
         let url = request.url ?? URL(string: "https://swiftydebug.mock")!
-        let response = HTTPURLResponse(url: url, statusCode: mock.statusCode,
-                                       httpVersion: "HTTP/1.1", headerFields: headers)
+        let response = mock.httpResponse(for: url)
 
         // Record it so the mock shows up in the request list like a real call.
         self.response = response
@@ -554,6 +616,15 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
         // The implementation just cancels the current load (if it's still running).
 
         cancelPendingChallenge()
+
+        // The app gave up on this request (cancelled, or its own timeout elapsed
+        // while it sat at a breakpoint). Delivering now would go nowhere, so drop
+        // the row rather than leave a "Deliver" button that silently does nothing.
+        if let parked = parkedBreakpoint, !parked.isSettled {
+            BreakpointCenter.shared.expire(parked)
+            parkedBreakpoint = nil
+        }
+        isHoldingResponse = false
 
         if let task = self._dataTask {
             task.cancel()
@@ -1107,6 +1178,7 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
                     }
                 }
             )
+            self.parkedBreakpoint = paused
             BreakpointCenter.shared.park(paused)
             return
         }
@@ -1117,15 +1189,58 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
     /// Delivers the (possibly edited) buffered response to the app.
     private func deliverHeldResponse(body: Data) {
         isHoldingResponse = false
-        guard let response = heldResponse else {
+        guard let original = heldResponse else {
             client?.urlProtocolDidFinishLoading(self)
             return
         }
         // Keep what the UI shows in sync with what the app actually received.
         self.data = NSMutableData(data: body)
 
+        // CRITICAL: the original response's headers describe the ORIGINAL body.
+        // Delivering an edited body behind them breaks the app in two ways:
+        //  • `Content-Length` no longer matches — CFNetwork truncates the edited
+        //    body back to the old length (or treats it as incomplete), so the app
+        //    decodes garbage and shows nothing.
+        //  • `Content-Encoding: gzip` is a lie — URLSession already decompressed
+        //    what we buffered, so our edited body is plain text and the client
+        //    would try to gunzip it.
+        // Rebuild the response so the headers describe what we actually send.
+        // Non-HTTP responses have no headers to correct, so they pass through.
+        let response: URLResponse = (original as? HTTPURLResponse)
+            .flatMap { Self.responseForEditedBody(original: $0, bodyLength: body.count) } ?? original
+
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         if !body.isEmpty { client?.urlProtocol(self, didLoad: body) }
         client?.urlProtocolDidFinishLoading(self)
+    }
+
+    /// Rebuilds an `HTTPURLResponse` so its headers match an edited body:
+    /// corrects `Content-Length` and drops the encoding headers that no longer
+    /// apply. Returns nil only if the response can't be reconstructed.
+    static func responseForEditedBody(original: HTTPURLResponse, bodyLength: Int) -> HTTPURLResponse? {
+        guard let url = original.url else { return nil }
+        // Non-string header keys (never produced by CFNetwork) are dropped.
+        let headers = Self.headersForEditedBody(
+            original: original.allHeaderFields, bodyLength: bodyLength)
+        return HTTPURLResponse(url: url,
+                               statusCode: original.statusCode,
+                               httpVersion: "HTTP/1.1",
+                               headerFields: headers)
+    }
+
+    /// Pure header transform — extracted so it can be unit-tested.
+    static func headersForEditedBody(original: [AnyHashable: Any], bodyLength: Int) -> [String: String] {
+        var out: [String: String] = [:]
+        for (key, value) in original {
+            guard let name = key as? String else { continue }
+            let lower = name.lowercased()
+            // These describe the ORIGINAL bytes and are wrong for an edited body.
+            if lower == "content-length" || lower == "content-encoding" || lower == "transfer-encoding" {
+                continue
+            }
+            out[name] = "\(value)"
+        }
+        out["Content-Length"] = "\(bodyLength)"
+        return out
     }
 }
