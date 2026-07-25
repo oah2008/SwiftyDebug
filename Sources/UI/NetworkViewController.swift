@@ -18,6 +18,23 @@ private final class TabFilterState {
     var isGroupedMode: Bool = false
     var isAutoFollowing: Bool = true
     var savedContentOffset: CGPoint = .zero
+
+    // MARK: Body search (BODY-SEARCH)
+    //
+    // Opt-in, per tab. `isBodySearchEnabled` only arms the mode — nothing is read
+    // from disk until the user *submits* a query, at which point the results are
+    // parked in `bodyMatches` and the list switches to results mode.
+
+    /// The "Search in bodies" scope button is ON for this tab.
+    var isBodySearchEnabled: Bool = false
+    /// The query the parked results belong to (used to detect a stale result set).
+    var bodySearchQuery: String = ""
+    /// transactionId -> hit, for the last completed scan on this tab.
+    var bodyMatches: [String: BodySearchMatch] = [:]
+    /// The list is currently rendering body-search results rather than the normal list.
+    var isShowingBodyResults: Bool = false
+    /// Footer/info-line summary of the last scan.
+    var bodySearchSummary: String = ""
 }
 
 class NetworkViewController: UIViewController {
@@ -45,6 +62,16 @@ class NetworkViewController: UIViewController {
     // Filter + layout toggle (inline with search bar)
     private var filterButton: UIButton!
     private var layoutToggleButton: UIButton!
+    /// Scope button that arms body search (BODY-SEARCH). Default OFF.
+    private var bodySearchButton: UIButton!
+
+    // Body search UI + scan bookkeeping (BODY-SEARCH)
+    private var bodyInfoBar: BodySearchInfoBar?
+    private var scanBanner: BodySearchProgressBanner?
+    private var activeScanToken: BodySearchCancellationToken?
+    /// Hits for the rows currently displayed, index-aligned with `models`.
+    private var displayedMatches: [BodySearchMatch] = []
+    private var isShowingBodyResults: Bool { currentTabState.isShowingBodyResults }
 
     // Floating glass header (iOS 26+)
     private var floatingHeader: UIView?
@@ -520,7 +547,26 @@ class NetworkViewController: UIViewController {
             }
         }
 
-        // 4. Search text filter — index-backed rich search over URL parts,
+        // 4. Body-search results mode (BODY-SEARCH). The hits were computed once
+        //    against the submitted query, so the index-backed text filter is
+        //    skipped here — a body hit legitimately has nothing in its index.
+        //    Tab/path/endpoint filters still apply, and rows keep list order.
+        if state.isShowingBodyResults {
+            var orderedModels: [NetworkTransaction] = []
+            var orderedMatches: [BodySearchMatch] = []
+            for model in filtered {
+                guard let match = state.bodyMatches[ResponseBodySearch.identifier(for: model)] else { continue }
+                orderedModels.append(model)
+                orderedMatches.append(match)
+            }
+            models = orderedModels
+            displayedMatches = orderedMatches
+            groupedModels = []
+            return
+        }
+        displayedMatches = []
+
+        // 5. Search text filter — index-backed rich search over URL parts,
         //    method, status, header names, query params, and response-derived
         //    metadata (see SEARCH). Falls back to a plain URL contains for any
         //    model that predates the index.
@@ -537,7 +583,7 @@ class NetworkViewController: UIViewController {
 
         models = filtered
 
-        // 5. Build groups if in grouped mode
+        // 6. Build groups if in grouped mode
         if state.isGroupedMode {
             groupedModels = buildGroupedModels(from: filtered)
         } else {
@@ -559,6 +605,243 @@ class NetworkViewController: UIViewController {
     private func updateLayoutToggleIcon() {
         let iconName = currentTabState.isGroupedMode ? "list.bullet" : "square.grid.2x2"
         layoutToggleButton.setImage(UIImage(systemName: iconName), for: .normal)
+    }
+
+    //MARK: - Body search (BODY-SEARCH)
+    //
+    // The normal list search is index-backed and never touches bodies, because
+    // `requestData`/`responseData` are disk-backed (one file read per access).
+    // Body search is therefore **explicitly opt-in and explicitly submitted**:
+    //
+    //   1. the user arms the scope button (default OFF — plain typing stays instant),
+    //   2. types a term and hits Search / Return (never per keystroke),
+    //   3. `ResponseBodySearch` reads every candidate body once on a background
+    //      queue, reporting determinate progress into a cancellable banner,
+    //   4. results are parked per tab and rendered as snippet rows.
+    //
+    // Nothing here blocks `.networkRequestCompleted`: the scan owns a snapshot
+    // array, the main thread only receives progress ticks.
+
+    private func updateBodySearchButton() {
+        let on = currentTabState.isBodySearchEnabled
+        bodySearchButton.tintColor = on ? .black : UIColor(white: 0.45, alpha: 1)
+        bodySearchButton.backgroundColor = on ? DebugTheme.accentColor : .clear
+    }
+
+    @objc private func didTapBodySearchToggle() {
+        let state = currentTabState
+        state.isBodySearchEnabled.toggle()
+
+        if !state.isBodySearchEnabled {
+            // Turning the scope off drops any parked results and returns the list
+            // to the normal index-backed view.
+            cancelActiveScan()
+            clearBodyResults(for: state)
+            applyFilter()
+            tableView.reloadData()
+        }
+
+        updateBodySearchButton()
+        refreshBodyInfoBar()
+    }
+
+    /// Drops parked results for one tab (keeps the scope button state).
+    private func clearBodyResults(for state: TabFilterState) {
+        state.isShowingBodyResults = false
+        state.bodyMatches = [:]
+        state.bodySearchQuery = ""
+        state.bodySearchSummary = ""
+        displayedMatches = []
+    }
+
+    /// Called on `.allLogsCleared`: every transaction id the results point at is
+    /// gone, so all tabs are reset.
+    private func discardAllBodyResults() {
+        cancelActiveScan()
+        for (_, state) in Self.tabStates { clearBodyResults(for: state) }
+        applyFilter()
+        refreshBodyInfoBar()
+        tableView.reloadData()
+    }
+
+    // MARK: Scan lifecycle
+
+    private func startBodySearch(query: String) {
+        guard SwiftyDebugRuntime.isActive else { return }
+        let state = currentTabState
+        guard state.isBodySearchEnabled else { return }
+
+        cancelActiveScan()
+
+        // Snapshot of the current tab's transactions — the scan never touches the
+        // live store, so new captures can keep arriving while it runs.
+        let candidates = tabModels(from: cacheModels ?? [])
+        guard !candidates.isEmpty else {
+            state.bodySearchSummary = "Nothing to scan on this tab."
+            refreshBodyInfoBar()
+            return
+        }
+
+        var options = ResponseBodySearch.Options()
+        // Media never carries a searchable body — reuse the list's own rule so the
+        // two can't disagree.
+        options.skipTransaction = { NetworkViewController.isMediaTransaction($0) }
+
+        let token = BodySearchCancellationToken()
+        activeScanToken = token
+        showScanBanner(total: candidates.count)
+
+        ResponseBodySearch.scan(
+            transactions: candidates,
+            query: query,
+            options: options,
+            token: token,
+            progress: { [weak self] done, total in
+                self?.scanBanner?.update(done: done, total: total)
+            },
+            completion: { [weak self] outcome in
+                guard let self = self, self.activeScanToken === token else { return }
+                self.activeScanToken = nil
+                self.hideScanBanner()
+                guard !outcome.wasCancelled else { return }
+                self.applyBodySearchOutcome(outcome, query: query)
+            }
+        )
+    }
+
+    private func cancelActiveScan() {
+        activeScanToken?.cancel()
+        activeScanToken = nil
+        hideScanBanner()
+    }
+
+    private func applyBodySearchOutcome(_ outcome: ResponseBodySearch.Outcome, query: String) {
+        let state = currentTabState
+        state.bodySearchQuery = query
+        state.bodyMatches = Dictionary(
+            outcome.matches.map { ($0.transactionId, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        state.isShowingBodyResults = true
+        state.bodySearchSummary = Self.summaryText(for: outcome)
+
+        // Results are a static answer — auto-follow would yank the user to the
+        // bottom on the next capture.
+        isAutoFollowing = false
+        setFollowButtonVisible(false, animated: false)
+
+        applyFilter()
+        refreshBodyInfoBar()
+        tableView.reloadData()
+        tableView.layoutIfNeeded()
+        tableView.setContentOffset(CGPoint(x: 0, y: -tableView.contentInset.top), animated: false)
+    }
+
+    private static func summaryText(for outcome: ResponseBodySearch.Outcome) -> String {
+        let hits = outcome.matches.count
+        var parts: [String] = [
+            hits == 1 ? "1 MATCH" : "\(hits) MATCHES",
+            "\(outcome.totalCount) requests",
+            "\(outcome.scannedCount) bodies read",
+        ]
+        if outcome.cacheHitCount > 0 { parts.append("\(outcome.cacheHitCount) cached") }
+        if outcome.skippedCount > 0 { parts.append("\(outcome.skippedCount) skipped (media/binary/empty)") }
+        if outcome.truncatedCount > 0 { parts.append("\(outcome.truncatedCount) capped") }
+        parts.append("first \(ResponseBodySearch.byteCapDescription) per body")
+        return parts.joined(separator: " · ")
+    }
+
+    // MARK: Info line (states the cap + the scan summary)
+
+    private func refreshBodyInfoBar() {
+        let state = currentTabState
+        guard state.isBodySearchEnabled else {
+            bodyInfoBar = nil
+            if tableView?.tableHeaderView != nil { tableView.tableHeaderView = nil }
+            return
+        }
+
+        let bar: BodySearchInfoBar
+        if let existing = bodyInfoBar {
+            bar = existing
+        } else {
+            let created = BodySearchInfoBar()
+            created.onClear = { [weak self] in
+                guard let self = self else { return }
+                self.cancelActiveScan()
+                self.clearBodyResults(for: self.currentTabState)
+                self.applyFilter()
+                self.refreshBodyInfoBar()
+                self.tableView.reloadData()
+            }
+            bodyInfoBar = created
+            bar = created
+        }
+
+        if state.isShowingBodyResults {
+            bar.configure(
+                title: "BODY RESULTS · \u{201C}\(state.bodySearchQuery)\u{201D}",
+                detail: state.bodySearchSummary,
+                showsClear: true
+            )
+        } else {
+            bar.configure(
+                title: "BODY SEARCH ARMED",
+                detail: state.bodySearchSummary.isEmpty
+                    ? "Type a term, then tap Search / Return to scan. Each body is read once, first \(ResponseBodySearch.byteCapDescription) only; media and binary bodies are skipped. Request bodies are searched too."
+                    : state.bodySearchSummary,
+                showsClear: false
+            )
+        }
+
+        layoutBodyInfoBar()
+        if tableView.tableHeaderView !== bar { tableView.tableHeaderView = bar }
+    }
+
+    /// `tableHeaderView` is frame-driven, so measure the card against the table
+    /// width and re-assign whenever the size changes.
+    private func layoutBodyInfoBar() {
+        guard let bar = bodyInfoBar else { return }
+        let width = tableView.bounds.width > 0 ? tableView.bounds.width : view.bounds.width
+        guard width > 0 else { return }
+        let height = bar.systemLayoutSizeFitting(
+            CGSize(width: width, height: 0),
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel
+        ).height
+        let newFrame = CGRect(x: 0, y: 0, width: width, height: ceil(height))
+        guard bar.frame != newFrame else { return }
+        bar.frame = newFrame
+        if tableView.tableHeaderView === bar { tableView.tableHeaderView = bar }
+    }
+
+    // MARK: Progress banner
+
+    private func showScanBanner(total: Int) {
+        let banner = scanBanner ?? {
+            let created = BodySearchProgressBanner()
+            created.translatesAutoresizingMaskIntoConstraints = false
+            created.onCancel = { [weak self] in self?.cancelActiveScan() }
+            view.addSubview(created)
+            NSLayoutConstraint.activate([
+                created.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+                created.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+                created.bottomAnchor.constraint(
+                    equalTo: view.safeAreaLayoutGuide.bottomAnchor,
+                    constant: -(Self.followButtonSize + 20)
+                ),
+            ])
+            created.forceLTR()
+            scanBanner = created
+            return created
+        }()
+        view.bringSubviewToFront(banner)
+        banner.isHidden = false
+        banner.update(done: 0, total: total)
+    }
+
+    private func hideScanBanner() {
+        scanBanner?.isHidden = true
     }
 
     //MARK: - Grouped models
@@ -702,6 +985,16 @@ class NetworkViewController: UIViewController {
         deleteItem.tintColor = DebugTheme.accentColor
         navigationItem.rightBarButtonItems = [deleteItem]
 
+        // Paused-requests button — only visible while something is actually on
+        // hold at a breakpoint, so held requests are impossible to miss.
+        // (See BREAKPOINTS.)
+        NotificationCenter.default.addObserver(
+            forName: .breakpointsDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refreshBreakpointBadge()
+        }
+        refreshBreakpointBadge()
+
         // Search bar styling
         searchBar.searchBarStyle = .minimal
         searchBar.barTintColor = .clear
@@ -755,10 +1048,17 @@ class NetworkViewController: UIViewController {
 
         updateFilterButtonIcon()
         updateLayoutToggleIcon()
+        updateBodySearchButton()
 
         //notification
         NotificationCenter.default.addObserver(forName: .networkRequestCompleted, object: nil, queue: OperationQueue.main) { [weak self] _ in
             self?.reloadHttp()
+        }
+
+        // A clear wipes every transaction id the body-search results point at, so
+        // drop the parked results (the shared BodySearchCache clears itself too).
+        NotificationCenter.default.addObserver(forName: .allLogsCleared, object: nil, queue: OperationQueue.main) { [weak self] _ in
+            self?.discardAllBodyResults()
         }
 
         tableView.tableFooterView = UIView()
@@ -768,6 +1068,7 @@ class NetworkViewController: UIViewController {
         tableView.separatorStyle = .none
         tableView.register(NetworkCell.self, forCellReuseIdentifier: "NetworkCell")
         tableView.register(NetworkGroupCell.self, forCellReuseIdentifier: "NetworkGroupCell")
+        tableView.register(BodySearchMatchCell.self, forCellReuseIdentifier: "BodySearchMatchCell")
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 80
         tableView.estimatedSectionHeaderHeight = 0
@@ -784,6 +1085,7 @@ class NetworkViewController: UIViewController {
         setFollowButtonVisible(false, animated: false)
 
         reloadHttp()
+        refreshBodyInfoBar()
         view.forceLTR()
     }
 
@@ -843,6 +1145,17 @@ class NetworkViewController: UIViewController {
 
         let iconConfig = UIImage.SymbolConfiguration(pointSize: 16, weight: .medium)
 
+        // Body-search scope button (BODY-SEARCH). Off by default so plain typing
+        // stays index-only and instant.
+        bodySearchButton = UIButton(type: .system)
+        bodySearchButton.translatesAutoresizingMaskIntoConstraints = false
+        bodySearchButton.setImage(UIImage(systemName: "doc.text.magnifyingglass", withConfiguration: iconConfig), for: .normal)
+        bodySearchButton.tintColor = UIColor(white: 0.45, alpha: 1)
+        bodySearchButton.layer.cornerRadius = 8
+        bodySearchButton.layer.cornerCurve = .continuous
+        bodySearchButton.addTarget(self, action: #selector(didTapBodySearchToggle), for: .touchUpInside)
+        searchRow.addSubview(bodySearchButton)
+
         filterButton = UIButton(type: .system)
         filterButton.translatesAutoresizingMaskIntoConstraints = false
         filterButton.setImage(UIImage(systemName: "line.3.horizontal.decrease.circle", withConfiguration: iconConfig), for: .normal)
@@ -861,7 +1174,12 @@ class NetworkViewController: UIViewController {
             searchBar.topAnchor.constraint(equalTo: searchRow.topAnchor),
             searchBar.bottomAnchor.constraint(equalTo: searchRow.bottomAnchor),
             searchBar.leadingAnchor.constraint(equalTo: searchRow.leadingAnchor),
-            searchBar.trailingAnchor.constraint(equalTo: filterButton.leadingAnchor),
+            searchBar.trailingAnchor.constraint(equalTo: bodySearchButton.leadingAnchor),
+
+            bodySearchButton.centerYAnchor.constraint(equalTo: searchRow.centerYAnchor),
+            bodySearchButton.trailingAnchor.constraint(equalTo: filterButton.leadingAnchor, constant: -2),
+            bodySearchButton.widthAnchor.constraint(equalToConstant: 32),
+            bodySearchButton.heightAnchor.constraint(equalToConstant: 32),
 
             filterButton.centerYAnchor.constraint(equalTo: searchRow.centerYAnchor),
             filterButton.widthAnchor.constraint(equalToConstant: 34),
@@ -997,6 +1315,7 @@ class NetworkViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        layoutBodyInfoBar()
         if let header = floatingHeader {
             let topInset = header.frame.maxY + 8
             let bottomInset = view.safeAreaInsets.bottom + Self.followButtonSize + 12
@@ -1008,7 +1327,32 @@ class NetworkViewController: UIViewController {
     }
 
     deinit {
+        activeScanToken?.cancel()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    //MARK: - Breakpoints
+
+    /// Shows a "N paused" button in the nav bar while requests are held at a
+    /// breakpoint (the app is genuinely waiting on them), and hides it otherwise.
+    private func refreshBreakpointBadge() {
+        let count = BreakpointCenter.shared.count
+        guard count > 0 else {
+            navigationItem.rightBarButtonItems = [deleteItem]
+            return
+        }
+        let item = UIBarButtonItem(
+            title: "⏸ \(count)", style: .plain,
+            target: self, action: #selector(openPausedRequests))
+        item.tintColor = .systemOrange
+        item.setTitleTextAttributes([.font: UIFont.systemFont(ofSize: 14, weight: .bold)], for: .normal)
+        item.setTitleTextAttributes([.font: UIFont.systemFont(ofSize: 14, weight: .bold)], for: .highlighted)
+        navigationItem.rightBarButtonItems = [deleteItem, item]
+    }
+
+    @objc private func openPausedRequests() {
+        let inbox = BreakpointInboxViewController()
+        navigationController?.pushViewController(inbox, animated: true)
     }
 
     //MARK: - target action
@@ -1045,6 +1389,9 @@ class NetworkViewController: UIViewController {
         let oldState = currentTabState
         oldState.savedContentOffset = tableView.contentOffset
 
+        // A scan belongs to the tab it was started on — leaving the tab cancels it.
+        cancelActiveScan()
+
         currentTab = NetworkTab(rawValue: sender.selectedSegmentIndex) ?? .app
         NetworkViewController.savedTab = currentTab
         let newState = currentTabState
@@ -1052,6 +1399,8 @@ class NetworkViewController: UIViewController {
         searchBar.text = newState.searchText
         updateLayoutToggleIcon()
         updateFilterButtonIcon()
+        updateBodySearchButton()
+        refreshBodyInfoBar()
 
         // Hide filter/layout buttons on Pinned tab (not relevant there)
         let isPinned = currentTab == .pinned
@@ -1136,26 +1485,46 @@ class NetworkViewController: UIViewController {
 extension NetworkViewController: UISearchBarDelegate {
 
     func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
-        currentTabState.searchText = searchText
+        let state = currentTabState
+        state.searchText = searchText
+
+        // Typing never reads a body. It only invalidates parked results once the
+        // text no longer matches the query they were computed for.
+        var didDropResults = false
+        if state.isShowingBodyResults, searchText != state.bodySearchQuery {
+            cancelActiveScan()
+            clearBodyResults(for: state)
+            didDropResults = true
+        }
+
         if !searchText.isEmpty {
             isAutoFollowing = false
             setFollowButtonVisible(true, animated: true)
         }
         applyFilter()
+        if didDropResults { refreshBodyInfoBar() }
         tableView.reloadData()
     }
 
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
         searchBar.resignFirstResponder()
+        // Submitting is the *only* trigger for a body scan.
+        guard currentTabState.isBodySearchEnabled else { return }
+        let query = (searchBar.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        startBodySearch(query: query)
     }
 
     func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
         searchBar.text = ""
         currentTabState.searchText = ""
         searchBar.resignFirstResponder()
+        cancelActiveScan()
+        clearBodyResults(for: currentTabState)
         isAutoFollowing = true
         setFollowButtonVisible(false, animated: true)
         applyFilter()
+        refreshBodyInfoBar()
         tableView.reloadData()
     }
 }
@@ -1164,6 +1533,11 @@ extension NetworkViewController: UISearchBarDelegate {
 extension NetworkViewController: UITableViewDataSource {
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        if isShowingBodyResults {
+            let count = displayedMatches.count
+            naviItemTitleLabel?.text = "\u{1f50e}[\(count)]"
+            return count
+        }
         if currentTabState.isGroupedMode {
             let count = groupedModels.count
             naviItemTitleLabel?.text = "\u{1f680}[\(count)]"
@@ -1176,6 +1550,18 @@ extension NetworkViewController: UITableViewDataSource {
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        if isShowingBodyResults {
+            let cell = tableView.dequeueReusableCell(withIdentifier: "BodySearchMatchCell", for: indexPath) as! BodySearchMatchCell
+            guard let models = models,
+                  indexPath.row < models.count,
+                  indexPath.row < displayedMatches.count else { return cell }
+            cell.configure(
+                model: models[indexPath.row],
+                match: displayedMatches[indexPath.row],
+                rank: indexPath.row + 1
+            )
+            return cell
+        }
         if currentTabState.isGroupedMode {
             let cell = tableView.dequeueReusableCell(withIdentifier: "NetworkGroupCell", for: indexPath) as! NetworkGroupCell
             guard indexPath.row < groupedModels.count else { return cell }
@@ -1200,6 +1586,19 @@ extension NetworkViewController: UITableViewDelegate {
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
+
+        if isShowingBodyResults {
+            guard let models = models, indexPath.row < models.count else { return }
+            models[indexPath.row].isViewed = true
+            tableView.reloadRows(at: [indexPath], with: .none)
+
+            let vc = NetworkDetailViewController()
+            vc.httpModels = models
+            vc.httpModel = models[indexPath.row]
+            isShowingDetail = true
+            navigationController?.pushViewController(vc, animated: true)
+            return
+        }
 
         if currentTabState.isGroupedMode {
             guard indexPath.row < groupedModels.count else { return }
@@ -1288,5 +1687,377 @@ extension NetworkViewController: UIScrollViewDelegate {
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         if !isAutoFollowing && !decelerate { checkIfScrolledToBottom() }
+    }
+}
+
+//MARK: - Body search palette
+
+private enum BodySearchStyle {
+    static let cardBG = UIColor(white: 0.13, alpha: 1)
+    static let cardBorder = UIColor(white: 0.24, alpha: 1)
+    static let caption = UIColor(white: 0.45, alpha: 1)
+    static let value = UIColor(white: 0.85, alpha: 1)
+    static let snippet = UIColor(white: 0.74, alpha: 1)
+    static let requestBadge = UIColor(red: 0.60, green: 0.65, blue: 0.95, alpha: 1)
+}
+
+//MARK: - Body search info line (states the 2 MB cap + last-scan summary)
+
+/// Card shown as the list's `tableHeaderView` while body search is armed.
+/// Explains the scan rules before the first scan, and summarises the last scan
+/// afterwards (with a Clear button to drop the results).
+private final class BodySearchInfoBar: UIView {
+
+    var onClear: (() -> Void)?
+
+    private let card = UIView()
+    private let titleLabel = UILabel()
+    private let detailLabel = UILabel()
+    private let clearButton = UIButton(type: .system)
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setup()
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder); setup() }
+
+    private func setup() {
+        backgroundColor = .clear
+
+        card.backgroundColor = BodySearchStyle.cardBG
+        card.layer.cornerRadius = 12
+        card.layer.cornerCurve = .continuous
+        card.layer.borderWidth = 1
+        card.layer.borderColor = BodySearchStyle.cardBorder.cgColor
+        card.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(card)
+
+        titleLabel.font = .systemFont(ofSize: 10, weight: .heavy)
+        titleLabel.textColor = DebugTheme.accentColor
+        titleLabel.numberOfLines = 1
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        detailLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        detailLabel.textColor = BodySearchStyle.caption
+        detailLabel.numberOfLines = 0
+
+        clearButton.setImage(
+            UIImage(systemName: "xmark.circle.fill",
+                    withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)),
+            for: .normal
+        )
+        clearButton.tintColor = BodySearchStyle.caption
+        clearButton.setContentHuggingPriority(.required, for: .horizontal)
+        clearButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        clearButton.addTarget(self, action: #selector(clearTapped), for: .touchUpInside)
+
+        let titleRow = UIStackView(arrangedSubviews: [titleLabel, clearButton])
+        titleRow.axis = .horizontal
+        titleRow.alignment = .center
+        titleRow.spacing = 8
+
+        let stack = UIStackView(arrangedSubviews: [titleRow, detailLabel])
+        stack.axis = .vertical
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            card.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            card.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
+        ])
+
+        forceLTR()
+    }
+
+    func configure(title: String, detail: String, showsClear: Bool) {
+        titleLabel.text = title
+        detailLabel.text = detail
+        clearButton.isHidden = !showsClear
+    }
+
+    @objc private func clearTapped() { onClear?() }
+}
+
+//MARK: - Body search progress banner (determinate + cancellable)
+
+/// Floating card that reports "Scanning 42/210…" while a scan runs. It sits
+/// above the follow button and leaves the rest of the screen interactive, so the
+/// list stays scrollable and new captures keep landing while the scan works.
+private final class BodySearchProgressBanner: UIView {
+
+    var onCancel: (() -> Void)?
+
+    private let titleLabel = UILabel()
+    private let countLabel = UILabel()
+    private let progressView = UIProgressView(progressViewStyle: .default)
+    private let cancelButton = UIButton(type: .system)
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setup()
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder); setup() }
+
+    private func setup() {
+        backgroundColor = BodySearchStyle.cardBG
+        layer.cornerRadius = 14
+        layer.cornerCurve = .continuous
+        layer.borderWidth = 1
+        layer.borderColor = BodySearchStyle.cardBorder.cgColor
+
+        titleLabel.font = .systemFont(ofSize: 10, weight: .heavy)
+        titleLabel.textColor = BodySearchStyle.caption
+        titleLabel.text = "SCANNING BODIES"
+
+        cancelButton.setTitle("Cancel", for: .normal)
+        cancelButton.setTitleColor(.systemRed, for: .normal)
+        cancelButton.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
+        cancelButton.setContentHuggingPriority(.required, for: .horizontal)
+        cancelButton.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+
+        countLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        countLabel.textColor = BodySearchStyle.value
+
+        progressView.progressTintColor = DebugTheme.accentColor
+        progressView.trackTintColor = UIColor(white: 0.24, alpha: 1)
+
+        let topRow = UIStackView(arrangedSubviews: [titleLabel, UIView(), cancelButton])
+        topRow.axis = .horizontal
+        topRow.alignment = .center
+        topRow.spacing = 8
+
+        let stack = UIStackView(arrangedSubviews: [topRow, countLabel, progressView])
+        stack.axis = .vertical
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
+        ])
+
+        forceLTR()
+    }
+
+    func update(done: Int, total: Int) {
+        countLabel.text = "Scanning \(done)/\(total)\u{2026}"
+        progressView.progress = total > 0 ? Float(done) / Float(total) : 0
+    }
+
+    @objc private func cancelTapped() { onCancel?() }
+}
+
+//MARK: - Body search result row
+
+/// One body hit: request identity on top, then the snippet with the matched term
+/// highlighted in context.
+///
+/// Content is pinned with real constraints to **both** the top and the bottom of
+/// `contentView` (card → stack → labels), so the multi-line snippet drives the
+/// row height under `automaticDimension` instead of collapsing.
+private final class BodySearchMatchCell: UITableViewCell {
+
+    private let card = UIView()
+    private let statusLine = UIView()
+
+    private let rankLabel = UILabel()
+    private let methodLabel = UILabel()
+    private let sideBadge = BodySearchBadgeLabel()
+    private let occurrenceLabel = UILabel()
+    private let cappedBadge = BodySearchBadgeLabel()
+    private let statusLabel = UILabel()
+    private let urlLabel = UILabel()
+    private let snippetLabel = UILabel()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        setup()
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder); setup() }
+
+    private func setup() {
+        selectionStyle = .none
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+
+        card.backgroundColor = BodySearchStyle.cardBG
+        card.layer.cornerRadius = 12
+        card.layer.cornerCurve = .continuous
+        card.layer.borderWidth = 1
+        card.layer.borderColor = BodySearchStyle.cardBorder.cgColor
+        card.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(card)
+
+        statusLine.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(statusLine)
+
+        rankLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+        rankLabel.textColor = UIColor(white: 0.55, alpha: 1)
+        rankLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        methodLabel.font = .systemFont(ofSize: 11, weight: .bold)
+        methodLabel.textColor = UIColor(white: 0.55, alpha: 1)
+        methodLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        occurrenceLabel.font = .systemFont(ofSize: 10, weight: .heavy)
+        occurrenceLabel.textColor = BodySearchStyle.caption
+        occurrenceLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        statusLabel.font = .monospacedDigitSystemFont(ofSize: 14, weight: .bold)
+        statusLabel.textAlignment = .right
+        statusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let spacer = UIView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let topRow = UIStackView(arrangedSubviews: [
+            rankLabel, methodLabel, sideBadge, occurrenceLabel, cappedBadge, spacer, statusLabel,
+        ])
+        topRow.axis = .horizontal
+        topRow.alignment = .center
+        topRow.spacing = 6
+
+        urlLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        urlLabel.textColor = BodySearchStyle.value
+        urlLabel.numberOfLines = 2
+        urlLabel.lineBreakMode = .byTruncatingMiddle
+
+        snippetLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        snippetLabel.textColor = BodySearchStyle.snippet
+        snippetLabel.numberOfLines = 3
+        snippetLabel.lineBreakMode = .byTruncatingTail
+
+        let stack = UIStackView(arrangedSubviews: [topRow, urlLabel, snippetLabel])
+        stack.axis = .vertical
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+            card.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
+            card.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 4),
+            card.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -4),
+
+            statusLine.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            statusLine.topAnchor.constraint(equalTo: card.topAnchor),
+            statusLine.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            statusLine.widthAnchor.constraint(equalToConstant: 3),
+
+            stack.leadingAnchor.constraint(equalTo: statusLine.trailingAnchor, constant: 11),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
+        ])
+
+        forceLTR()
+    }
+
+    func configure(model: NetworkTransaction, match: BodySearchMatch, rank: Int) {
+        rankLabel.text = String(rank)
+        methodLabel.text = model.method.map { "[\($0)]" } ?? ""
+
+        let code = model.statusCode ?? "0"
+        let statusColor = NetworkCell.colorForStatusCode(code)
+        statusLabel.text = code == "0" ? "\u{274C}" : code
+        statusLabel.textColor = statusColor
+        statusLine.backgroundColor = statusColor
+
+        // Which side matched — the whole point of the badge.
+        switch match.side {
+        case .response:
+            sideBadge.apply(text: "RESPONSE", color: DebugTheme.accentColor)
+        case .request:
+            sideBadge.apply(text: "REQUEST", color: BodySearchStyle.requestBadge)
+        }
+
+        occurrenceLabel.text = match.occurrences > 1 ? "\(match.occurrences)\u{00D7}" : nil
+        occurrenceLabel.isHidden = match.occurrences <= 1
+
+        cappedBadge.isHidden = !match.isTruncatedScan
+        if match.isTruncatedScan {
+            cappedBadge.apply(text: "CAPPED", color: .systemOrange)
+        }
+
+        urlLabel.text = model.url?.absoluteString ?? ""
+        snippetLabel.attributedText = Self.highlighted(match: match)
+    }
+
+    /// Snippet with the matched term picked out in the accent color.
+    private static func highlighted(match: BodySearchMatch) -> NSAttributedString {
+        let text = NSMutableAttributedString(
+            string: match.snippet,
+            attributes: [
+                .font: UIFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: BodySearchStyle.snippet,
+            ]
+        )
+        let full = NSRange(location: 0, length: text.length)
+        let range = match.highlightRange
+        guard range.length > 0, NSIntersectionRange(range, full).length == range.length else {
+            return text
+        }
+        text.addAttributes([
+            .font: UIFont.monospacedSystemFont(ofSize: 11, weight: .bold),
+            .foregroundColor: DebugTheme.accentColor,
+            .backgroundColor: DebugTheme.accentColor.withAlphaComponent(0.18),
+        ], range: range)
+        return text
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        snippetLabel.attributedText = nil
+        occurrenceLabel.text = nil
+        cappedBadge.isHidden = true
+    }
+}
+
+//MARK: - Small pill label used by the result row
+
+private final class BodySearchBadgeLabel: UILabel {
+
+    private let insets = UIEdgeInsets(top: 2, left: 6, bottom: 2, right: 6)
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        font = .systemFont(ofSize: 9, weight: .heavy)
+        textAlignment = .center
+        layer.cornerRadius = 4
+        clipsToBounds = true
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    func apply(text: String, color: UIColor) {
+        self.text = text
+        textColor = color
+        backgroundColor = color.withAlphaComponent(0.20)
+        isHidden = false
+    }
+
+    override func drawText(in rect: CGRect) {
+        super.drawText(in: rect.inset(by: insets))
+    }
+
+    override var intrinsicContentSize: CGSize {
+        let size = super.intrinsicContentSize
+        return CGSize(width: ceil(size.width) + insets.left + insets.right,
+                      height: ceil(size.height) + insets.top + insets.bottom)
     }
 }

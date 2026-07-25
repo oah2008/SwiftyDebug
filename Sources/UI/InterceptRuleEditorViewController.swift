@@ -58,6 +58,8 @@ class InterceptRuleEditorViewController: UITableViewController {
     private var isBlocked = false
     private var redirectMode: RedirectMode = .none
     private var redirectTarget = ""
+    private var mock = MockResponse()
+    private var breakpointMode: BreakpointMode = .off
     private var headerItems: [EditItem] = []
     private var queryParamItems: [EditItem] = []
     private var existingRule: InterceptRule?
@@ -132,6 +134,8 @@ class InterceptRuleEditorViewController: UITableViewController {
             isBlocked = rule.isBlocked
             redirectMode = rule.redirectMode
             redirectTarget = rule.redirectTarget
+            mock = rule.mock
+            breakpointMode = rule.breakpointMode
             headerItems = rule.headerOverrides.map {
                 EditItem(key: $0.key, value: $0.value, isRemoving: false, isKeyEditable: false)
             }
@@ -221,6 +225,8 @@ class InterceptRuleEditorViewController: UITableViewController {
         rule.matchMode = matchMode
         rule.redirectMode = redirectMode
         rule.redirectTarget = redirectTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        rule.mock = mock
+        rule.breakpointMode = breakpointMode
 
         rule.headerOverrides = headerItems.filter { !$0.isRemoving && !$0.key.isEmpty }
             .map { KVPair(key: $0.key, value: $0.value) }
@@ -230,6 +236,8 @@ class InterceptRuleEditorViewController: UITableViewController {
         rule.removedQueryParamKeys = Set(queryParamItems.filter { $0.isRemoving && !$0.key.isEmpty }.map { $0.key })
 
         let hasEffect = rule.isBlocked
+            || rule.mock.isEnabled
+            || rule.breakpointMode != .off
             || rule.redirectMode != .none && !rule.redirectTarget.isEmpty
             || !rule.headerOverrides.isEmpty || !rule.removedHeaderKeys.isEmpty
             || !rule.queryParamOverrides.isEmpty || !rule.removedQueryParamKeys.isEmpty
@@ -318,6 +326,42 @@ class InterceptRuleEditorViewController: UITableViewController {
         } else {
             present(SwiftyDebugNavigationController(rootViewController: editor), animated: true)
         }
+    }
+
+    /// Mock editor — scenario presets plus a full JSON body editor. (See MOCK.)
+    private func presentMockEditor() {
+        // Offer the endpoint's real response as a starting point.
+        let currentBody = httpModel?.responseData?.dataToPrettyPrintString()
+        let editor = MockResponseEditorViewController(mock: mock, currentResponseText: currentBody)
+        editor.onSave = { [weak self] updated in
+            self?.mock = updated
+            self?.tableView.reloadData()
+        }
+        if let nav = navigationController {
+            nav.pushViewController(editor, animated: true)
+        } else {
+            present(SwiftyDebugNavigationController(rootViewController: editor), animated: true)
+        }
+    }
+
+    /// Breakpoint stage picker. Exactly one stage can be armed, so a request is
+    /// never paused twice. (See BREAKPOINTS.)
+    private func presentBreakpointPicker() {
+        let modes: [BreakpointMode] = [.off, .beforeSend, .afterResponse]
+        let options = modes.map { m in
+            OptionPickerSheetViewController.Option(
+                title: m.title, subtitle: m.detail,
+                symbol: m == .off ? "nosign" : (m == .beforeSend ? "arrow.up.circle" : "arrow.down.circle"),
+                tint: m == .off ? .white : .systemOrange
+            ) { [weak self] in
+                self?.breakpointMode = m
+                self?.tableView.reloadData()
+            }
+        }
+        OptionPickerSheetViewController.present(
+            from: self, title: "Breakpoint",
+            message: "Paused requests appear in the Paused inbox — the app waits until you release them.",
+            options: options, selectedIndex: modes.firstIndex(of: breakpointMode))
     }
 
     /// Full list of available headers/params in a searchable sheet.
@@ -421,7 +465,7 @@ class InterceptRuleEditorViewController: UITableViewController {
             if matchMode == .host { return 1 + selectedHosts.count }
             return 2
         case .action:
-            return existingRule != nil ? 3 : 2      // block, redirect (+ delete)
+            return existingRule != nil ? 5 : 4      // block, redirect, mock, breakpoint (+ delete)
         case .headers:
             return isBlocked ? 0 : headerItems.count + 1     // +1 = "Add header"
         case .availableHeaders:
@@ -563,6 +607,32 @@ class InterceptRuleEditorViewController: UITableViewController {
             c.detailTextLabel?.numberOfLines = 2
             c.accessoryType = .disclosureIndicator
             return c
+        case 2:
+            let c = plainCell("mock", style: .subtitle)
+            c.textLabel?.text = "Mock Response"
+            c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+            c.textLabel?.textColor = .white
+            c.detailTextLabel?.text = mock.isEnabled
+                ? "Returns \(mock.statusCode) without hitting the network"
+                : "Off — requests go to the real endpoint"
+            c.detailTextLabel?.font = .systemFont(ofSize: 11)
+            c.detailTextLabel?.textColor = mock.isEnabled ? DebugTheme.accentColor : UIColor(white: 0.45, alpha: 1)
+            c.detailTextLabel?.numberOfLines = 2
+            c.accessoryType = .disclosureIndicator
+            return c
+        case 3:
+            let c = plainCell("breakpoint", style: .subtitle)
+            c.textLabel?.text = "Breakpoint"
+            c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+            c.textLabel?.textColor = .white
+            c.detailTextLabel?.text = breakpointMode == .off
+                ? "Off — requests are never paused"
+                : breakpointMode.title + " · " + breakpointMode.detail
+            c.detailTextLabel?.font = .systemFont(ofSize: 11)
+            c.detailTextLabel?.textColor = breakpointMode == .off ? UIColor(white: 0.45, alpha: 1) : .systemOrange
+            c.detailTextLabel?.numberOfLines = 3
+            c.accessoryType = .disclosureIndicator
+            return c
         default:
             let c = plainCell("delete")
             c.textLabel?.text = "Delete Rule"
@@ -659,7 +729,9 @@ class InterceptRuleEditorViewController: UITableViewController {
             if matchMode == .host && ip.row == 0 { selectHostsTapped() }
         case .action:
             if ip.row == 1 { presentRedirectEditor() }
-            else if ip.row == 2 { removeRuleTapped() }
+            else if ip.row == 2 { presentMockEditor() }
+            else if ip.row == 3 { presentBreakpointPicker() }
+            else if ip.row == 4 { removeRuleTapped() }
         case .headers:
             if ip.row == headerItems.count { addHeader() }
         case .queryParams:

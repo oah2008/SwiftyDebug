@@ -245,6 +245,14 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
     /// The request after intercept rules have been applied (headers/query params modified).
     /// Used in stopLoading() so the UI reflects the actual request that was sent.
     private var interceptedRequest: URLRequest?
+    /// The composite rule matched for this request (mock / breakpoint / redirect).
+    private var resolvedRule: InterceptRule?
+    /// True when the response was served from a mock rather than the network.
+    private var isMocked = false
+    /// While an `.afterResponse` breakpoint is armed we buffer the response
+    /// instead of streaming it to the client, so the body can be edited first.
+    private var isHoldingResponse = false
+    private var heldResponse: URLResponse?
 
     // MARK: Recursive request flag
 
@@ -379,7 +387,8 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
 
         // --- Interception: check for matching intercept rules ---
         if let url = recursiveRequest.url {
-            if let rule = InterceptRuleStore.shared.resolvedRule(forURL: url) {
+            self.resolvedRule = InterceptRuleStore.shared.resolvedRule(forURL: url)
+            if let rule = self.resolvedRule {
                 if rule.isBlocked {
                     let error = NSError(
                         domain: NSURLErrorDomain,
@@ -451,14 +460,49 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
             return
         }
 
-        // Once everything is ready to go, create a data task with the new request.
+        // --- Mock response: answer locally, never touch the network. ---
+        if let mock = self.resolvedRule?.mock, mock.isEnabled {
+            deliverMock(mock, for: recursiveRequest as URLRequest)
+            return
+        }
+
+        // --- Breakpoint (before send): park the request for editing. ---
+        if self.resolvedRule?.breakpointMode == .beforeSend {
+            let paused = BreakpointCenter.PausedRequest(
+                stage: .beforeSend,
+                request: recursiveRequest as URLRequest,
+                resume: { [weak self] edited in
+                    // Continue with whatever the developer changed.
+                    self?.performOnThread(self?.clientThread, modes: self?.modes) {
+                        self?.sendUpstream(edited.request)
+                    }
+                },
+                abort: { [weak self] in
+                    guard let self else { return }
+                    self.performOnThread(self.clientThread, modes: self.modes) {
+                        self.client?.urlProtocol(self, didFailWithError: NSError(
+                            domain: NSURLErrorDomain, code: NSURLErrorCancelled,
+                            userInfo: [NSLocalizedDescriptionKey: "Aborted at breakpoint"]))
+                    }
+                }
+            )
+            BreakpointCenter.shared.park(paused)
+            return
+        }
+
+        sendUpstream(recursiveRequest as URLRequest)
+    }
+
+    /// Actually issues the (possibly breakpoint-edited) request upstream,
+    /// honoring the network-conditioner latency.
+    private func sendUpstream(_ request: URLRequest) {
         self._dataTask = type(of: self).sharedDemux().dataTask(
-            with: recursiveRequest as URLRequest,
+            with: request,
             delegate: self,
             modes: self.modes
         )
 
-        let latency = preset.addedLatency
+        let latency = Settings.shared.networkConditionerPreset.addedLatency
         if latency > 0 {
             // Defer resume (non-blocking) so the whole request is delayed by the
             // preset's simulated latency. Never sleep the client thread.
@@ -468,6 +512,41 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
             }
         } else {
             self._dataTask?.resume()
+        }
+    }
+
+    /// Synthesizes a response from a mock rule and hands it to the client without
+    /// any network access. (See MOCK.)
+    private func deliverMock(_ mock: MockResponse, for request: URLRequest) {
+        let body = mock.body.data(using: .utf8) ?? Data()
+        var headers: [String: String] = ["Content-Type": "application/json"]
+        for pair in mock.headers where !pair.key.isEmpty { headers[pair.key] = pair.value }
+        headers["Content-Length"] = "\(body.count)"
+
+        let url = request.url ?? URL(string: "https://swiftydebug.mock")!
+        let response = HTTPURLResponse(url: url, statusCode: mock.statusCode,
+                                       httpVersion: "HTTP/1.1", headerFields: headers)
+
+        // Record it so the mock shows up in the request list like a real call.
+        self.response = response
+        self.data = NSMutableData(data: body)
+        self.isMocked = true
+
+        let deliver = { [weak self] in
+            guard let self, let response else { return }
+            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if !body.isEmpty { self.client?.urlProtocol(self, didLoad: body) }
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
+
+        let delay = max(mock.delay, Settings.shared.networkConditionerPreset.addedLatency)
+        if delay > 0 {
+            let thread = self.clientThread, modes = self.modes
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.performOnThread(thread, modes: modes, block: deliver)
+            }
+        } else {
+            deliver()
         }
     }
 
@@ -942,6 +1021,17 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
             cacheStoragePolicy = .notAllowed
         }
 
+        // With an `.afterResponse` breakpoint armed we must not stream anything to
+        // the client yet — the body has to be editable first, so buffer the
+        // response and deliver it on resume. (See BREAKPOINTS.)
+        if self.resolvedRule?.breakpointMode == .afterResponse {
+            self.isHoldingResponse = true
+            self.heldResponse = response
+            self.response = response
+            completionHandler(.allow)
+            return
+        }
+
         self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: cacheStoragePolicy)
 
         self.response = response
@@ -952,8 +1042,11 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
     func urlSession(_ session: URLSession,
                     dataTask: URLSessionDataTask,
                     didReceive data: Data) {
-        // Just pass the call on to our client.
-        self.client?.urlProtocol(self, didLoad: data)
+        // While holding for an `.afterResponse` breakpoint, accumulate only —
+        // the client must not see any bytes until the developer releases it.
+        if !self.isHoldingResponse {
+            self.client?.urlProtocol(self, didLoad: data)
+        }
 
         // Only accumulate for SwiftyDebug's capture if under the size cap.
         // The client always receives the full, unmodified data above.
@@ -983,10 +1076,56 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
                     task: URLSessionTask,
                     didCompleteWithError error: Error?) {
         if let error = error {
+            // A failure releases any hold — nothing to edit.
+            self.isHoldingResponse = false
             self.client?.urlProtocol(self, didFailWithError: error)
             self.error = error
-        } else {
-            self.client?.urlProtocolDidFinishLoading(self)
+            return
         }
+
+        // `.afterResponse` breakpoint: park the buffered response for editing
+        // instead of finishing. The app stays waiting until it's released.
+        if self.isHoldingResponse {
+            let paused = BreakpointCenter.PausedRequest(
+                stage: .afterResponse,
+                request: self.interceptedRequest ?? self.request,
+                response: self.heldResponse as? HTTPURLResponse,
+                responseBody: self.data as Data?,
+                resume: { [weak self] edited in
+                    guard let self else { return }
+                    self.performOnThread(self.clientThread, modes: self.modes) {
+                        self.deliverHeldResponse(body: edited.responseBody ?? Data())
+                    }
+                },
+                abort: { [weak self] in
+                    guard let self else { return }
+                    self.performOnThread(self.clientThread, modes: self.modes) {
+                        self.isHoldingResponse = false
+                        self.client?.urlProtocol(self, didFailWithError: NSError(
+                            domain: NSURLErrorDomain, code: NSURLErrorCancelled,
+                            userInfo: [NSLocalizedDescriptionKey: "Aborted at breakpoint"]))
+                    }
+                }
+            )
+            BreakpointCenter.shared.park(paused)
+            return
+        }
+
+        self.client?.urlProtocolDidFinishLoading(self)
+    }
+
+    /// Delivers the (possibly edited) buffered response to the app.
+    private func deliverHeldResponse(body: Data) {
+        isHoldingResponse = false
+        guard let response = heldResponse else {
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        // Keep what the UI shows in sync with what the app actually received.
+        self.data = NSMutableData(data: body)
+
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        if !body.isEmpty { client?.urlProtocol(self, didLoad: body) }
+        client?.urlProtocolDidFinishLoading(self)
     }
 }

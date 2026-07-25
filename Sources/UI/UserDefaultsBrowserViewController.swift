@@ -7,6 +7,306 @@
 
 import UIKit
 
+// MARK: - Data decoding
+
+/// Which decoder won when a raw `Data` blob was parsed. Shown as a pill next to
+/// the value so it's obvious *what* is being rendered (and what an edit will be
+/// re-encoded back into).
+enum DataRepresentation: String {
+    case json    = "JSON"
+    case plist   = "PLIST"
+    case archive = "ARCHIVE"
+    case text    = "TEXT"
+    case binary  = "BINARY"
+
+    var color: UIColor {
+        switch self {
+        case .json:    return UIColor(red: 0.42, green: 0.78, blue: 0.98, alpha: 1)
+        case .plist:   return UIColor(red: 0.72, green: 0.68, blue: 0.98, alpha: 1)
+        case .archive: return UIColor(red: 0.96, green: 0.68, blue: 0.42, alpha: 1)
+        case .text:    return UIColor(red: 0.55, green: 0.86, blue: 0.52, alpha: 1)
+        case .binary:  return UIColor(white: 0.62, alpha: 1)
+        }
+    }
+
+    /// Only representations that can be re-encoded from edited text round-trip.
+    /// An archive graph and an opaque blob cannot, so they stay read-only.
+    var isEditable: Bool {
+        switch self {
+        case .json, .plist, .text: return true
+        case .archive, .binary:    return false
+        }
+    }
+
+    var editHint: String {
+        switch self {
+        case .json:    return "Edited text is parsed as JSON and written back as JSON Data."
+        case .plist:   return "Edited text is parsed and written back as property-list Data in its original format."
+        case .text:    return "Edited text is written back as UTF-8 Data."
+        case .archive: return "NSKeyedArchiver payloads are shown decoded but can't be re-encoded from text — read-only."
+        case .binary:  return "Opaque bytes — shown as a hex preview, read-only."
+        }
+    }
+}
+
+/// The result of progressively decoding a `Data` value: what it turned out to
+/// be, the text to show/edit, and enough context to re-encode an edit into the
+/// *same* representation.
+struct DecodedDataValue {
+
+    let data: Data
+    let representation: DataRepresentation
+    /// The text rendered in the inspector (and edited, when editable).
+    let text: String
+    /// The property-list format the blob was stored in (`.plist` only).
+    let plistFormat: PropertyListSerialization.PropertyListFormat
+    /// `true` when a `.plist` is rendered as XML plist text rather than JSON —
+    /// it held dates/data that JSON cannot carry losslessly.
+    let plistRendersAsXML: Bool
+
+    var isEditable: Bool { representation.isEditable }
+
+    var byteCountText: String { "\(data.count) byte\(data.count == 1 ? "" : "s")" }
+
+    /// Compact one-line summary for a collapsed row.
+    var previewText: String {
+        let firstLine = text.split(separator: "\n", maxSplits: 1,
+                                   omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return byteCountText }
+        let clipped = trimmed.count > 120 ? String(trimmed.prefix(120)) + "…" : trimmed
+        return "\(clipped)  ·  \(byteCountText)"
+    }
+}
+
+/// Progressive `Data` decoding shared by the UserDefaults and Keychain
+/// inspectors, plus the matching re-encoder used when an edit is saved.
+enum DataValueDecoder {
+
+    // MARK: Decoding
+
+    /// Tries, in order: JSON → property list → keyed archive → UTF-8 text →
+    /// hex preview. Stops at the first success.
+    static func decode(_ data: Data) -> DecodedDataValue {
+        guard !data.isEmpty else {
+            return DecodedDataValue(data: data, representation: .text, text: "",
+                                    plistFormat: .binary, plistRendersAsXML: false)
+        }
+
+        // 1 — JSON. Only containers count: a bare `42` is text, not a document.
+        if let object = try? JSONSerialization.jsonObject(with: data, options: []),
+           JSONSerialization.isValidJSONObject(object),
+           let pretty = prettyJSON(object) {
+            return DecodedDataValue(data: data, representation: .json, text: pretty,
+                                    plistFormat: .binary, plistRendersAsXML: false)
+        }
+
+        // 2 — property list, binary or XML. A keyed archive is *also* a binary
+        // plist, so archive-shaped payloads are handed to step 3 first and only
+        // fall back to a plist rendering when unarchiving fails.
+        //
+        // Only *containers* count. `PropertyListSerialization` still reads the
+        // old OpenStep format, in which any bare token — a bearer token, a UUID,
+        // "42" — parses as a valid top-level string. Treating those as plists
+        // would both mislabel them and, far worse, rewrite a plain secret as an
+        // XML plist blob on save. They belong to the UTF-8 step below.
+        var format = PropertyListSerialization.PropertyListFormat.binary
+        let parsed = try? PropertyListSerialization.propertyList(from: data, options: [], format: &format)
+        let plist = parsed.flatMap { isPlistContainer($0) ? $0 : nil }
+        if let plist, !isKeyedArchive(plist) {
+            return plistValue(data, plist: plist, format: format)
+        }
+
+        // 3 — NSKeyedArchiver payload (secure coding off: this is a debug tool
+        // and the point is to see whatever the app actually stored).
+        if let object = unarchiveTopLevel(data) {
+            return DecodedDataValue(data: data, representation: .archive,
+                                    text: describeArchived(object),
+                                    plistFormat: format, plistRendersAsXML: false)
+        }
+        if let plist {
+            return plistValue(data, plist: plist, format: format)
+        }
+
+        // 4 — UTF-8 text.
+        if let text = String(data: data, encoding: .utf8), isPrintable(text) {
+            return DecodedDataValue(data: data, representation: .text, text: text,
+                                    plistFormat: .binary, plistRendersAsXML: false)
+        }
+
+        // 5 — opaque bytes.
+        return DecodedDataValue(data: data, representation: .binary, text: hexDump(data),
+                                plistFormat: .binary, plistRendersAsXML: false)
+    }
+
+    private static func plistValue(_ data: Data,
+                                   plist: Any,
+                                   format: PropertyListSerialization.PropertyListFormat) -> DecodedDataValue {
+        // OpenStep is a read-only format — writing it back would throw, so an
+        // edit of one is re-encoded as XML.
+        let writeFormat: PropertyListSerialization.PropertyListFormat = (format == .openStep) ? .xml : format
+
+        // JSON-shaped plists render (and round-trip) as JSON. Anything carrying
+        // dates or nested data renders as XML plist text so nothing is lost.
+        if JSONSerialization.isValidJSONObject(plist), let pretty = prettyJSON(plist) {
+            return DecodedDataValue(data: data, representation: .plist, text: pretty,
+                                    plistFormat: writeFormat, plistRendersAsXML: false)
+        }
+        if let xml = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0),
+           let text = String(data: xml, encoding: .utf8) {
+            return DecodedDataValue(data: data, representation: .plist, text: text,
+                                    plistFormat: writeFormat, plistRendersAsXML: true)
+        }
+        return DecodedDataValue(data: data, representation: .plist, text: String(describing: plist),
+                                plistFormat: writeFormat, plistRendersAsXML: true)
+    }
+
+    /// `true` for a top-level plist container. Scalars are deliberately excluded
+    /// — see the OpenStep note in `decode`.
+    private static func isPlistContainer(_ plist: Any) -> Bool {
+        plist is NSDictionary || plist is NSArray
+    }
+
+    // MARK: Re-encoding
+
+    enum EncodeError: Error {
+        case notEditable(DataRepresentation)
+        case invalid(String)
+
+        var message: String {
+            switch self {
+            case .notEditable(let representation):
+                return "\(representation.rawValue) values can't be re-encoded from text."
+            case .invalid(let reason):
+                return reason
+            }
+        }
+    }
+
+    /// Re-encodes `text` into the **same representation** `decoded` came from,
+    /// so a `Data` default/secret is never silently rewritten as a String.
+    static func encode(_ text: String, like decoded: DecodedDataValue) throws -> Data {
+        switch decoded.representation {
+        case .json:
+            let object = try jsonObject(from: text)
+            do {
+                return try JSONSerialization.data(withJSONObject: object, options: [])
+            } catch {
+                throw EncodeError.invalid("Couldn't re-encode as JSON: \(error.localizedDescription)")
+            }
+
+        case .plist:
+            let object: Any
+            if decoded.plistRendersAsXML {
+                var format = PropertyListSerialization.PropertyListFormat.xml
+                guard let parsed = try? PropertyListSerialization.propertyList(
+                    from: Data(text.utf8), options: [], format: &format) else {
+                    throw EncodeError.invalid("That isn't a valid property list. Keep the <plist> XML structure intact.")
+                }
+                object = parsed
+            } else {
+                object = try jsonObject(from: text)
+            }
+            do {
+                return try PropertyListSerialization.data(fromPropertyList: object,
+                                                          format: decoded.plistFormat, options: 0)
+            } catch {
+                throw EncodeError.invalid("Couldn't re-encode as a property list: \(error.localizedDescription)")
+            }
+
+        case .text:
+            return Data(text.utf8)
+
+        case .archive, .binary:
+            throw EncodeError.notEditable(decoded.representation)
+        }
+    }
+
+    private static func jsonObject(from text: String) throws -> Any {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw EncodeError.invalid("The value is empty — enter a JSON object or array.")
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8), options: []),
+              JSONSerialization.isValidJSONObject(object) else {
+            throw EncodeError.invalid("That isn't valid JSON. Check for a trailing comma, an unquoted key or a missing brace.")
+        }
+        return object
+    }
+
+    // MARK: Helpers
+
+    static func prettyJSON(_ object: Any) -> String? {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object,
+                                                     options: [.prettyPrinted, .sortedKeys]) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// `true` when a decoded plist is really an `NSKeyedArchiver` payload.
+    private static func isKeyedArchive(_ plist: Any) -> Bool {
+        guard let dictionary = plist as? [String: Any] else { return false }
+        return dictionary["$archiver"] != nil || dictionary["$objects"] != nil
+    }
+
+    /// Top-level unarchive with **secure coding off** — that is the point of a
+    /// debug inspector: whatever class graph the app archived should be
+    /// readable. `.setErrorAndReturn` keeps a malformed archive from raising an
+    /// Objective-C exception (which Swift cannot catch) instead of returning nil.
+    private static func unarchiveTopLevel(_ data: Data) -> Any? {
+        guard let unarchiver = try? NSKeyedUnarchiver(forReadingFrom: data) else { return nil }
+        unarchiver.requiresSecureCoding = false
+        unarchiver.decodingFailurePolicy = .setErrorAndReturn
+        defer { unarchiver.finishDecoding() }
+        guard let object = unarchiver.decodeObject(forKey: NSKeyedArchiveRootObjectKey),
+              unarchiver.error == nil else { return nil }
+        return object
+    }
+
+    /// Human-readable dump of an unarchived object graph.
+    static func describeArchived(_ object: Any) -> String {
+        let typeName = String(describing: type(of: object))
+        if let plistLike = object as? NSObject,
+           JSONSerialization.isValidJSONObject(plistLike),
+           let pretty = prettyJSON(plistLike) {
+            return "\(typeName)\n\n\(pretty)"
+        }
+        switch object {
+        case let array as [Any]:
+            let body = array.enumerated()
+                .map { "[\($0.offset)] \(String(describing: $0.element))" }
+                .joined(separator: "\n")
+            return "\(typeName) · \(array.count) element\(array.count == 1 ? "" : "s")\n\n\(body)"
+        case let dictionary as [AnyHashable: Any]:
+            let body = dictionary
+                .map { "\(String(describing: $0.key)) = \(String(describing: $0.value))" }
+                .sorted()
+                .joined(separator: "\n")
+            return "\(typeName) · \(dictionary.count) key\(dictionary.count == 1 ? "" : "s")\n\n\(body)"
+        default:
+            return "\(typeName)\n\n\(String(describing: object))"
+        }
+    }
+
+    /// `true` when a decoded string is safe to show as text (no stray controls).
+    static func isPrintable(_ string: String) -> Bool {
+        for scalar in string.unicodeScalars {
+            if scalar.value == 9 || scalar.value == 10 || scalar.value == 13 { continue }
+            if scalar.value < 32 || scalar.value == 127 { return false }
+        }
+        return true
+    }
+
+    /// Byte count plus a hex preview of the leading bytes.
+    static func hexDump(_ data: Data, limit: Int = 512) -> String {
+        let hex = data.prefix(limit)
+            .map { String(format: "%02X", $0) }
+            .joined(separator: " ")
+        let suffix = data.count > limit ? " …" : ""
+        return "\(data.count) byte\(data.count == 1 ? "" : "s")\n\n\(hex)\(suffix)"
+    }
+}
+
 // MARK: - Model
 
 /// One `UserDefaults.standard` entry, with its detected storage type.
@@ -14,6 +314,23 @@ private struct UserDefaultsEntry {
     let key: String
     let value: Any
     let type: UserDefaultsValueType
+    /// Non-nil exactly when `type == .data` — what the blob decoded into.
+    let decoded: DecodedDataValue?
+
+    init(key: String, value: Any) {
+        self.key = key
+        self.value = value
+        let type = UserDefaultsValueType.detect(value)
+        self.type = type
+        self.decoded = (type == .data) ? DataValueDecoder.decode((value as? Data) ?? Data()) : nil
+    }
+
+    /// Data rows are editable when their decoded form can be re-encoded; the
+    /// scalar rows follow the type's own rule.
+    var isEditable: Bool {
+        if type == .data { return decoded?.isEditable ?? false }
+        return type.isEditable
+    }
 }
 
 /// The concrete type a defaults value round-trips as. Editing must write the
@@ -35,7 +352,9 @@ private enum UserDefaultsValueType {
         }
     }
 
-    /// Only scalars can be safely re-typed from a single text field.
+    /// Only scalars can be safely re-typed from a single text field. `.data` is
+    /// decided per-entry (see `UserDefaultsEntry.isEditable`) because it depends
+    /// on what the blob decoded into — always use the entry's flag in the UI.
     var isEditable: Bool {
         switch self {
         case .string, .int, .double, .bool, .url: return true
@@ -96,8 +415,10 @@ private enum UserDefaultsValueType {
 /// blocklist to guess what belongs to the app.
 ///
 /// Tapping a scalar row expands it into an inline `KeyValueCardCell` that writes
-/// back with the original type. Containers (Array/Dictionary/Data/Date) expand
-/// read-only, pretty-printed as JSON where possible.
+/// back with the original type. A `Data` row expands into `UserDefaultsDataCell`,
+/// which shows the blob decoded (JSON → property list → keyed archive → UTF-8 →
+/// hex) and writes an edit back **as Data** in the same representation. The
+/// remaining containers (Array/Dictionary/Date) expand read-only.
 final class UserDefaultsBrowserViewController: UITableViewController {
 
     // MARK: State
@@ -145,6 +466,10 @@ final class UserDefaultsBrowserViewController: UITableViewController {
 
     // MARK: Lifecycle
 
+    /// `navigationItem.searchController` is installed exactly once, from
+    /// `viewWillAppear`. See the comment there.
+    private var hasInstalledSearchController = false
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
@@ -162,7 +487,8 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         ]
         navigationItem.rightBarButtonItems?.forEach { $0.tintColor = DebugTheme.accentColor }
 
-        // Search
+        // Search bar *appearance* is safe to configure here; attaching it to the
+        // navigation item is not — see `installSearchControllerIfNeeded()`.
         searchController.searchResultsUpdater = self
         searchController.obscuresBackgroundDuringPresentation = false
         searchController.searchBar.placeholder = "Filter by key"
@@ -173,13 +499,12 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         searchController.searchBar.autocorrectionType = .no
         searchController.searchBar.searchTextField.textColor = .white
         searchController.searchBar.searchTextField.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
-        navigationItem.searchController = searchController
-        navigationItem.hidesSearchBarWhenScrolling = false
-        definesPresentationContext = true
 
         tableView.register(KeyValueCardCell.self, forCellReuseIdentifier: "Card")
         tableView.register(UserDefaultsRowCell.self, forCellReuseIdentifier: UserDefaultsRowCell.reuseID)
         tableView.register(UserDefaultsReadOnlyCell.self, forCellReuseIdentifier: UserDefaultsReadOnlyCell.reuseID)
+        tableView.register(UserDefaultsDataCell.self, forCellReuseIdentifier: UserDefaultsDataCell.reuseID)
+        tableView.register(UserDefaultsMessageCell.self, forCellReuseIdentifier: UserDefaultsMessageCell.reuseID)
         tableView.backgroundColor = .black
         tableView.separatorStyle = .none
         tableView.rowHeight = UITableView.automaticDimension
@@ -211,7 +536,23 @@ final class UserDefaultsBrowserViewController: UITableViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        installSearchControllerIfNeeded()
         reload()
+    }
+
+    /// Attaching a `UISearchController` to the navigation item pulls the search
+    /// bar into the navigation *bar*, so it is only valid once this controller
+    /// actually has one. The presenter force-loads the view (`_ = vc.view`)
+    /// before wrapping it in a `UINavigationController`, which means
+    /// `viewDidLoad` runs with `navigationController == nil` — doing it there
+    /// leaves UIKit installing the search bar into a bar that doesn't exist yet.
+    /// `viewWillAppear` is the first point where the hierarchy is guaranteed.
+    private func installSearchControllerIfNeeded() {
+        guard !hasInstalledSearchController, navigationController != nil else { return }
+        hasInstalledSearchController = true
+        definesPresentationContext = true
+        navigationItem.hidesSearchBarWhenScrolling = false
+        navigationItem.searchController = searchController
     }
 
     // MARK: Loading
@@ -221,8 +562,7 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         let domain = Self.appDomain() ?? [:]
         domainCount = domain.count
 
-        var rows = domain
-            .map { UserDefaultsEntry(key: $0.key, value: $0.value, type: UserDefaultsValueType.detect($0.value)) }
+        var rows = domain.map { UserDefaultsEntry(key: $0.key, value: $0.value) }
 
         if !searchText.isEmpty {
             rows = rows.filter { $0.key.range(of: searchText, options: .caseInsensitive) != nil }
@@ -360,7 +700,24 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         case .string, .url:
             // URLs live in defaults as strings — keep them strings.
             defaults.set(text, forKey: entry.key)
-        case .data, .array, .dictionary, .date:
+        case .data:
+            // A Data default must stay a Data default: re-encode the edited text
+            // into the representation it was decoded from and write *that*.
+            guard let decoded = entry.decoded else {
+                return .invalid("This value could not be decoded, so it can't be written back.")
+            }
+            guard decoded.isEditable else {
+                return .invalid(decoded.representation.editHint)
+            }
+            do {
+                let encoded = try DataValueDecoder.encode(text, like: decoded)
+                defaults.set(encoded, forKey: entry.key)
+            } catch let error as DataValueDecoder.EncodeError {
+                return .invalid(error.message)
+            } catch {
+                return .invalid(error.localizedDescription)
+            }
+        case .array, .dictionary, .date:
             return .invalid("\(entry.type.title) values are read-only here.")
         }
         return .written
@@ -380,6 +737,8 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         case .url:
             if let url = entry.value as? URL { return url.absoluteString }
             return entry.value as? String ?? String(describing: entry.value)
+        case .data:
+            return entry.decoded?.text ?? ""
         default:
             return Self.previewString(for: entry)
         }
@@ -395,8 +754,7 @@ final class UserDefaultsBrowserViewController: UITableViewController {
             guard let date = entry.value as? Date else { return String(describing: entry.value) }
             return dateFormatter.string(from: date)
         case .data:
-            let data = entry.value as? Data ?? Data()
-            return "\(data.count) byte\(data.count == 1 ? "" : "s")"
+            return entry.decoded?.previewText ?? "0 bytes"
         case .array:
             let count = (entry.value as? NSArray)?.count ?? 0
             return "\(count) item\(count == 1 ? "" : "s")"
@@ -415,11 +773,7 @@ final class UserDefaultsBrowserViewController: UITableViewController {
                 + "\n" + isoFormatter.string(from: date)
                 + "\nepoch \(date.timeIntervalSince1970)"
         case .data:
-            let data = entry.value as? Data ?? Data()
-            if let json = JSONExporter.prettyJSONString(from: data) { return json }
-            if let text = String(data: data, encoding: .utf8), !text.isEmpty { return text }
-            let hex = data.prefix(256).map { String(format: "%02x", $0) }.joined(separator: " ")
-            return "\(data.count) bytes\n\(hex)\(data.count > 256 ? " …" : "")"
+            return entry.decoded?.text ?? ""
         case .array, .dictionary:
             let safe = jsonSafe(entry.value)
             if JSONSerialization.isValidJSONObject(safe),
@@ -442,14 +796,27 @@ final class UserDefaultsBrowserViewController: UITableViewController {
     }
 
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        guard !entries.isEmpty else { return emptyCell() }
+        // `numberOfRowsInSection` reports `max(count, 1)` so the empty state has
+        // a row to live in — every accessor below must therefore range-check
+        // before touching `entries`, not just test for emptiness.
+        guard entries.indices.contains(indexPath.row) else {
+            return emptyCell(for: indexPath)
+        }
 
         let entry = entries[indexPath.row]
         let isExpanded = entry.key == expandedKey
 
-        // Expanded + editable → the shared inline editor card.
+        // Expanded + Data → the multi-line decoder/editor card.
+        if isExpanded, entry.type == .data {
+            return dataCell(for: entry, at: indexPath)
+        }
+
+        // Expanded + editable scalar → the shared inline editor card.
         if isExpanded && entry.type.isEditable {
-            let cell = tableView.dequeueReusableCell(withIdentifier: "Card", for: indexPath) as! KeyValueCardCell
+            guard let cell = tableView.dequeueReusableCell(
+                withIdentifier: "Card", for: indexPath) as? KeyValueCardCell else {
+                return emptyCell(for: indexPath)
+            }
             cell.showsModeControl = false
             // Renaming a defaults key would mean delete+recreate; keys are locked.
             cell.configure(key: entry.key, value: Self.editableString(for: entry),
@@ -467,8 +834,11 @@ final class UserDefaultsBrowserViewController: UITableViewController {
 
         // Expanded + container → read-only pretty print.
         if isExpanded {
-            let cell = tableView.dequeueReusableCell(
-                withIdentifier: UserDefaultsReadOnlyCell.reuseID, for: indexPath) as! UserDefaultsReadOnlyCell
+            guard let cell = tableView.dequeueReusableCell(
+                withIdentifier: UserDefaultsReadOnlyCell.reuseID,
+                for: indexPath) as? UserDefaultsReadOnlyCell else {
+                return emptyCell(for: indexPath)
+            }
             let body = Self.readOnlyBody(for: entry)
             cell.configure(key: entry.key, type: entry.type, body: body)
             cell.onCopy = { [weak self] in
@@ -478,36 +848,89 @@ final class UserDefaultsBrowserViewController: UITableViewController {
             return cell
         }
 
-        let cell = tableView.dequeueReusableCell(
-            withIdentifier: UserDefaultsRowCell.reuseID, for: indexPath) as! UserDefaultsRowCell
-        cell.configure(key: entry.key, type: entry.type, preview: Self.previewString(for: entry))
+        guard let cell = tableView.dequeueReusableCell(
+            withIdentifier: UserDefaultsRowCell.reuseID, for: indexPath) as? UserDefaultsRowCell else {
+            return emptyCell(for: indexPath)
+        }
+        cell.configure(key: entry.key,
+                       type: entry.type,
+                       representation: entry.decoded?.representation,
+                       editable: entry.isEditable,
+                       preview: Self.previewString(for: entry))
         return cell
     }
 
-    private func emptyCell() -> UITableViewCell {
-        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "empty")
-        cell.backgroundColor = .clear
-        cell.contentView.backgroundColor = .clear
-        cell.selectionStyle = .none
-        cell.textLabel?.text = searchText.isEmpty ? "No defaults" : "No key matches “\(searchText)”"
-        cell.textLabel?.textColor = UIColor(white: 0.5, alpha: 1)
-        cell.textLabel?.font = .systemFont(ofSize: 15, weight: .medium)
-        cell.textLabel?.textAlignment = .center
-        cell.textLabel?.numberOfLines = 0
-        cell.detailTextLabel?.text = searchText.isEmpty
-            ? "This app hasn't persisted any defaults yet. Tap + to add a key."
-            : "Clear the search to see every key this app stores."
-        cell.detailTextLabel?.textColor = UIColor(white: 0.35, alpha: 1)
-        cell.detailTextLabel?.font = .systemFont(ofSize: 12)
-        cell.detailTextLabel?.textAlignment = .center
-        cell.detailTextLabel?.numberOfLines = 0
-        cell.forceLTR()
+    /// The expanded Data card: decoded text, the winning representation, and an
+    /// editor that re-encodes back into that same representation.
+    private func dataCell(for entry: UserDefaultsEntry, at indexPath: IndexPath) -> UITableViewCell {
+        guard let cell = tableView.dequeueReusableCell(
+            withIdentifier: UserDefaultsDataCell.reuseID, for: indexPath) as? UserDefaultsDataCell else {
+            return emptyCell(for: indexPath)
+        }
+        let decoded = entry.decoded ?? DataValueDecoder.decode(Data())
+        cell.configure(key: entry.key, decoded: decoded, editable: entry.isEditable)
+
+        // The *key* travels in the closures, never the index path: rows shift
+        // whenever the search text or the domain changes, and a captured
+        // IndexPath would be stale by the time the button is tapped.
+        let key = entry.key
+        cell.onCopy = { [weak self] text in
+            UIPasteboard.general.string = text
+            self?.showToast("Copied value")
+        }
+        // `cell` is captured weakly: it owns this closure, so a strong capture
+        // would be a retain cycle that outlives every reload.
+        cell.onSave = { [weak self, weak cell] text in
+            guard let self, let cell else { return }
+            self.saveData(text: text, forKey: key, from: cell)
+        }
+        return cell
+    }
+
+    /// Writes an edited Data value back, re-encoded as Data. Failure is reported
+    /// inline on the card and nothing is written.
+    private func saveData(text: String, forKey key: String, from cell: UserDefaultsDataCell) {
+        guard let entry = entry(forKey: key) else {
+            cell.showError("“\(key)” is no longer in this app's defaults.")
+            return
+        }
+        switch commit(text: text, to: entry) {
+        case .unchanged:
+            cell.clearError()
+            showToast("No change")
+        case .written:
+            cell.clearError()
+            view.endEditing(true)
+            reload()
+            showToast("Saved “\(key)” as Data")
+        case .invalid(let reason):
+            cell.showError(reason)
+        }
+    }
+
+    /// Self-sizing empty/placeholder card. Deliberately **not** a stock
+    /// `UITableViewCell` — its `textLabel`/`detailTextLabel` don't self-size
+    /// with `numberOfLines = 0`.
+    private func emptyCell(for indexPath: IndexPath) -> UITableViewCell {
+        guard let cell = tableView.dequeueReusableCell(
+            withIdentifier: UserDefaultsMessageCell.reuseID, for: indexPath) as? UserDefaultsMessageCell else {
+            let fallback = UITableViewCell(style: .default, reuseIdentifier: nil)
+            fallback.backgroundColor = .clear
+            fallback.contentView.backgroundColor = .clear
+            fallback.selectionStyle = .none
+            return fallback
+        }
+        cell.configure(
+            title: searchText.isEmpty ? "No defaults" : "No key matches “\(searchText)”",
+            body: searchText.isEmpty
+                ? "This app hasn't persisted any defaults yet. Tap + to add a key."
+                : "Clear the search to see every key this app stores.")
         return cell
     }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        guard !entries.isEmpty, indexPath.row < entries.count else { return }
+        guard entries.indices.contains(indexPath.row) else { return }
         // Flush any in-flight edit before the cell goes away.
         view.endEditing(true)
 
@@ -515,27 +938,31 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         expandedKey = (expandedKey == key) ? nil : key
         tableView.reloadData()
 
+        // Re-derive the row after the reload: `entries` may have been rebuilt.
         guard expandedKey != nil,
               let row = entries.firstIndex(where: { $0.key == key }) else { return }
         let target = IndexPath(row: row, section: 0)
         tableView.scrollToRow(at: target, at: .middle, animated: true)
-        if entries[row].type.isEditable {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                (self?.tableView.cellForRow(at: target) as? KeyValueCardCell)?.valueField.becomeFirstResponder()
-            }
+        // Only the single-line scalar editor auto-focuses; the Data editor is a
+        // text view the user opens deliberately.
+        guard entries[row].type != .data, entries[row].isEditable else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.entries.indices.contains(target.row),
+                  self.entries[target.row].key == key else { return }
+            (self.tableView.cellForRow(at: target) as? KeyValueCardCell)?.valueField.becomeFirstResponder()
         }
     }
 
     // MARK: Delete
 
     override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
-        !entries.isEmpty && indexPath.row < entries.count
+        entries.indices.contains(indexPath.row)
     }
 
     override func tableView(_ tableView: UITableView,
                             trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath)
     -> UISwipeActionsConfiguration? {
-        guard !entries.isEmpty, indexPath.row < entries.count else { return nil }
+        guard entries.indices.contains(indexPath.row) else { return nil }
         let key = entries[indexPath.row].key
         let delete = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, done in
             self?.confirmDelete(key: key, completion: done)
@@ -565,7 +992,7 @@ final class UserDefaultsBrowserViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
         let domain = Bundle.main.bundleIdentifier ?? "—"
-        return "Showing \(entries.count) of \(domainCount) key\(domainCount == 1 ? "" : "s") in this app's own domain (\(domain)). System and global defaults are never listed. Tap a row to edit it inline; edits are written when you finish editing and keep the original type. Swipe left to delete."
+        return "Showing \(entries.count) of \(domainCount) key\(domainCount == 1 ? "" : "s") in this app's own domain (\(domain)). System and global defaults are never listed. Tap a row to edit it inline; edits keep the original type. Data blobs are decoded (JSON → property list → keyed archive → UTF-8 text → hex) and saved back as Data in the same representation. Swipe left to delete."
     }
 
     override func tableView(_ tableView: UITableView, willDisplayFooterView view: UIView, forSection section: Int) {
@@ -644,6 +1071,7 @@ private final class UserDefaultsRowCell: UITableViewCell {
     private let keyCaption = UILabel()
     private let keyLabel = UILabel()
     private let typePill = PillLabel()
+    private let formatPill = PillLabel()
     private let lockPill = PillLabel()
     private let separator = UIView()
     private let valueCaption = UILabel()
@@ -691,7 +1119,7 @@ private final class UserDefaultsRowCell: UITableViewCell {
         separator.translatesAutoresizingMaskIntoConstraints = false
         separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
 
-        let topRow = UIStackView(arrangedSubviews: [keyCaption, UIView(), lockPill, typePill])
+        let topRow = UIStackView(arrangedSubviews: [keyCaption, UIView(), lockPill, formatPill, typePill])
         topRow.axis = .horizontal
         topRow.alignment = .center
         topRow.spacing = 6
@@ -719,13 +1147,22 @@ private final class UserDefaultsRowCell: UITableViewCell {
         forceLTR()
     }
 
-    fileprivate func configure(key: String, type: UserDefaultsValueType, preview: String) {
+    fileprivate func configure(key: String,
+                               type: UserDefaultsValueType,
+                               representation: DataRepresentation?,
+                               editable: Bool,
+                               preview: String) {
         keyLabel.text = key
         valueLabel.text = preview.isEmpty ? "(empty)" : preview
         valueLabel.textColor = preview.isEmpty
             ? UIColor(white: 0.40, alpha: 1) : UIColor(white: 0.88, alpha: 1)
         typePill.configure(text: type.title, color: type.pillColor)
-        lockPill.isHidden = type.isEditable
+        if let representation {
+            formatPill.configure(text: representation.rawValue, color: representation.color)
+        } else {
+            formatPill.isHidden = true
+        }
+        lockPill.isHidden = editable
     }
 }
 
@@ -857,6 +1294,305 @@ private final class UserDefaultsReadOnlyCell: UITableViewCell {
         typePill.configure(text: type.title, color: type.pillColor)
         // Very long dumps would blow up row height — cap what we render.
         bodyLabel.text = body.count > 6000 ? String(body.prefix(6000)) + "\n… truncated" : body
+    }
+}
+
+// MARK: - Expanded Data card
+
+/// The expanded card for a `Data` value: shows what the blob decoded into, the
+/// decoded text in a multi-line editor, and writes the edit back **as Data** in
+/// the same representation. Re-encoding failures are reported inline and never
+/// written.
+private final class UserDefaultsDataCell: UITableViewCell {
+
+    static let reuseID = "UserDefaultsDataCell"
+
+    /// Called with the edited text when SAVE is tapped.
+    var onSave: ((String) -> Void)?
+    var onCopy: ((String) -> Void)?
+
+    private let card = UIView()
+    private let keyCaption = UILabel()
+    private let keyLabel = UILabel()
+    private let typePill = PillLabel()
+    private let formatPill = PillLabel()
+    private let lockPill = PillLabel()
+    private let separator = UIView()
+    private let valueCaption = UILabel()
+    private let byteLabel = UILabel()
+    private let textView = UITextView()
+    private let errorLabel = UILabel()
+    private let note = UILabel()
+    private let copyButton = UIButton(type: .system)
+    private let saveButton = UIButton(type: .system)
+    private let revertButton = UIButton(type: .system)
+    private let buttonRow = UIStackView()
+
+    /// The text the cell was configured with, so REVERT can restore it.
+    private var originalText = ""
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        setup()
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder); setup() }
+
+    private func setup() {
+        selectionStyle = .none
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+
+        card.backgroundColor = UIColor(white: 0.13, alpha: 1)
+        card.layer.cornerRadius = 14
+        card.layer.cornerCurve = .continuous
+        card.layer.borderWidth = 1
+        card.layer.borderColor = UIColor(white: 0.24, alpha: 1).cgColor
+        card.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(card)
+
+        for caption in [keyCaption, valueCaption] {
+            caption.font = .systemFont(ofSize: 10, weight: .heavy)
+            caption.textColor = UIColor(white: 0.45, alpha: 1)
+        }
+        keyCaption.text = "KEY"
+        valueCaption.text = "VALUE"
+
+        keyLabel.font = .monospacedSystemFont(ofSize: 15, weight: .semibold)
+        keyLabel.textColor = DebugTheme.accentColor
+        keyLabel.numberOfLines = 0
+
+        byteLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        byteLabel.textColor = UIColor(white: 0.45, alpha: 1)
+
+        lockPill.configure(text: "READ-ONLY", color: UIColor(white: 0.55, alpha: 1))
+
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.textColor = UIColor(white: 0.90, alpha: 1)
+        textView.backgroundColor = UIColor(white: 0.09, alpha: 1)
+        textView.layer.cornerRadius = 9
+        textView.layer.cornerCurve = .continuous
+        textView.layer.borderWidth = 1
+        textView.layer.borderColor = UIColor(white: 0.22, alpha: 1).cgColor
+        textView.autocapitalizationType = .none
+        textView.autocorrectionType = .no
+        textView.spellCheckingType = .no
+        textView.keyboardAppearance = .dark
+        textView.isScrollEnabled = false          // grow with the content
+        textView.textContainerInset = UIEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
+        textView.translatesAutoresizingMaskIntoConstraints = false
+        textView.heightAnchor.constraint(greaterThanOrEqualToConstant: 90).isActive = true
+        textView.inputAccessoryView = makeKeyboardBar()
+
+        errorLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        errorLabel.textColor = .systemRed
+        errorLabel.numberOfLines = 0
+        errorLabel.isHidden = true
+
+        note.font = .systemFont(ofSize: 10, weight: .medium)
+        note.textColor = UIColor(white: 0.45, alpha: 1)
+        note.numberOfLines = 0
+
+        separator.backgroundColor = UIColor(white: 0.22, alpha: 1)
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+
+        style(copyButton, title: "COPY", filled: false)
+        style(revertButton, title: "REVERT", filled: false)
+        style(saveButton, title: "SAVE AS DATA", filled: true)
+        copyButton.addTarget(self, action: #selector(copyTapped), for: .touchUpInside)
+        revertButton.addTarget(self, action: #selector(revertTapped), for: .touchUpInside)
+        saveButton.addTarget(self, action: #selector(saveTapped), for: .touchUpInside)
+
+        let topRow = UIStackView(arrangedSubviews: [keyCaption, UIView(), lockPill, formatPill, typePill])
+        topRow.axis = .horizontal
+        topRow.alignment = .center
+        topRow.spacing = 6
+
+        let valueRow = UIStackView(arrangedSubviews: [valueCaption, byteLabel, UIView(), copyButton])
+        valueRow.axis = .horizontal
+        valueRow.alignment = .center
+        valueRow.spacing = 8
+
+        buttonRow.axis = .horizontal
+        buttonRow.alignment = .center
+        buttonRow.spacing = 8
+        buttonRow.addArrangedSubview(saveButton)
+        buttonRow.addArrangedSubview(revertButton)
+        buttonRow.addArrangedSubview(UIView())
+
+        let stack = UIStackView(arrangedSubviews: [topRow, keyLabel, separator, valueRow,
+                                                   textView, errorLabel, buttonRow, note])
+        stack.axis = .vertical
+        stack.spacing = 6
+        stack.setCustomSpacing(10, after: keyLabel)
+        stack.setCustomSpacing(10, after: separator)
+        stack.setCustomSpacing(10, after: textView)
+        stack.setCustomSpacing(10, after: buttonRow)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+            card.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
+            card.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 5),
+            card.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -5),
+
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
+        ])
+
+        forceLTR()
+    }
+
+    private func style(_ button: UIButton, title: String, filled: Bool) {
+        var config = filled ? UIButton.Configuration.filled() : UIButton.Configuration.plain()
+        config.title = title
+        config.baseForegroundColor = filled ? .black : DebugTheme.accentColor
+        config.baseBackgroundColor = DebugTheme.accentColor
+        config.cornerStyle = .medium
+        config.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 12, bottom: 5, trailing: 12)
+        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attrs in
+            var attrs = attrs
+            attrs.font = .systemFont(ofSize: 10, weight: .heavy)
+            return attrs
+        }
+        button.configuration = config
+        if !filled {
+            button.backgroundColor = UIColor(white: 0.23, alpha: 1)
+            button.layer.cornerRadius = 9
+            button.clipsToBounds = true
+        }
+        button.setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    /// A Done bar so a multi-line editor can always dismiss the keyboard.
+    private func makeKeyboardBar() -> UIToolbar {
+        let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: 320, height: 44))
+        bar.barStyle = .black
+        bar.tintColor = DebugTheme.accentColor
+        let done = UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(doneTapped))
+        bar.items = [UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil), done]
+        bar.sizeToFit()
+        return bar
+    }
+
+    // MARK: Actions
+
+    @objc private func doneTapped() { textView.resignFirstResponder() }
+    @objc private func copyTapped() { onCopy?(textView.text ?? "") }
+    @objc private func saveTapped() { onSave?(textView.text ?? "") }
+    @objc private func revertTapped() {
+        textView.text = originalText
+        clearError()
+    }
+
+    // MARK: Configure
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        // The editor can be first responder when the row is recycled.
+        if textView.isFirstResponder { textView.resignFirstResponder() }
+        onSave = nil
+        onCopy = nil
+        originalText = ""
+        clearError()
+    }
+
+    func configure(key: String, decoded: DecodedDataValue, editable: Bool) {
+        keyLabel.text = key
+        typePill.configure(text: UserDefaultsValueType.data.title,
+                           color: UserDefaultsValueType.data.pillColor)
+        formatPill.configure(text: decoded.representation.rawValue, color: decoded.representation.color)
+        lockPill.isHidden = editable
+        byteLabel.text = "·  \(decoded.byteCountText)"
+
+        // Very long dumps would blow up row height — cap what is rendered. A
+        // truncated body must never be editable: saving it would destroy data.
+        let capped = decoded.text.count > 20_000
+        let body = capped ? String(decoded.text.prefix(20_000)) + "\n… truncated" : decoded.text
+        originalText = body
+        textView.text = body
+
+        let allowEditing = editable && !capped
+        textView.isEditable = allowEditing
+        textView.textColor = allowEditing ? UIColor(white: 0.90, alpha: 1) : UIColor(white: 0.70, alpha: 1)
+        buttonRow.isHidden = !allowEditing
+
+        if capped {
+            note.text = "Value is too large to edit safely (\(decoded.byteCountText)) — shown truncated, read-only."
+        } else {
+            note.text = decoded.representation.editHint
+        }
+        clearError()
+        forceLTR()
+    }
+
+    func showError(_ message: String) {
+        errorLabel.text = message
+        errorLabel.isHidden = false
+        textView.layer.borderColor = UIColor.systemRed.withAlphaComponent(0.7).cgColor
+    }
+
+    func clearError() {
+        errorLabel.text = nil
+        errorLabel.isHidden = true
+        textView.layer.borderColor = UIColor(white: 0.22, alpha: 1).cgColor
+    }
+}
+
+// MARK: - Message card
+
+/// Self-sizing empty-state card. Replaces the stock `.subtitle` cell, whose
+/// `textLabel`/`detailTextLabel` do not self-size with `numberOfLines = 0`.
+private final class UserDefaultsMessageCell: UITableViewCell {
+
+    static let reuseID = "UserDefaultsMessageCell"
+
+    private let titleLabel = UILabel()
+    private let bodyLabel = UILabel()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        setup()
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder); setup() }
+
+    private func setup() {
+        selectionStyle = .none
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+
+        titleLabel.font = .systemFont(ofSize: 15, weight: .medium)
+        titleLabel.textColor = UIColor(white: 0.5, alpha: 1)
+        titleLabel.textAlignment = .center
+        titleLabel.numberOfLines = 0
+
+        bodyLabel.font = .systemFont(ofSize: 12)
+        bodyLabel.textColor = UIColor(white: 0.35, alpha: 1)
+        bodyLabel.textAlignment = .center
+        bodyLabel.numberOfLines = 0
+
+        let stack = UIStackView(arrangedSubviews: [titleLabel, bodyLabel])
+        stack.axis = .vertical
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 28),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -28),
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 40),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -40),
+        ])
+        forceLTR()
+    }
+
+    func configure(title: String, body: String) {
+        titleLabel.text = title
+        bodyLabel.text = body
+        forceLTR()
     }
 }
 

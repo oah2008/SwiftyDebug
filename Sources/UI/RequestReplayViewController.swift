@@ -262,30 +262,45 @@ final class RequestReplayViewController: UITableViewController {
         return c
     }
 
+    /// Method row — a tappable row opening a sheet rather than a segmented
+    /// control. Six segments don't fit legibly on a phone and get clipped.
     private func methodCell() -> UITableViewCell {
-        let c = card("method")
-        let seg = UISegmentedControl(items: Self.methods)
-        seg.selectedSegmentIndex = Self.methods.firstIndex(of: method) ?? 0
-        seg.selectedSegmentTintColor = DebugTheme.accentColor
-        seg.setTitleTextAttributes([.foregroundColor: UIColor(white: 0.65, alpha: 1),
-                                    .font: UIFont.systemFont(ofSize: 11, weight: .semibold)], for: .normal)
-        seg.setTitleTextAttributes([.foregroundColor: UIColor.black,
-                                    .font: UIFont.systemFont(ofSize: 11, weight: .bold)], for: .selected)
-        seg.addAction(UIAction { [weak self, weak seg] _ in
-            guard let self, let seg else { return }
-            self.method = Self.methods[seg.selectedSegmentIndex]
-            self.tableView.reloadSections(IndexSet(integer: Section.body.rawValue), with: .automatic)
-        }, for: .valueChanged)
-        seg.translatesAutoresizingMaskIntoConstraints = false
-        c.contentView.addSubview(seg)
-        NSLayoutConstraint.activate([
-            seg.leadingAnchor.constraint(equalTo: c.contentView.leadingAnchor, constant: 12),
-            seg.trailingAnchor.constraint(equalTo: c.contentView.trailingAnchor, constant: -12),
-            seg.topAnchor.constraint(equalTo: c.contentView.topAnchor, constant: 8),
-            seg.bottomAnchor.constraint(equalTo: c.contentView.bottomAnchor, constant: -8),
-            seg.heightAnchor.constraint(equalToConstant: 32),
-        ])
+        let c = UITableViewCell(style: .subtitle, reuseIdentifier: "method")
+        c.backgroundColor = UIColor(white: 0.11, alpha: 1)
+        c.selectionStyle = .default
+        c.textLabel?.text = "Method"
+        c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+        c.textLabel?.textColor = .white
+        c.detailTextLabel?.text = methodSupportsBody ? "Supports a request body" : "No request body"
+        c.detailTextLabel?.font = .systemFont(ofSize: 11)
+        c.detailTextLabel?.textColor = UIColor(white: 0.5, alpha: 1)
+
+        let value = UILabel()
+        value.text = "\(method)  ›"
+        value.font = .monospacedSystemFont(ofSize: 15, weight: .bold)
+        value.textColor = DebugTheme.accentColor
+        value.sizeToFit()
+        c.accessoryView = value
+        c.forceLTR()
         return c
+    }
+
+    private func pickMethod() {
+        let options = Self.methods.map { m in
+            OptionPickerSheetViewController.Option(
+                title: m,
+                subtitle: ["GET", "HEAD", "DELETE"].contains(m) ? "No request body" : "Supports a request body",
+                symbol: nil,
+                tint: m == method ? DebugTheme.accentColor : .white
+            ) { [weak self] in
+                guard let self else { return }
+                self.method = m
+                self.tableView.reloadData()
+            }
+        }
+        OptionPickerSheetViewController.present(
+            from: self, title: "HTTP Method", message: nil,
+            options: options, selectedIndex: Self.methods.firstIndex(of: method))
     }
 
     private func urlCell() -> UITableViewCell {
@@ -400,6 +415,8 @@ final class RequestReplayViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, didSelectRowAt ip: IndexPath) {
         tableView.deselectRow(at: ip, animated: true)
         switch Section(rawValue: ip.section)! {
+        case .request where ip.row == 0:
+            pickMethod()
         case .params where ip.row == params.count:
             params.append(KV(key: "", value: ""))
             tableView.reloadSections(IndexSet(integer: ip.section), with: .automatic)

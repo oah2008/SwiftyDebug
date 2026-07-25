@@ -46,6 +46,121 @@ final class SwiftyDebugTests: XCTestCase {
         XCTAssertEqual(JSONExporter.clipboardString(from: plain), "hello world")
     }
 
+    // MARK: - JSON editor engine
+
+    private func makeDoc() -> JSONDocument {
+        JSONDocument(text: """
+        {"name":"a","count":2,"ok":true,"items":[{"id":1,"title":"x"},{"id":2,"title":"y"}],"nested":{"deep":{"v":"z"}}}
+        """)!
+    }
+
+    func testJSONReadByPath() {
+        let doc = makeDoc()
+        XCTAssertEqual(doc.value(at: [.key("name")]) as? String, "a")
+        XCTAssertEqual(doc.value(at: [.key("items"), .index(1), .key("title")]) as? String, "y")
+        XCTAssertEqual(doc.value(at: [.key("nested"), .key("deep"), .key("v")]) as? String, "z")
+        XCTAssertNil(doc.value(at: [.key("items"), .index(9)]))
+        XCTAssertNil(doc.value(at: [.key("nope")]))
+    }
+
+    func testJSONKindDetectionDistinguishesBoolFromNumber() {
+        let doc = makeDoc()
+        XCTAssertEqual(doc.kind(at: [.key("ok")]), .bool)      // must NOT be .number
+        XCTAssertEqual(doc.kind(at: [.key("count")]), .number)
+        XCTAssertEqual(doc.kind(at: [.key("items")]), .array)
+        XCTAssertEqual(doc.kind(at: [.key("nested")]), .object)
+    }
+
+    func testJSONSetValueDeepAndUndo() {
+        let doc = makeDoc()
+        XCTAssertTrue(doc.setValue("CHANGED", at: [.key("items"), .index(0), .key("title")]))
+        XCTAssertEqual(doc.value(at: [.key("items"), .index(0), .key("title")]) as? String, "CHANGED")
+        // Sibling untouched.
+        XCTAssertEqual(doc.value(at: [.key("items"), .index(1), .key("title")]) as? String, "y")
+        doc.undo()
+        XCTAssertEqual(doc.value(at: [.key("items"), .index(0), .key("title")]) as? String, "x")
+        doc.redo()
+        XCTAssertEqual(doc.value(at: [.key("items"), .index(0), .key("title")]) as? String, "CHANGED")
+    }
+
+    func testJSONDuplicateArrayElementInsertsAfter() {
+        let doc = makeDoc()
+        XCTAssertTrue(doc.duplicateElement(at: [.key("items"), .index(0)]))
+        let items = doc.value(at: [.key("items")]) as? [Any]
+        XCTAssertEqual(items?.count, 3)
+        XCTAssertEqual(doc.value(at: [.key("items"), .index(1), .key("title")]) as? String, "x")
+        XCTAssertEqual(doc.value(at: [.key("items"), .index(2), .key("title")]) as? String, "y")
+    }
+
+    func testJSONTemplateElementUnionsSiblingKeys() {
+        // "Add item" on an array of objects should produce the right shape.
+        let doc = JSONDocument(text: #"{"items":[{"id":1,"title":"x"},{"id":2,"extra":true}]}"#)!
+        let template = doc.templateElement(forArrayAt: [.key("items")]) as? [String: Any]
+        XCTAssertNotNil(template)
+        XCTAssertEqual(Set(template!.keys), ["id", "title", "extra"])
+        XCTAssertEqual(template?["id"] as? NSNumber, 0)
+        XCTAssertEqual(template?["title"] as? String, "")
+        XCTAssertEqual(template?["extra"] as? Bool, false)
+    }
+
+    func testJSONRenameKeyRefusesToClobber() {
+        let doc = makeDoc()
+        XCTAssertFalse(doc.renameKey(at: [.key("name")], to: "count"))   // exists
+        XCTAssertTrue(doc.renameKey(at: [.key("name")], to: "label"))
+        XCTAssertEqual(doc.value(at: [.key("label")]) as? String, "a")
+        XCTAssertNil(doc.value(at: [.key("name")]))
+    }
+
+    func testJSONRemoveAndAdd() {
+        let doc = makeDoc()
+        XCTAssertTrue(doc.remove(at: [.key("items"), .index(0)]))
+        XCTAssertEqual((doc.value(at: [.key("items")]) as? [Any])?.count, 1)
+        XCTAssertTrue(doc.addKey("newKey", value: "v", toObjectAt: []))
+        XCTAssertEqual(doc.value(at: [.key("newKey")]) as? String, "v")
+        XCTAssertFalse(doc.addKey("newKey", value: "z", toObjectAt: []))  // duplicate
+    }
+
+    func testJSONMoveElement() {
+        let doc = makeDoc()
+        XCTAssertTrue(doc.moveElement(inArrayAt: [.key("items")], from: 0, to: 1))
+        XCTAssertEqual(doc.value(at: [.key("items"), .index(0), .key("id")] ) as? NSNumber, 2)
+    }
+
+    func testJSONChangeKindConverts() {
+        let doc = JSONDocument(text: #"{"a":"42","b":true,"c":"x"}"#)!
+        doc.changeKind(at: [.key("a")], to: .number)
+        XCTAssertEqual(doc.value(at: [.key("a")]) as? NSNumber, 42)
+        doc.changeKind(at: [.key("b")], to: .string)
+        XCTAssertEqual(doc.value(at: [.key("b")]) as? String, "true")
+        doc.changeKind(at: [.key("c")], to: .array)
+        XCTAssertEqual((doc.value(at: [.key("c")]) as? [Any])?.count, 1)
+    }
+
+    func testJSONSerializationRoundTripAndSlashes() {
+        let doc = JSONDocument(text: #"{"url":"https://a.com/b"}"#)!
+        let text = doc.prettyText()
+        XCTAssertTrue(text.contains("https://a.com/b"))
+        XCTAssertFalse(text.contains("\\/"))
+        XCTAssertNotNil(JSONDocument(text: text))
+    }
+
+    func testJSONValidateReportsErrors() {
+        XCTAssertTrue(JSONDocument.validate(#"{"a":1}"#).isValid)
+        XCTAssertTrue(JSONDocument.validate("[1,2]").isValid)
+        XCTAssertFalse(JSONDocument.validate("{oops").isValid)
+        XCTAssertNotNil(JSONDocument.validate("{oops").error)
+    }
+
+    func testJSONTopLevelArrayDocument() {
+        // Arrays of objects are the headline use case — must work at the root.
+        let doc = JSONDocument(text: #"[{"id":1},{"id":2}]"#)!
+        XCTAssertEqual(doc.kind(at: []), .array)
+        XCTAssertTrue(doc.duplicateElement(at: [.index(0)]))
+        XCTAssertEqual((doc.root as? [Any])?.count, 3)
+        XCTAssertTrue(doc.setValue(99, at: [.index(2), .key("id")]))
+        XCTAssertEqual(doc.value(at: [.index(2), .key("id")]) as? NSNumber, 99)
+    }
+
     // MARK: - Inspector scoping
 
     func testSDKOwnedKeysAreIdentified() {

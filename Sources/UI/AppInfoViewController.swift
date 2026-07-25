@@ -74,6 +74,18 @@ class AppInfoViewController: UITableViewController {
         InspectorRow(title: "Keychain", symbol: "key.fill") {
             KeychainBrowserViewController()
         },
+        InspectorRow(title: "Timeline", symbol: "chart.bar.xaxis") {
+            NetworkTimelineViewController()
+        },
+        InspectorRow(title: "Insights", symbol: "chart.pie.fill") {
+            NetworkInsightsViewController()
+        },
+        InspectorRow(title: "Auth Tokens", symbol: "person.badge.key.fill") {
+            AuthTokenInspectorViewController()
+        },
+        InspectorRow(title: "Paused Requests", symbol: "pause.circle.fill") {
+            BreakpointInboxViewController()
+        },
     ]
 
     // MARK: - Data
@@ -278,14 +290,22 @@ class AppInfoViewController: UITableViewController {
     /// `viewDidLoad` can install its bar items, and one is only added when the
     /// screen didn't provide its own.
     private func presentInspector(_ vc: UIViewController) {
-        _ = vc.view   // force viewDidLoad so its own bar items are set first
+        // Build the navigation controller FIRST, then force `viewDidLoad`.
+        //
+        // Order matters: force-loading a screen while `navigationController` is
+        // still nil crashed the UserDefaults inspector, which assigns
+        // `navigationItem.searchController` in viewDidLoad — UIKit was told to
+        // hoist a search bar into a navigation bar that didn't exist yet.
+        // Wrapping first means the nav relationship is already established.
+        let nav = SwiftyDebugNavigationController(rootViewController: vc)
+        _ = vc.view   // now safe: its own bar items get installed before we look
+
         if vc.navigationItem.leftBarButtonItem == nil {
             let close = UIBarButtonItem(image: UIImage(systemName: "xmark"), style: .plain,
                                         target: self, action: #selector(dismissInspector))
             close.tintColor = DebugTheme.accentColor
             vc.navigationItem.leftBarButtonItem = close
         }
-        let nav = SwiftyDebugNavigationController(rootViewController: vc)
         nav.modalPresentationStyle = .fullScreen
         present(nav, animated: true)
     }

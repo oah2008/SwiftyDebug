@@ -27,6 +27,10 @@ extension SwiftyDebug {
         CustomHTTPProtocol.swizzleSessionConfiguration()
 
         NetworkMonitor.shared.enable()
+
+        // Surface paused requests over the host app — a held request otherwise
+        // looks like the app has hung. (See BREAKPOINTS.)
+        BreakpointOverlay.shared.start()
     }
 
     static func deinitializationMethod() {
@@ -48,6 +52,11 @@ extension SwiftyDebug {
         // Flip the global gate first so in-flight hot paths stop doing work
         // immediately.
         SwiftyDebugRuntime.markStopped()
+
+        // Release anything paused at a breakpoint FIRST — a stopped SDK must
+        // never leave the host app with permanently stuck requests.
+        BreakpointCenter.shared.resumeAll()
+        BreakpointOverlay.shared.stop()
 
         // Stop native network interception (unregisters the URLProtocol; the
         // runtime gate in canInit is the real backstop for already-created
@@ -80,6 +89,7 @@ extension SwiftyDebug {
         PrintInterceptor.shared.enable = SwiftyDebug.enableConsoleLog && Settings.shared.consoleLogsEnabled
 
         WKWebViewSwizzling.pushEnabledStateToWebViews(enabled: true)
+        BreakpointOverlay.shared.start()
 
         Settings.shared.bubbleVisible = true
     }

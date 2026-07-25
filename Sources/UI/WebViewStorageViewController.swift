@@ -60,7 +60,10 @@ final class WebViewStoragePickerViewController: UITableViewController {
     }
 
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        if webViews.isEmpty {
+        // Bounds guard rather than `isEmpty` — the live web-view list can shrink
+        // between the row count and this call (web views are weakly held and can
+        // deallocate at any time).
+        if indexPath.row >= webViews.count {
             let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "empty")
             cell.backgroundColor = .clear
             cell.selectionStyle = .none
@@ -350,8 +353,12 @@ final class WebViewStorageViewController: UITableViewController {
     }
 
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        // Empty state
-        if items.isEmpty {
+        // Bounds guard, NOT `items.isEmpty`: `numberOfRowsInSection` returns
+        // max(count, 1) for the empty state, so UIKit can legitimately ask for
+        // row 0 when the array is empty — and an async storage reload can shrink
+        // `items` between the row count and this call. Indexing without this
+        // guard crashed while scrolling.
+        guard indexPath.row < items.count else {
             let c = UITableViewCell(style: .subtitle, reuseIdentifier: "empty")
             c.backgroundColor = .clear
             c.selectionStyle = .none
