@@ -7,6 +7,60 @@
 
 import UIKit
 
+/// Converts between a JSON value and the text an editor shows for it.
+///
+/// Both editors share this: the inline field in the tree and the full page
+/// below. Keeping one implementation means a value can't come back a different
+/// type depending on which screen you happened to edit it on, and the rules
+/// ("42" stays an Int, "  true " is a bool) are unit-testable on their own.
+enum JSONInlineValueCoder {
+
+    /// The editable text for a scalar. Containers and null edit as empty text.
+    static func text(for value: Any?) -> String {
+        switch value {
+        case let s as String:
+            return s
+        case let n as NSNumber:
+            // CFBoolean is an NSNumber — check it first or `true` reads as "1".
+            return CFGetTypeID(n) == CFBooleanGetTypeID()
+                ? (n.boolValue ? "true" : "false")
+                : n.stringValue
+        default:
+            return ""
+        }
+    }
+
+    /// Turns editor text back into a JSON value of `kind`.
+    static func value(from text: String, kind: JSONValueKind) -> Any {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch kind {
+        case .string:
+            return text
+        case .number:
+            // Keep integers as integers so they don't render as "1.0".
+            if let i = Int(trimmed) { return NSNumber(value: i) }
+            return NSNumber(value: Double(trimmed) ?? 0)
+        case .bool:
+            return ["true", "1", "yes", "on"].contains(trimmed.lowercased())
+        case .null:
+            return NSNull()
+        case .object, .array:
+            // Containers aren't typed by hand in the field, but if the text does
+            // parse as the right shape, honour it rather than wiping the node.
+            if let parsed = JSONDocument(text: text)?.root, JSONValueKind.of(parsed) == kind {
+                return parsed
+            }
+            return kind.emptyValue
+        }
+    }
+
+    /// True when a draft would write back exactly what's already there — the
+    /// guard that keeps a no-op edit out of the undo stack.
+    static func isUnchanged(draft: String, current: Any?) -> Bool {
+        text(for: current) == draft
+    }
+}
+
 /// Focused editor for a single scalar JSON value.
 ///
 /// Editing long strings (tokens, HTML, base64) inside a table row is miserable
@@ -24,6 +78,10 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
     private let breadcrumb = UILabel()
     private let typeControl = UISegmentedControl(items: ["String", "Number", "Bool", "Null"])
     private let textView = UITextView()
+    /// Owned so the keyboard can shrink the card instead of covering it.
+    private var cardBottom: NSLayoutConstraint!
+    private var cardMinHeight: NSLayoutConstraint!
+    private var boolRowBottom: NSLayoutConstraint!
     private let boolSwitch = UISwitch()
     private let boolRow = UIView()
     private let hintLabel = UILabel()
@@ -36,14 +94,7 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
         let resolved = value ?? NSNull()
         self.kind = JSONValueKind.of(resolved)
         self.pathDisplay = pathDisplay
-        switch resolved {
-        case let s as String: originalText = s
-        case let n as NSNumber:
-            originalText = CFGetTypeID(n) == CFBooleanGetTypeID()
-                ? (n.boolValue ? "true" : "false") : n.stringValue
-        case is NSNull: originalText = ""
-        default: originalText = ""
-        }
+        self.originalText = JSONInlineValueCoder.text(for: resolved)
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -89,11 +140,11 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
 
         textView.backgroundColor = .clear
         textView.textColor = UIColor(white: 0.92, alpha: 1)
-        textView.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
+        textView.font = .monospacedSystemFont(ofSize: 16, weight: .regular)
         textView.autocapitalizationType = .none
         textView.autocorrectionType = .no
         textView.spellCheckingType = .no
-        textView.textContainerInset = UIEdgeInsets(top: 12, left: 10, bottom: 12, right: 10)
+        textView.textContainerInset = UIEdgeInsets(top: 14, left: 12, bottom: 14, right: 12)
         textView.text = originalText
         textView.delegate = self
         textView.translatesAutoresizingMaskIntoConstraints = false
@@ -139,10 +190,14 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
             textView.trailingAnchor.constraint(equalTo: card.trailingAnchor),
             textView.bottomAnchor.constraint(equalTo: card.bottomAnchor),
 
+            // NOT pinned to card.bottom: with a fixed 56pt height that would force
+            // the card to 56pt, contradicting the fill-to-bottom constraint below.
+            // Auto Layout resolved that by breaking the top of the chain, which
+            // left the breadcrumb floating in the middle of an empty screen.
+            // `boolRowBottom` supplies the bottom only when a bool is being edited.
             boolRow.topAnchor.constraint(equalTo: card.topAnchor),
             boolRow.leadingAnchor.constraint(equalTo: card.leadingAnchor),
             boolRow.trailingAnchor.constraint(equalTo: card.trailingAnchor),
-            boolRow.bottomAnchor.constraint(equalTo: card.bottomAnchor),
             boolRow.heightAnchor.constraint(equalToConstant: 56),
 
             boolLabel.leadingAnchor.constraint(equalTo: boolRow.leadingAnchor, constant: 14),
@@ -153,16 +208,63 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
             hintLabel.topAnchor.constraint(equalTo: card.bottomAnchor, constant: 8),
             hintLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
             hintLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-            hintLabel.bottomAnchor.constraint(lessThanOrEqualTo: guide.bottomAnchor, constant: -12),
+            hintLabel.bottomAnchor.constraint(lessThanOrEqualTo: guide.bottomAnchor, constant: -6),
         ])
 
-        // The text card grows to fill the space above the keyboard.
-        let grow = card.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -44)
-        grow.priority = .defaultLow
-        grow.isActive = true
+        // The card fills every remaining point above the keyboard. This is the
+        // whole reason a value opens on its own page, so the constraint is
+        // required — at .defaultLow it lost to the text view's content hugging
+        // and the card sat at the height of one line on a full screen.
+        cardBottom = card.bottomAnchor.constraint(equalTo: guide.bottomAnchor,
+                                                  constant: -Self.hintReserve)
+        cardMinHeight = card.heightAnchor.constraint(greaterThanOrEqualToConstant: 220)
+        // Bool and null need a 56pt row, not a full page — `applyKind` swaps
+        // between this and the pair above so the two can never both be required.
+        boolRowBottom = boolRow.bottomAnchor.constraint(equalTo: card.bottomAnchor)
 
+        // The text view must stretch, not size itself to its content.
+        textView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        textView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+
+        observeKeyboard()
         applyKind()
         view.forceLTR()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    /// Space kept under the card for the hint line.
+    private static let hintReserve: CGFloat = 30
+
+    /// Nothing tracked the keyboard before, so the bottom of a full-height card
+    /// sat underneath it — you could not see the end of what you were typing.
+    private func observeKeyboard() {
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardFrameChanged(_:)),
+            name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardWillHide(_:)),
+            name: UIResponder.keyboardWillHideNotification, object: nil)
+    }
+
+    @objc private func keyboardFrameChanged(_ note: Notification) {
+        guard let frame = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue,
+              let window = view.window else { return }
+        let overlap = max(0, view.convert(view.bounds, to: window).maxY - frame.minY)
+        setCardBottomInset(overlap + Self.hintReserve, note: note)
+    }
+
+    @objc private func keyboardWillHide(_ note: Notification) {
+        setCardBottomInset(Self.hintReserve, note: note)
+    }
+
+    private func setCardBottomInset(_ inset: CGFloat, note: Notification) {
+        guard abs(cardBottom.constant + inset) > 0.5 else { return }
+        cardBottom.constant = -inset
+        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        UIView.animate(withDuration: duration) { self.view.layoutIfNeeded() }
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -184,7 +286,7 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
         case .number:
             textView.isHidden = false; boolRow.isHidden = true
             textView.keyboardType = .numbersAndPunctuation
-            hintLabel.text = "Saved as a JSON number. Non-numeric text saves as 0."
+            hintLabel.text = "Saved as a JSON number. Non-numeric text is discarded."
         case .bool:
             textView.isHidden = true; boolRow.isHidden = false
             view.endEditing(true)
@@ -196,20 +298,25 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
         default:
             break
         }
+        applyCardSizing()
+    }
+
+    /// A text value gets the whole page; a bool or null needs one short row.
+    /// Exactly one of the two sizings is ever active, so they cannot conflict.
+    private func applyCardSizing() {
+        let wantsFullHeight = (kind == .string || kind == .number)
+        boolRowBottom.isActive = !wantsFullHeight
+        cardBottom.isActive = wantsFullHeight
+        cardMinHeight.isActive = wantsFullHeight
+        view.layoutIfNeeded()
     }
 
     @objc private func saveTapped() {
         let value: Any
         switch kind {
-        case .string: value = textView.text ?? ""
-        case .number:
-            let raw = (textView.text ?? "").trimmingCharacters(in: .whitespaces)
-            // Keep integers as integers so they don't render as "1.0".
-            if let i = Int(raw) { value = NSNumber(value: i) }
-            else { value = NSNumber(value: Double(raw) ?? 0) }
-        case .bool:   value = boolSwitch.isOn
-        case .null:   value = NSNull()
-        default:      value = textView.text ?? ""
+        case .bool: value = boolSwitch.isOn
+        case .null: value = NSNull()
+        default:    value = JSONInlineValueCoder.value(from: textView.text ?? "", kind: kind)
         }
         onSave?(value)
         navigationController?.popViewController(animated: true)

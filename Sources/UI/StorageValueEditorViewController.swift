@@ -42,9 +42,9 @@ final class StorageValueEditorViewController: UIViewController, UITextViewDelega
     private let scroll = UIScrollView()
     private let keyField = UITextField()
     private let valueView = UITextView()
-    private let jsonBanner = UIView()
-    private let jsonLabel = UILabel()
-    private let jsonButton = UIButton(type: .system)
+    /// The shared "this is JSON — open the tree editor" affordance. Identical
+    /// here, in the replay editor, the mock editor and the breakpoint inbox.
+    private let jsonCard = JSONEditorCardView()
     private let statsLabel = UILabel()
 
     init(key: String, value: String, subtitle: String? = nil, isKeyEditable: Bool = false) {
@@ -140,34 +140,9 @@ final class StorageValueEditorViewController: UIViewController, UITextViewDelega
             stack.addArrangedSubview(l)
         }
 
-        // JSON banner — appears only when the value parses as JSON.
-        jsonBanner.backgroundColor = DebugTheme.accentColor.withAlphaComponent(0.14)
-        jsonBanner.layer.cornerRadius = 12
-        jsonBanner.layer.cornerCurve = .continuous
-        jsonBanner.translatesAutoresizingMaskIntoConstraints = false
-        jsonLabel.font = .systemFont(ofSize: 12, weight: .semibold)
-        jsonLabel.textColor = DebugTheme.accentColor
-        jsonLabel.numberOfLines = 2
-        jsonLabel.translatesAutoresizingMaskIntoConstraints = false
-        jsonButton.setTitle("Open editor", for: .normal)
-        jsonButton.titleLabel?.font = .systemFont(ofSize: 12, weight: .bold)
-        jsonButton.setTitleColor(.black, for: .normal)
-        jsonButton.backgroundColor = DebugTheme.accentColor
-        jsonButton.layer.cornerRadius = 8
-        jsonButton.contentEdgeInsets = UIEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
-        jsonButton.addTarget(self, action: #selector(openJSONEditor), for: .touchUpInside)
-        jsonButton.translatesAutoresizingMaskIntoConstraints = false
-        jsonBanner.addSubview(jsonLabel)
-        jsonBanner.addSubview(jsonButton)
-        NSLayoutConstraint.activate([
-            jsonLabel.leadingAnchor.constraint(equalTo: jsonBanner.leadingAnchor, constant: 12),
-            jsonLabel.centerYAnchor.constraint(equalTo: jsonBanner.centerYAnchor),
-            jsonLabel.trailingAnchor.constraint(lessThanOrEqualTo: jsonButton.leadingAnchor, constant: -8),
-            jsonButton.trailingAnchor.constraint(equalTo: jsonBanner.trailingAnchor, constant: -12),
-            jsonButton.centerYAnchor.constraint(equalTo: jsonBanner.centerYAnchor),
-            jsonBanner.heightAnchor.constraint(greaterThanOrEqualToConstant: 52),
-        ])
-        stack.addArrangedSubview(jsonBanner)
+        // JSON card — appears only when the value parses as JSON.
+        jsonCard.onTap = { [weak self] in self?.openJSONEditor() }
+        stack.addArrangedSubview(jsonCard)
 
         // VALUE
         let valueCaptionRow = UIStackView(arrangedSubviews: [caption("VALUE"), UIView(), statsLabel])
@@ -224,26 +199,15 @@ final class StorageValueEditorViewController: UIViewController, UITextViewDelega
 
     // MARK: - JSON awareness
 
-    /// Shows the "this is JSON" banner when the value parses, so the user can
-    /// jump into the tree editor instead of wrestling with raw text.
+    /// Shows the shared JSON card when the value parses, so the user can jump
+    /// into the tree editor instead of wrestling with raw text.
     private func refreshJSONBanner() {
-        let text = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isJSON = !text.isEmpty && JSONDocument.validate(text).isValid
-            && (text.hasPrefix("{") || text.hasPrefix("["))
-        jsonBanner.isHidden = !isJSON
-        if isJSON, let doc = JSONDocument(text: text) {
-            let kind = JSONValueKind.of(doc.root)
-            var summary = "Valid JSON"
-            if let arr = doc.root as? [Any] { summary += " · \(arr.count) items" }
-            else if let obj = doc.root as? [String: Any] { summary += " · \(obj.count) keys" }
-            else { summary += " · \(kind.badge)" }
-            jsonLabel.text = summary
-        }
+        jsonCard.configure(text: currentValue)
         let bytes = currentValue.utf8.count
         statsLabel.text = "\(currentValue.count) chars · \(bytes) bytes"
     }
 
-    @objc private func openJSONEditor() {
+    private func openJSONEditor() {
         let editor = JSONEditorViewController(text: currentValue, title: currentKey)
         editor.saveButtonTitle = "Use JSON"
         editor.onSave = { [weak self] doc in

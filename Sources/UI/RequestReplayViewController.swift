@@ -17,6 +17,10 @@ import UIKit
 /// The replayed request goes out through a normal `URLSession`, so SwiftyDebug's
 /// own URLProtocol captures it too — it shows up in the Network list like any
 /// other request. (See REPLAY.)
+///
+/// It is also the destination for **Import cURL**: a pasted command is parsed
+/// into the same editable state, so there is one request editor in the SDK
+/// rather than two that drift apart.
 final class RequestReplayViewController: UITableViewController {
 
     // MARK: - Support check
@@ -41,6 +45,10 @@ final class RequestReplayViewController: UITableViewController {
     private var params: [KV] = []
     private var headers: [KV] = []
     private var bodyText: String = ""
+    /// True once the developer types in the body field. Until then an imported
+    /// cURL body is sent as its original bytes rather than re-encoded from the
+    /// pretty-printed text.
+    private var bodyWasEdited = false
 
     /// The request as captured, before any edits — the most relevant source of
     /// header names to offer back after the user deletes one.
@@ -48,21 +56,60 @@ final class RequestReplayViewController: UITableViewController {
     private let originHost: String
     private let originPath: String
 
+    /// Set when this screen was opened from a pasted cURL command. It carries the
+    /// two things the editable fields can't: the transport flags (`-k`, `-L`) and
+    /// the flags the parser understood but dropped, which must stay visible or a
+    /// silently-ignored `--compressed` turns into a bug hunt.
+    private let curlImport: ParsedCurlRequest?
+
     private static let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
-    private var methodSupportsBody: Bool { !["GET", "HEAD", "DELETE"].contains(method) }
+    /// GET and HEAD never carry a body. DELETE technically can, real APIs use it,
+    /// and an imported `curl -X DELETE -d …` would otherwise lose its payload
+    /// with nothing on screen to say so.
+    private var methodSupportsBody: Bool { !["GET", "HEAD"].contains(method) }
 
     private enum Section: Int, CaseIterable {
         case request = 0     // method + URL
         case params = 1
         case headers = 2
         case body = 3
+        case imported = 4    // cURL provenance — empty for a captured request
     }
 
     private var isSending = false
 
+    /// The JSON card living in the body row, so typing can refresh it without
+    /// reloading the row (which would drop the keyboard). Weak — the table owns
+    /// the cell and rebuilds it on every reload.
+    private weak var bodyCardView: JSONEditorCardView?
+
+    /// Only built for an import that needs non-default transport policy; every
+    /// other replay uses the shared session (which SwiftyDebug already captures).
+    private var customSession: URLSession?
+
+    private var session: URLSession {
+        if let customSession { return customSession }
+        guard let curl = curlImport, !curl.followsRedirects || curl.allowsInsecureTLS else {
+            return .shared
+        }
+        let created = URLSession(
+            configuration: .default,
+            delegate: ReplayTransportDelegate(followsRedirects: curl.followsRedirects,
+                                              allowsInsecureTLS: curl.allowsInsecureTLS),
+            delegateQueue: nil)
+        customSession = created
+        return created
+    }
+
+    deinit {
+        // A delegate session retains its delegate (and itself) until invalidated.
+        customSession?.invalidateAndCancel()
+    }
+
     // MARK: - Init
 
     init(model: NetworkTransaction) {
+        self.curlImport = nil
         self.method = (model.method ?? "GET").uppercased()
 
         let url = model.url as URL?
@@ -93,7 +140,81 @@ final class RequestReplayViewController: UITableViewController {
         super.init(style: .grouped)
     }
 
+    /// Opens the same editor on a pasted cURL command, so importing lands on the
+    /// screen the user already knows instead of a second, lesser one.
+    init(curl: ParsedCurlRequest) {
+        self.curlImport = curl
+        self.method = curl.method.uppercased()
+
+        if var comps = URLComponents(url: curl.url, resolvingAgainstBaseURL: false) {
+            for item in comps.queryItems ?? [] {
+                params.append(KV(key: item.name, value: item.value ?? ""))
+            }
+            comps.query = nil
+            baseURLString = comps.url?.absoluteString ?? curl.url.absoluteString
+        } else {
+            baseURLString = curl.url.absoluteString
+        }
+
+        // Written order, duplicates kept — the command may legitimately repeat a
+        // header, and collapsing them here would change what gets sent.
+        headers = curl.headers.map { KV(key: $0.name, value: $0.value) }
+
+        // A binary body (`--data-binary @file`) has no text form. Leave the field
+        // empty rather than pretending there is nothing to send — `sendTapped`
+        // still transmits the original bytes, and `importedSummary` says so.
+        if let body = curl.bodyString {
+            bodyText = JSONExporter.prettyJSONString(from: body) ?? body
+        }
+
+        originalHeaders = headers.map { (name: $0.key, value: $0.value) }
+        originHost = (curl.url.host ?? "").lowercased()
+        originPath = curl.url.path
+
+        super.init(style: .grouped)
+    }
+
     required init?(coder: NSCoder) { fatalError() }
+
+    // MARK: - Request building
+
+    /// Builds the outgoing request. Pure and `internal` so the two things that
+    /// silently broke when cURL import moved onto this screen — repeated headers
+    /// and curl's default content type — are covered by tests rather than by
+    /// inspection.
+    ///
+    /// `appliesCurlDefaults` is true only for an imported command: a replayed
+    /// capture already carries whatever `Content-Type` the app really sent, and
+    /// inventing one would misrepresent it.
+    static func makeRequest(url: URL,
+                            method: String,
+                            headers: [(name: String, value: String)],
+                            body: Data?,
+                            appliesCurlDefaults: Bool,
+                            timeout: TimeInterval = 60) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = timeout
+
+        // `setValue` REPLACES, so a plain loop collapses repeated headers —
+        // `-H 'Cookie: a=1' -H 'Cookie: b=2'` would send only the last one.
+        var seen = Set<String>()
+        for header in headers where !header.name.isEmpty {
+            if seen.insert(header.name.lowercased()).inserted {
+                request.setValue(header.value, forHTTPHeaderField: header.name)
+            } else {
+                request.addValue(header.value, forHTTPHeaderField: header.name)
+            }
+        }
+
+        if let body, !body.isEmpty {
+            request.httpBody = body
+            if appliesCurlDefaults, !seen.contains("content-type") {
+                request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            }
+        }
+        return request
+    }
 
     // MARK: - Lifecycle
 
@@ -102,7 +223,7 @@ final class RequestReplayViewController: UITableViewController {
         view.backgroundColor = .black
 
         let titleLabel = UILabel()
-        titleLabel.text = "Replay Request"
+        titleLabel.text = curlImport == nil ? "Replay Request" : "Imported cURL"
         titleLabel.font = .boldSystemFont(ofSize: 18)
         titleLabel.textColor = DebugTheme.accentColor
         titleLabel.sizeToFit()
@@ -148,21 +269,30 @@ final class RequestReplayViewController: UITableViewController {
             return
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = method
-        request.timeoutInterval = 60
-        for h in headers where !h.key.isEmpty {
-            request.setValue(h.value, forHTTPHeaderField: h.key)
+        // An imported binary body has no text form, and a JSON one was
+        // pretty-printed for display — re-encoding either would change the bytes
+        // on the wire and break anything signing the raw payload. Send the
+        // original unless the developer actually edited the text.
+        let body: Data?
+        if !methodSupportsBody {
+            body = nil
+        } else if let original = curlImport?.body, !bodyWasEdited {
+            body = original
+        } else {
+            body = bodyText.isEmpty ? nil : bodyText.data(using: .utf8)
         }
-        if methodSupportsBody, !bodyText.isEmpty {
-            request.httpBody = bodyText.data(using: .utf8)
-        }
+
+        let request = Self.makeRequest(
+            url: url, method: method,
+            headers: headers.map { (name: $0.key, value: $0.value) },
+            body: body,
+            appliesCurlDefaults: curlImport != nil)
 
         isSending = true
         setSendingUI(true)
         let started = Date()
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        session.dataTask(with: request) { [weak self] data, response, error in
             let finished = Date()
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -375,6 +505,7 @@ final class RequestReplayViewController: UITableViewController {
         case .params:  return params.count + 1       // +Add
         case .headers: return headers.count + 1 + (availableHeaders.isEmpty ? 0 : 1)
         case .body:    return methodSupportsBody ? 1 : 0
+        case .imported: return curlImport == nil ? 0 : 1
         }
     }
 
@@ -391,6 +522,8 @@ final class RequestReplayViewController: UITableViewController {
             return availableHeadersCell()
         case .body:
             return bodyCell()
+        case .imported:
+            return importedCell()
         }
     }
 
@@ -550,8 +683,17 @@ final class RequestReplayViewController: UITableViewController {
         return c
     }
 
+    /// Raw editing stays exactly as it was — the shared JSON card sits above it
+    /// and appears only while the text parses, so a JSON body can be reshaped in
+    /// the tree editor without giving up free-form typing.
     private func bodyCell() -> UITableViewCell {
         let c = card("body")
+
+        let jsonCard = JSONEditorCardView()
+        jsonCard.onTap = { [weak self] in self?.editBodyAsJSON() }
+        jsonCard.configure(text: bodyText)
+        bodyCardView = jsonCard
+
         let tv = UITextView()
         tv.text = bodyText
         tv.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -561,18 +703,89 @@ final class RequestReplayViewController: UITableViewController {
         tv.autocapitalizationType = .none
         tv.autocorrectionType = .no
         tv.textContainerInset = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
-        tv.translatesAutoresizingMaskIntoConstraints = false
         tv.delegate = self
         tv.tag = 901
-        c.contentView.addSubview(tv)
+
+        let stack = UIStackView(arrangedSubviews: [jsonCard, tv])
+        stack.axis = .vertical
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        c.contentView.addSubview(stack)
         NSLayoutConstraint.activate([
-            tv.leadingAnchor.constraint(equalTo: c.contentView.leadingAnchor, constant: 4),
-            tv.trailingAnchor.constraint(equalTo: c.contentView.trailingAnchor, constant: -4),
-            tv.topAnchor.constraint(equalTo: c.contentView.topAnchor, constant: 2),
-            tv.bottomAnchor.constraint(equalTo: c.contentView.bottomAnchor, constant: -2),
+            stack.leadingAnchor.constraint(equalTo: c.contentView.leadingAnchor, constant: 4),
+            stack.trailingAnchor.constraint(equalTo: c.contentView.trailingAnchor, constant: -4),
+            stack.topAnchor.constraint(equalTo: c.contentView.topAnchor, constant: 6),
+            stack.bottomAnchor.constraint(equalTo: c.contentView.bottomAnchor, constant: -2),
             tv.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
         ])
         return c
+    }
+
+    /// Opens the body in the shared tree editor and writes the pretty text back
+    /// into the raw field, so both representations stay the same document.
+    private func editBodyAsJSON() {
+        let editor = JSONEditorViewController(text: bodyText, title: "Request Body")
+        editor.saveButtonTitle = "Use Body"
+        editor.onSave = { [weak self] doc in
+            guard let self else { return }
+            self.bodyText = doc.prettyText()
+            // The row is rebuilt rather than patched: the text view has to regrow
+            // to the new content and the card's summary has to follow it.
+            self.tableView.reloadSections(IndexSet(integer: Section.body.rawValue), with: .none)
+        }
+        navigationController?.pushViewController(editor, animated: true)
+    }
+
+    /// What the parser dropped and what it kept but can't show as a field —
+    /// visible on the screen that actually sends the request, not just on the
+    /// import screen the user already left.
+    private func importedCell() -> UITableViewCell {
+        let c = UITableViewCell(style: .subtitle, reuseIdentifier: "imported")
+        c.backgroundColor = UIColor(white: 0.11, alpha: 1)
+        c.selectionStyle = .none
+        c.textLabel?.text = "Imported from cURL"
+        c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+        c.textLabel?.textColor = .white
+        c.detailTextLabel?.numberOfLines = 0
+        c.detailTextLabel?.attributedText = importedSummary()
+        let cfg = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        c.imageView?.image = UIImage(systemName: "terminal", withConfiguration: cfg)?
+            .withTintColor(UIColor(white: 0.8, alpha: 1), renderingMode: .alwaysOriginal)
+        c.forceLTR()
+        return c
+    }
+
+    private func importedSummary() -> NSAttributedString {
+        guard let curl = curlImport else { return NSAttributedString() }
+        let out = NSMutableAttributedString()
+
+        var kept: [String] = []
+        kept.append(curl.followsRedirects ? "follows redirects (-L)" : "does not follow redirects")
+        if curl.allowsInsecureTLS { kept.append("accepts any TLS certificate (-k)") }
+        if curl.wantsCompressedResponse { kept.append("compressed response (--compressed)") }
+        out.append(NSAttributedString(string: kept.joined(separator: " · "), attributes: [
+            .font: UIFont.systemFont(ofSize: 11),
+            .foregroundColor: UIColor(white: 0.5, alpha: 1),
+        ]))
+
+        // A body that isn't valid UTF-8 can't be shown in the text field. Say so,
+        // or an empty body row reads as "there is nothing to send".
+        if let body = curl.body, curl.bodyString == nil {
+            out.append(NSAttributedString(
+                string: "\nBinary body (\(body.count) bytes) — not editable, sent unchanged",
+                attributes: [
+                    .font: UIFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: UIColor.systemOrange,
+                ]))
+        }
+
+        if !curl.ignoredFlags.isEmpty {
+            out.append(NSAttributedString(string: "\nIgnored: " + curl.ignoredFlags.joined(separator: ", "), attributes: [
+                .font: UIFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: UIColor.systemOrange,
+            ]))
+        }
+        return out
     }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt ip: IndexPath) {
@@ -624,6 +837,7 @@ final class RequestReplayViewController: UITableViewController {
         case .params:  text = "QUERY PARAMETERS\(params.isEmpty ? "" : " (\(params.count))")"
         case .headers: text = "HEADERS\(headers.isEmpty ? "" : " (\(headers.count))")"
         case .body:    guard methodSupportsBody else { return nil }; text = "BODY"
+        case .imported: guard curlImport != nil else { return nil }; text = "IMPORTED COMMAND"
         }
         let v = UIView()
         let l = UILabel()
@@ -642,6 +856,7 @@ final class RequestReplayViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
         if Section(rawValue: section) == .body && !methodSupportsBody { return 0 }
+        if Section(rawValue: section) == .imported && curlImport == nil { return 0 }
         return 38
     }
     override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat { 4 }
@@ -652,13 +867,57 @@ final class RequestReplayViewController: UITableViewController {
 
 extension RequestReplayViewController: UITextViewDelegate {
     func textViewDidChange(_ textView: UITextView) {
-        if textView.tag == 900 { baseURLString = textView.text }
-        else if textView.tag == 901 { bodyText = textView.text }
+        if textView.tag == 900 {
+            baseURLString = textView.text
+        } else if textView.tag == 901 {
+            bodyText = textView.text
+            bodyWasEdited = true
+            // Show/hide and relabel in place — reloading the row here would end
+            // editing and dismiss the keyboard mid-type.
+            bodyCardView?.configure(text: bodyText)
+        }
         // Keep row height in sync without losing first responder.
         UIView.performWithoutAnimation {
             tableView.beginUpdates()
             tableView.endUpdates()
         }
+    }
+}
+
+// MARK: - Transport policy
+
+/// Applies the two transport flags a cURL command can carry: `-k` (accept any
+/// server trust) and the absence of `-L` (do not follow redirects, which is the
+/// opposite of `URLSession`'s default). Only a delegate can express either, so a
+/// replay that needs them gets its own session.
+private final class ReplayTransportDelegate: NSObject, URLSessionTaskDelegate {
+
+    private let followsRedirects: Bool
+    private let allowsInsecureTLS: Bool
+
+    init(followsRedirects: Bool, allowsInsecureTLS: Bool) {
+        self.followsRedirects = followsRedirects
+        self.allowsInsecureTLS = allowsInsecureTLS
+    }
+
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(followsRedirects ? request : nil)
+    }
+
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard allowsInsecureTLS,
+              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
     }
 }
 

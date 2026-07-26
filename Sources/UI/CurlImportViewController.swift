@@ -121,7 +121,7 @@ final class CurlImportViewController: UIViewController {
         placeholderLabel.text = "curl -X POST 'https://api.example.com/v1/search' \\\n  -H 'Content-Type: application/json' \\\n  --data-raw '{\"query\":\"shoes\"}'"
         editorCard.addSubview(placeholderLabel)
 
-        configure(replayButton, title: "Replay Request", filled: true, action: #selector(replayTapped))
+        configure(replayButton, title: "Open in Replay", filled: true, action: #selector(replayTapped))
         configure(ruleButton, title: "Create Intercept Rule", filled: false, action: #selector(createRuleTapped))
 
         let buttons = UIStackView(arrangedSubviews: [replayButton, ruleButton])
@@ -306,10 +306,14 @@ final class CurlImportViewController: UIViewController {
         dismiss(animated: true)
     }
 
+    /// Opens the *same* editor a captured request replays through, pre-filled
+    /// with the parsed command — one request screen, not two. Sending from there
+    /// lands on the normal request-details page, so an imported command and a
+    /// replayed one are inspected identically.
     @objc private func replayTapped() {
         guard let parsed else { return }
         view.endEditing(true)
-        push(CurlReplayViewController(request: parsed))
+        push(RequestReplayViewController(curl: parsed))
     }
 
     @objc private func createRuleTapped() {

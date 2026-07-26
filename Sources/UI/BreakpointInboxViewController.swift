@@ -107,6 +107,9 @@ final class BreakpointInboxViewController: UITableViewController {
             c.forceLTR()
             return c
         }
+        // `numberOfRows` is max(count, 1) for the empty state, and `items` can
+        // shrink between that count and this call when a request is released.
+        guard items.indices.contains(ip.row) else { return UITableViewCell() }
         let cell = tableView.dequeueReusableCell(withIdentifier: "BP", for: ip) as! BreakpointRowCell
         cell.configure(items[ip.row])
         return cell
@@ -306,6 +309,7 @@ private final class BreakpointDetailViewController: UITableViewController {
         tableView.separatorStyle = .none
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 60
+        tableView.register(JSONEditorCardCell.self, forCellReuseIdentifier: JSONEditorCardCell.reuseIdentifier)
         view.forceLTR()
     }
 
@@ -314,7 +318,25 @@ private final class BreakpointDetailViewController: UITableViewController {
         Row.allCases.count
     }
 
+    /// The editable response body uses the shared JSON card — the same control,
+    /// wording and gesture as the replay editor and the mock editor.
+    private func bodyCardCell(_ ip: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(
+            withIdentifier: JSONEditorCardCell.reuseIdentifier, for: ip) as! JSONEditorCardCell
+        // The only way into the editor on this screen, so it stays put even while
+        // the held payload isn't (yet) valid JSON.
+        cell.cardView.alwaysVisible = true
+        cell.cardView.showsPreview = true
+        cell.cardView.cardTitle = "Edit response body"
+        cell.cardView.detailText = "Reshape the payload before the app ever sees it — add, rename, retype or reorder fields."
+        cell.cardView.configure(text: editedBody)
+        cell.cardView.onTap = { [weak self] in self?.editBody() }
+        return cell
+    }
+
     override func tableView(_ tableView: UITableView, cellForRowAt ip: IndexPath) -> UITableViewCell {
+        if Row(rawValue: ip.row) == .body, isBodyEditable { return bodyCardCell(ip) }
+
         let c = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
         c.backgroundColor = UIColor(white: 0.11, alpha: 1)
         c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
@@ -336,8 +358,9 @@ private final class BreakpointDetailViewController: UITableViewController {
             c.detailTextLabel?.text = headers.keys.sorted()
                 .map { "\($0): \(headers[$0] ?? "")" }.joined(separator: "\n")
         case .body:
-            let editable = isBodyEditable
-            c.textLabel?.text = editable ? "Edit response body" : "Response body"
+            // Editable bodies are handled above by the shared JSON card; this is
+            // the read-only case (binary payload, or paused before the response).
+            c.textLabel?.text = "Response body"
             if paused.isResponseBodyBinary {
                 let bytes = paused.responseBody?.count ?? 0
                 c.detailTextLabel?.text = "Binary payload — \(bytes) bytes, delivered unchanged"
@@ -345,8 +368,7 @@ private final class BreakpointDetailViewController: UITableViewController {
                 let preview = editedBody.trimmingCharacters(in: .whitespacesAndNewlines)
                 c.detailTextLabel?.text = preview.isEmpty ? "(empty)" : String(preview.prefix(300))
             }
-            c.accessoryType = editable ? .disclosureIndicator : .none
-            c.selectionStyle = editable ? .default : .none
+            c.selectionStyle = .none
         case .resume:
             c.textLabel?.text = paused.stage == .afterResponse ? "Deliver to app" : "Send request"
             c.textLabel?.textColor = DebugTheme.accentColor
@@ -365,15 +387,7 @@ private final class BreakpointDetailViewController: UITableViewController {
         tableView.deselectRow(at: ip, animated: true)
         switch Row(rawValue: ip.row)! {
         case .body:
-            guard isBodyEditable else { return }
-            let editor = JSONEditorViewController(text: editedBody, title: "Response Body")
-            editor.saveButtonTitle = "Use Body"
-            editor.onSave = { [weak self] doc in
-                self?.editedBody = doc.prettyText()
-                self?.bodyWasEdited = true
-                self?.tableView.reloadData()
-            }
-            navigationController?.pushViewController(editor, animated: true)
+            editBody()
         case .resume:
             if bodyWasEdited, let data = editedBody.data(using: .utf8) {
                 paused.responseBody = data
@@ -386,5 +400,17 @@ private final class BreakpointDetailViewController: UITableViewController {
         default:
             break
         }
+    }
+
+    private func editBody() {
+        guard isBodyEditable else { return }
+        let editor = JSONEditorViewController(text: editedBody, title: "Response Body")
+        editor.saveButtonTitle = "Use Body"
+        editor.onSave = { [weak self] doc in
+            self?.editedBody = doc.prettyText()
+            self?.bodyWasEdited = true
+            self?.tableView.reloadData()
+        }
+        navigationController?.pushViewController(editor, animated: true)
     }
 }

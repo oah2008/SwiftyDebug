@@ -78,6 +78,20 @@ final class JSONEditorViewController: UIViewController {
     private var collapsed = Set<String>()
     private var filterText = ""
 
+    // MARK: - Inline editing state
+    //
+    // Keyed by PATH, never by row index: every mutation re-flattens the tree and
+    // cells are reused, so an index would point at the wrong node a moment later.
+
+    /// The node currently being edited in place, if any.
+    private var editingPath: JSONPath?
+    /// Live text for that node. The document is only written on commit — writing
+    /// per keystroke would reload the table and kill the caret.
+    private var editingDraft = ""
+    /// Height the inline field last measured, so a cell that scrolls away and
+    /// comes back is restored at the same size.
+    private var editingHeight: CGFloat?
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -110,9 +124,17 @@ final class JSONEditorViewController: UIViewController {
         document.onChange = { [weak self] in
             self?.documentChanged()
         }
+        observeKeyboard()
         rebuildRows()
         updateStatus()
         view.forceLTR()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // Leaving the screen (Save, back, or pushing the value page) must not
+        // drop what's in the inline field.
+        commitInlineEdit()
     }
 
     // MARK: - Setup
@@ -236,6 +258,8 @@ final class JSONEditorViewController: UIViewController {
     // MARK: - Mode
 
     @objc private func modeChanged() {
+        // Commit before the raw text is rendered, or the draft is lost.
+        commitInlineEdit()
         let newMode = Mode(rawValue: modeControl.selectedSegmentIndex) ?? .tree
         // Leaving raw: commit the text if it parses, otherwise refuse to switch.
         if mode == .raw, newMode == .tree {
@@ -278,6 +302,159 @@ final class JSONEditorViewController: UIViewController {
         }
     }
 
+    // MARK: - Keyboard
+
+    private func observeKeyboard() {
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardFrameWillChange(_:)),
+            name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardWillHide(_:)),
+            name: UIResponder.keyboardWillHideNotification, object: nil)
+    }
+
+    @objc private func keyboardFrameWillChange(_ note: Notification) {
+        guard let end = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+        let keyboard = view.convert(end, from: nil)
+        applyKeyboardOverlap(max(0, tableView.frame.maxY - keyboard.minY))
+    }
+
+    @objc private func keyboardWillHide(_ note: Notification) {
+        applyKeyboardOverlap(0)
+    }
+
+    /// Insets the scrollers so the edited row can sit above the keyboard rather
+    /// than under it.
+    private func applyKeyboardOverlap(_ overlap: CGFloat) {
+        tableView.contentInset.bottom = overlap
+        tableView.verticalScrollIndicatorInsets.bottom = overlap
+        rawTextView.contentInset.bottom = overlap
+        rawTextView.verticalScrollIndicatorInsets.bottom = overlap
+        if overlap > 0, editingPath != nil { scrollEditingRowIntoView(animated: true) }
+    }
+
+    // MARK: - Inline value editing
+
+    /// Starts editing `path` in place. The cell must be on screen to take first
+    /// responder, so the row is scrolled in and laid out first.
+    private func beginInlineEdit(at path: JSONPath) {
+        guard let index = rows.firstIndex(where: { $0.path == path }) else { return }
+        let indexPath = IndexPath(row: index, section: 0)
+
+        editingPath = path
+        editingDraft = JSONInlineValueCoder.text(for: document.value(at: path))
+        editingHeight = nil
+        // Dragging must not yank the keyboard away mid-edit.
+        tableView.keyboardDismissMode = .none
+
+        tableView.scrollToRow(at: indexPath, at: .none, animated: false)
+        tableView.layoutIfNeeded()
+        guard let cell = tableView.cellForRow(at: indexPath) as? JSONNodeCell else {
+            // Couldn't get a live cell — fall back to the full page rather than
+            // leaving the row stuck in a half-editing state.
+            finishInlineEditing()
+            editValue(at: path)
+            return
+        }
+        configure(cell, with: rows[index])
+        // Grow the row for the field BEFORE focusing, so the keyboard animates
+        // in against a row that's already its final size.
+        applyRowHeightChange()
+        cell.focusValueEditor()
+        scrollEditingRowIntoView(animated: true)
+    }
+
+    /// The inline field grew or shrank: re-measure the row without reloading it
+    /// (a reload would destroy the cell and with it the first responder).
+    private func inlineEditorHeightChanged(_ height: CGFloat) {
+        editingHeight = height
+        applyRowHeightChange()
+        scrollEditingRowIntoView(animated: false)
+        editingCell()?.scrollCaretToVisible()
+    }
+
+    /// `performBatchUpdates(nil)` re-asks visible cells for their height and
+    /// keeps first responder. The offset is pinned around it because rows above
+    /// the viewport still carry estimated heights and would otherwise shift.
+    private func applyRowHeightChange() {
+        let offset = tableView.contentOffset
+        UIView.performWithoutAnimation {
+            tableView.performBatchUpdates(nil)
+        }
+        let inset = tableView.adjustedContentInset
+        let minY = -inset.top
+        let maxY = max(minY, tableView.contentSize.height + inset.bottom - tableView.bounds.height)
+        let clamped = min(max(offset.y, minY), maxY)
+        if abs(tableView.contentOffset.y - clamped) > 0.5 {
+            tableView.setContentOffset(CGPoint(x: offset.x, y: clamped), animated: false)
+        }
+    }
+
+    /// Keeps the edited row visible above the keyboard. A row taller than the
+    /// gap is aligned to its bottom, where the caret is.
+    private func scrollEditingRowIntoView(animated: Bool) {
+        guard let index = editingRowIndex() else { return }
+        let rect = tableView.rectForRow(at: IndexPath(row: index, section: 0))
+        guard !rect.isNull, rect.height > 0 else { return }
+        let inset = tableView.adjustedContentInset
+        let visibleHeight = tableView.bounds.height - inset.top - inset.bottom
+        guard visibleHeight > 0 else { return }
+
+        var target = rect.insetBy(dx: 0, dy: -8)
+        if target.height > visibleHeight {
+            target = CGRect(x: target.minX, y: target.maxY - visibleHeight,
+                            width: target.width, height: visibleHeight)
+        }
+        tableView.scrollRectToVisible(target, animated: animated)
+    }
+
+    private func editingRowIndex() -> Int? {
+        guard let path = editingPath else { return nil }
+        return rows.firstIndex(where: { $0.path == path })
+    }
+
+    private func editingCell() -> JSONNodeCell? {
+        guard let index = editingRowIndex() else { return nil }
+        return tableView.cellForRow(at: IndexPath(row: index, section: 0)) as? JSONNodeCell
+    }
+
+    /// Writes the inline draft back through the path API and ends editing.
+    /// Safe to call when nothing is being edited — every mutating action calls it
+    /// first so a pending edit is never lost or applied to the wrong node.
+    @discardableResult
+    private func commitInlineEdit() -> Bool {
+        guard let path = editingPath else { return false }
+        let draft = editingDraft
+        let kind = document.kind(at: path)
+        finishInlineEditing()
+
+        guard let kind, JSONInlineEditMetrics.isInlineEditable(kind) else { return false }
+        // Inline edits commit on loss of first responder, not on an explicit Save.
+        // Coercing an unparsable number to 0 would therefore let "select all,
+        // backspace, tap elsewhere" silently destroy a value — discard instead.
+        if kind == .number {
+            let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard Int(trimmed) != nil || Double(trimmed) != nil else { return false }
+        }
+        // A no-op write would still push an undo entry.
+        guard !JSONInlineValueCoder.isUnchanged(draft: draft, current: document.value(at: path)) else {
+            return false
+        }
+        return document.setValue(JSONInlineValueCoder.value(from: draft, kind: kind), at: path)
+    }
+
+    /// Tears the editing state down without touching the document.
+    private func finishInlineEditing() {
+        guard editingPath != nil else { return }
+        let cell = editingCell()
+        editingPath = nil
+        editingDraft = ""
+        editingHeight = nil
+        tableView.keyboardDismissMode = .interactive
+        cell?.endValueEditingSilently()
+        applyRowHeightChange()
+    }
+
     // MARK: - Tree building
 
     private func rebuildRows() {
@@ -285,6 +462,13 @@ final class JSONEditorViewController: UIViewController {
         buildRows(value: document.root, path: [], label: "root", depth: 0, into: &out)
         // The synthetic root row is only useful when the root is a container.
         rows = out
+        // The edited node may have been deleted, filtered out, or collapsed away.
+        if let path = editingPath, !rows.contains(where: { $0.path == path }) {
+            editingPath = nil
+            editingDraft = ""
+            editingHeight = nil
+            tableView.keyboardDismissMode = .interactive
+        }
         tableView.reloadData()
     }
 
@@ -351,10 +535,13 @@ final class JSONEditorViewController: UIViewController {
 
     // MARK: - Toolbar actions
 
-    @objc private func undoTapped() { document.undo() }
-    @objc private func redoTapped() { document.redo() }
+    // Every mutating action commits the inline draft first: each of these
+    // reloads or replaces the tree, which would otherwise strand the edit.
+    @objc private func undoTapped() { commitInlineEdit(); document.undo() }
+    @objc private func redoTapped() { commitInlineEdit(); document.redo() }
 
     @objc private func formatTapped() {
+        commitInlineEdit()
         if mode == .raw {
             guard let parsed = JSONDocument(text: rawTextView.text) else {
                 showAlert("Invalid JSON", JSONDocument.validate(rawTextView.text).error ?? "")
@@ -371,6 +558,7 @@ final class JSONEditorViewController: UIViewController {
     /// Paste a whole payload from the clipboard — the fast path for "edit the
     /// endpoint's real JSON" or "type my own".
     @objc private func pasteTapped() {
+        commitInlineEdit()
         guard let text = UIPasteboard.general.string, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             showAlert("Clipboard empty", "Copy some JSON first, then tap paste.")
             return
@@ -394,10 +582,13 @@ final class JSONEditorViewController: UIViewController {
 
     /// Adds a child to the root container.
     @objc private func addRootChildTapped() {
+        commitInlineEdit()
         addChild(toContainerAt: [])
     }
 
     @objc private func cancelTapped() {
+        // Cancel discards the in-progress inline edit along with everything else.
+        finishInlineEditing()
         if navigationController?.viewControllers.first === self {
             dismiss(animated: true)
         } else {
@@ -406,6 +597,7 @@ final class JSONEditorViewController: UIViewController {
     }
 
     @objc private func saveTapped() {
+        commitInlineEdit()
         // Commit raw text first if that's the active mode.
         if mode == .raw {
             let result = JSONDocument.validate(rawTextView.text)
@@ -434,6 +626,7 @@ final class JSONEditorViewController: UIViewController {
 
     /// The action menu for a node, using the custom picker (no truncation).
     private func presentActions(for row: Row) {
+        commitInlineEdit()
         var options: [OptionPickerSheetViewController.Option] = []
         let path = row.path
         let isRoot = path.isEmpty
@@ -443,10 +636,17 @@ final class JSONEditorViewController: UIViewController {
         }()
 
         if !row.isContainer {
-            options.append(.init(title: "Edit value", subtitle: row.preview,
-                                 symbol: "pencil", tint: DebugTheme.accentColor) { [weak self] in
+            options.append(.init(title: "Edit on its own page", subtitle: row.preview,
+                                 symbol: "arrow.up.left.and.arrow.down.right",
+                                 tint: DebugTheme.accentColor) { [weak self] in
                 self?.editValue(at: path)
             })
+            if JSONInlineEditMetrics.isInlineEditable(row.kind) {
+                options.append(.init(title: "Edit in place", subtitle: "Type right in the row",
+                                     symbol: "pencil") { [weak self] in
+                    self?.beginInlineEdit(at: path)
+                })
+            }
         }
         if row.isContainer {
             options.append(.init(title: row.kind == .array ? "Add item" : "Add key",
@@ -574,43 +774,99 @@ extension JSONEditorViewController: UITableViewDataSource, UITableViewDelegate {
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "Node", for: indexPath) as! JSONNodeCell
-        let row = rows[indexPath.row]
+        guard rows.indices.contains(indexPath.row) else { return cell }
+        configure(cell, with: rows[indexPath.row])
+        return cell
+    }
+
+    /// One place that dresses a cell, used by `cellForRowAt` and when a row is
+    /// switched into editing without a reload (a reload would lose the caret).
+    private func configure(_ cell: JSONNodeCell, with row: Row) {
+        let path = row.path
+        var editing: JSONNodeCell.EditingState?
+        if editingPath == path {
+            editing = JSONNodeCell.EditingState(text: editingDraft, height: editingHeight, kind: row.kind)
+        }
         cell.configure(label: row.label, preview: row.preview, kind: row.kind, depth: row.depth,
-                       isContainer: row.isContainer, isExpanded: row.isExpanded, childCount: row.childCount)
+                       isContainer: row.isContainer, isExpanded: row.isExpanded,
+                       childCount: row.childCount, editing: editing)
+
         cell.onDisclosureTapped = { [weak self] in
             guard let self else { return }
-            let key = row.path.display
+            self.commitInlineEdit()
+            let key = path.display
             if self.collapsed.contains(key) { self.collapsed.remove(key) } else { self.collapsed.insert(key) }
             self.rebuildRows()
         }
-        return cell
+        // The expand affordance: commit what's typed, then hand the node to the
+        // full-page editor, which writes back through the same path.
+        cell.onExpandTapped = { [weak self] in
+            guard let self else { return }
+            self.commitInlineEdit()
+            self.editValue(at: path)
+        }
+        cell.onTextChanged = { [weak self] text in
+            guard let self, self.editingPath == path else { return }
+            self.editingDraft = text
+        }
+        cell.onHeightChanged = { [weak self] height in
+            guard let self, self.editingPath == path else { return }
+            self.inlineEditorHeightChanged(height)
+        }
+        cell.onEditingEnded = { [weak self] text in
+            guard let self, self.editingPath == path else { return }
+            self.editingDraft = text
+            self.commitInlineEdit()
+        }
     }
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
+        guard rows.indices.contains(indexPath.row) else { return }
         let row = rows[indexPath.row]
-        // Tapping a scalar edits it directly; tapping a container opens actions
-        // (its chevron toggles expansion).
+
+        // Tapping a container opens actions (its chevron toggles expansion).
         if row.isContainer {
             presentActions(for: row)
+            return
+        }
+        // Already editing this node: leave the caret alone, unless the cell was
+        // recycled out of the table mid-edit and lost the keyboard.
+        if editingPath == row.path {
+            let cell = tableView.cellForRow(at: indexPath) as? JSONNodeCell
+            if let cell, !cell.isValueEditorFocused { cell.focusValueEditor() }
+            return
+        }
+
+        let path = row.path
+        commitInlineEdit()   // may rebuild the tree, so re-resolve by path below
+        guard rows.contains(where: { $0.path == path }), let kind = document.kind(at: path) else { return }
+
+        // Long or multi-line values are still better on their own page.
+        let text = JSONInlineValueCoder.text(for: document.value(at: path))
+        if JSONInlineEditMetrics.prefersFullPage(text: text, kind: kind) {
+            editValue(at: path)
         } else {
-            editValue(at: row.path)
+            beginInlineEdit(at: path)
         }
     }
 
     func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
-        let row = rows[indexPath.row]
-        guard !row.path.isEmpty else { return nil }   // never delete the root
+        guard rows.indices.contains(indexPath.row) else { return nil }
+        let path = rows[indexPath.row].path
+        guard !path.isEmpty else { return nil }   // never delete the root
 
         let delete = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, done in
-            self?.document.remove(at: row.path)
+            self?.commitInlineEdit()
+            self?.document.remove(at: path)
             done(true)
         }
         var actions = [delete]
 
-        if case .index? = row.path.last {
+        if case .index? = path.last {
             let dup = UIContextualAction(style: .normal, title: "Duplicate") { [weak self] _, _, done in
-                self?.document.duplicateElement(at: row.path)
+                self?.commitInlineEdit()
+                self?.document.duplicateElement(at: path)
                 done(true)
             }
             dup.backgroundColor = UIColor(red: 0.16, green: 0.50, blue: 0.47, alpha: 1)
@@ -620,6 +876,7 @@ extension JSONEditorViewController: UITableViewDataSource, UITableViewDelegate {
     }
 
     func tableView(_ tableView: UITableView, leadingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        guard rows.indices.contains(indexPath.row) else { return nil }
         let row = rows[indexPath.row]
         let more = UIContextualAction(style: .normal, title: "More") { [weak self] _, _, done in
             self?.presentActions(for: row)

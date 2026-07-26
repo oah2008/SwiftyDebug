@@ -108,6 +108,7 @@ final class MockResponseEditorViewController: UITableViewController {
         tableView.separatorStyle = .none
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 60
+        tableView.register(JSONEditorCardCell.self, forCellReuseIdentifier: JSONEditorCardCell.reuseIdentifier)
         rebuildSections()
         view.forceLTR()
     }
@@ -189,7 +190,25 @@ final class MockResponseEditorViewController: UITableViewController {
         return c
     }
 
+    /// The body row is the shared JSON card, so opening a payload for editing
+    /// looks and behaves the same here as in the replay editor, the breakpoint
+    /// inbox and the storage editor.
+    private func bodyCardCell(_ ip: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(
+            withIdentifier: JSONEditorCardCell.reuseIdentifier, for: ip) as! JSONEditorCardCell
+        // The card is the only way into the editor here — an empty mock body has
+        // to stay reachable, so it never hides itself.
+        cell.cardView.alwaysVisible = true
+        cell.cardView.showsPreview = true
+        cell.cardView.detailText = "Open the tree editor to add, rename, retype or reorder fields."
+        cell.cardView.configure(text: mock.body)
+        cell.cardView.onTap = { [weak self] in self?.editBody() }
+        return cell
+    }
+
     override func tableView(_ tableView: UITableView, cellForRowAt ip: IndexPath) -> UITableViewCell {
+        if case .bodyEdit = sections[ip.section].rows[ip.row] { return bodyCardCell(ip) }
+
         let c = cell()
         switch sections[ip.section].rows[ip.row] {
         case .matchMode:
@@ -251,13 +270,7 @@ final class MockResponseEditorViewController: UITableViewController {
             c.accessoryView = value
 
         case .bodyEdit:
-            c.textLabel?.text = "Edit body"
-            let preview = mock.body.trimmingCharacters(in: .whitespacesAndNewlines)
-            c.detailTextLabel?.text = preview.isEmpty
-                ? "Empty — tap to build a JSON body"
-                : String(preview.prefix(160))
-            c.detailTextLabel?.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-            c.accessoryType = .disclosureIndicator
+            break   // handled above by bodyCardCell(_:)
 
         case .bodyFromReal:
             c.textLabel?.text = "Start from the real response"

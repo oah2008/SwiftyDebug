@@ -24,30 +24,28 @@ private final class TabFilterState {
     // Opt-in, per tab, and per *side*: request bodies and response bodies are
     // two independent scopes, mirroring `ResponseBodySearch.Options`'
     // `searchRequestBodies` / `searchResponseBodies` flags. Nothing is read from
-    // disk until either the "Bodies" control arms the tab (then scans are
-    // debounced behind typing) or the user taps a scope chip on the inline
-    // scope row.
+    // disk until the Advanced Search sheet turns a side on — that arms the tab,
+    // and scans are then debounced behind typing.
     //
-    // A scope being ON only means "merge these hits into the list". Counts are
-    // produced by the scan and shown on the chips *before* the merge, so the
-    // developer can see there are N more hits inside bodies first.
+    // A scope being ON means "read this side and merge its hits into the list".
 
-    /// The "Bodies" control is armed for this tab (auto-scan after the debounce).
+    /// Body search is armed for this tab (auto-scan after the debounce).
     var isBodySearchEnabled: Bool = false
-    /// Scope chips: hits from this side are merged into the result list.
+    /// Hits from this side are merged into the result list. Mirrors the
+    /// Advanced sheet's two body switches.
     var enabledScopes: Set<BodySearchSide> = []
-    /// Sides with a scan in flight — the chip shows "scanning…" instead of a
-    /// stale or zero count.
+    /// Sides with a scan in flight — the progress banner is reporting on them.
     var scanningSides: Set<BodySearchSide> = []
     /// The (trimmed) query the counts and matches below belong to. Anything else
     /// in the search field makes them stale.
     var scannedQuery: String = ""
     /// side -> (transactionId -> hit) for the last completed scan of that side.
     var matchesBySide: [BodySearchSide: [String: BodySearchMatch]] = [:]
-    /// side -> hit count. nil (absent) means "never scanned", which the chip
-    /// renders as an invitation to scan rather than as zero.
+    /// side -> hit count. nil (absent) means "never scanned for this query",
+    /// which is what makes a side count as stale and worth (re)scanning.
     var countsBySide: [BodySearchSide: Int] = [:]
-    /// One-line summary of the last scan, shown on the scope row.
+    /// One-line summary of the last scan, reported by the progress banner when
+    /// the scan lands.
     var bodySearchSummary: String = ""
     /// Everything from the Advanced Search sheet. Per tab, and sticky across
     /// queries — these are settings, not part of a single search.
@@ -73,13 +71,13 @@ private final class TabFilterState {
         bodySearchSummary = ""
     }
 
-    /// Full reset, including the chips — used when body search is disarmed or the
-    /// capture store is cleared.
+    /// Full reset, including the scopes — used when body search is disarmed or
+    /// the capture store is cleared.
     ///
-    /// Clears the Advanced sheet's scope switches too, since they are the same
-    /// setting: leaving them on would make the sheet claim bodies are searched
-    /// when nothing is. The matching options (case, media, byte cap) survive —
-    /// those are preferences, not part of one search.
+    /// Clears the Advanced sheet's scope switches too: leaving them on would
+    /// make the sheet claim bodies are searched when nothing is. The matching
+    /// options (case, media, byte cap) survive — those are preferences, not
+    /// part of one search.
     func resetBodySearch() {
         resetScanResults()
         enabledScopes.removeAll()
@@ -134,13 +132,15 @@ class NetworkViewController: UIViewController {
     /// Typing never scans. This fires once the user pauses.
     private var scanDebounceTimer: Timer?
     private static let scanDebounceInterval: TimeInterval = 0.45
+    /// Bumped every time the banner is shown, re-shown or hidden, so a pending
+    /// auto-dismiss can tell whether it still owns what is on screen.
+    private var bannerGeneration = 0
+    /// How long the finished-scan summary stays up before the banner closes.
+    private static let bannerResultDuration: TimeInterval = 3.0
 
     /// Body hit per displayed row (nil = matched on metadata only), index-aligned
     /// with `models`. Built by `applyFilter()`, never read from disk.
     private var rowMatches: [BodySearchMatch?] = []
-    /// Rows the index-backed (metadata) search alone would have produced — the
-    /// "URL & headers" count on the scope row.
-    private var metadataResultCount = 0
 
     // Floating glass header (iOS 26+)
     private var floatingHeader: UIView?
@@ -577,7 +577,6 @@ class NetworkViewController: UIViewController {
             models = nil
             groupedModels = []
             rowMatches = []
-            metadataResultCount = 0
             return
         }
 
@@ -630,7 +629,6 @@ class NetworkViewController: UIViewController {
         //    second list, no second section, and no disk read (the scan already
         //    did that once, off the main thread).
         rowMatches = []
-        metadataResultCount = 0
         let query = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !state.searchText.isEmpty {
             let raw = state.searchText
@@ -660,7 +658,6 @@ class NetworkViewController: UIViewController {
                 }
 
                 guard metadataHit || bodyMatch != nil else { continue }
-                if metadataHit { metadataResultCount += 1 }
                 kept.append(model)
                 keptMatches.append(bodyMatch)
             }
@@ -709,23 +706,24 @@ class NetworkViewController: UIViewController {
     //
     // The normal list search is index-backed and never touches bodies, because
     // `requestData`/`responseData` are disk-backed (one file read per access).
-    // Body search is therefore still **opt-in**, but it is now presented inline
-    // instead of as a separate results mode:
+    // Body search is therefore **opt-in**, and it has exactly one entry point:
+    // the **Advanced** button, which opens `AdvancedSearchSheetViewController`
+    // with the Response body / Request body switches (plus case sensitivity,
+    // whole-body scanning and media inclusion).
     //
-    //   1. the query row shows a scope cell as the first row of the results,
-    //      with one chip per `BodySearchSide` (request / response),
-    //   2. a chip carries that side's hit count, so the user can see "there are
-    //      N more hits inside bodies" *before* merging them,
-    //   3. counts come from `ResponseBodySearch.scan` run once per side with
+    //   1. turning a body switch on arms the tab for that `BodySearchSide`,
+    //   2. scans come from `ResponseBodySearch.scan`, run once per side with
     //      only that side's flag set — off the main thread, byte-capped,
     //      cancellable, and memoised per (query, transaction) by BodySearchCache,
-    //   4. a scan is only started by an explicit act: arming the "Bodies"
-    //      control (then debounced behind typing), tapping a chip, or hitting
-    //      Search/Return while armed. Typing alone never reads a body.
+    //   3. a scan only starts from an explicit act: flipping a switch in the
+    //      sheet, or hitting Search/Return while armed. Typing alone never reads
+    //      a body — it just reschedules the debounced rescan for an armed tab.
     //
-    // Turning a chip on merges its hits into the same list the metadata search
-    // produced — see `applyFilter()` — and those rows render with the normal
-    // result card plus one extra snippet line.
+    // Hits are merged into the same list the metadata search produced — see
+    // `applyFilter()` — and those rows render with the normal result card plus
+    // one extra snippet line and a REQUEST/RESPONSE badge. While a scan runs the
+    // floating progress banner is the in-list feedback; the Advanced button's
+    // active pill is what says body search is on at all.
 
     private func updateAdvancedSearchButton() {
         // "Active" means the search is doing something beyond plain matching, so
@@ -765,14 +763,12 @@ class NetworkViewController: UIViewController {
                                            state: TabFilterState) {
         updateAdvancedSearchButton()
 
-        // The scope switches in the sheet and the chips on the card are the same
-        // setting shown twice — keep them in step.
+        // The sheet's two body switches ARE the scopes — keep them in step.
         state.setScope(.response, on: updated.searchResponseBodies)
         state.setScope(.request, on: updated.searchRequestBodies)
 
         guard updated.searchesAnyBody else {
             disarmBodySearch()
-            reloadScopeRow()
             return
         }
         state.isBodySearchEnabled = true
@@ -785,7 +781,7 @@ class NetworkViewController: UIViewController {
         if matchingRulesChanged { state.resetScanResults() }
 
         let query = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { reloadScopeRow(); return }
+        guard !query.isEmpty else { return }
 
         let stale = BodySearchSide.allCases.filter {
             state.isScopeOn($0) && (state.scannedQuery != query || state.countsBySide[$0] == nil)
@@ -799,9 +795,8 @@ class NetworkViewController: UIViewController {
     }
 
     /// Turns body scanning off for this tab and returns the list to the
-    /// index-backed view. Arming happens from the card's chips instead — there is
-    /// no separate on/off control any more, because "armed but no scope chosen"
-    /// was a state that did nothing and explained nothing.
+    /// index-backed view. Called when the Advanced sheet's last body switch goes
+    /// off — "armed but no scope chosen" is a state that would scan nothing.
     private func disarmBodySearch() {
         let state = currentTabState
         state.isBodySearchEnabled = false
@@ -823,113 +818,11 @@ class NetworkViewController: UIViewController {
         tableView.reloadData()
     }
 
-    // MARK: Scope row
-
-    /// The scope cell is the first row whenever there is something to scope.
-    private var showsScopeRow: Bool {
+    /// A query is active, so every row renders as a search result card (match
+    /// snippet + REQUEST/RESPONSE badge) instead of the plain capture row.
+    /// Trimmed, so a field holding only spaces is not "searching".
+    private var isSearching: Bool {
         return !currentTabState.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    /// Rows the data arrays own, i.e. everything after the scope cell.
-    private var rowOffset: Int { showsScopeRow ? 1 : 0 }
-
-    private func scopeConfig(for state: TabFilterState) -> NetworkSearchScopeCell.Config {
-        let query = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isFresh = state.scannedQuery == query && !query.isEmpty
-
-        let scopes: [NetworkSearchScopeCell.ScopeState] = [.response, .request].map { side in
-            NetworkSearchScopeCell.ScopeState(
-                side: side,
-                isOn: state.isScopeOn(side),
-                isScanning: state.scanningSides.contains(side),
-                // A count from another query is worse than no count at all.
-                count: isFresh ? state.countsBySide[side] : nil
-            )
-        }
-
-        return NetworkSearchScopeCell.Config(
-            query: query,
-            metadataCount: metadataResultCount,
-            scopes: scopes,
-            statusText: scopeStatusText(for: state, query: query)
-        )
-    }
-
-    private func scopeStatusText(for state: TabFilterState, query: String) -> String {
-        if !state.scanningSides.isEmpty {
-            let done = scanProgress.values.reduce(0, +)
-            return "Scanning \(done)/\(max(scanTotal, 1))\u{2026}"
-        }
-        if state.scannedQuery == query, !state.bodySearchSummary.isEmpty {
-            return state.bodySearchSummary
-        }
-        return "Bodies are on disk \u{00B7} first \(ResponseBodySearch.byteCapDescription) each"
-    }
-
-    /// Refreshes just the scope cell — cheap, and it never disturbs the scroll
-    /// position of the results underneath it.
-    private func reloadScopeRow() {
-        guard isViewLoaded, showsScopeRow,
-              tableView.numberOfRows(inSection: 0) > 0 else { return }
-        tableView.reloadRows(at: [IndexPath(row: 0, section: 0)], with: .none)
-    }
-
-    /// Progress ticks only touch the status line, so the chips don't flicker.
-    private func updateScopeRowStatus() {
-        guard isViewLoaded, showsScopeRow else { return }
-        let cell = tableView.cellForRow(at: IndexPath(row: 0, section: 0)) as? NetworkSearchScopeCell
-        let state = currentTabState
-        let query = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        cell?.setStatus(scopeStatusText(for: state, query: query))
-    }
-
-    /// A chip tap is both the switch and the way in: it turns the scope on and,
-    /// if that side has no fresh count yet, scans it (arming the tab so later
-    /// queries keep their counts up to date).
-    private func didToggleScope(_ side: BodySearchSide) {
-        let state = currentTabState
-        let query = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return }
-
-        let turningOn = !state.isScopeOn(side)
-        state.setScope(side, on: turningOn)
-        // The card chips and the Advanced sheet's scope switches are one setting
-        // shown in two places — mirror the change back so reopening the sheet
-        // doesn't contradict the card.
-        switch side {
-        case .response: state.advanced.searchResponseBodies = turningOn
-        case .request:  state.advanced.searchRequestBodies = turningOn
-        }
-        updateAdvancedSearchButton()
-
-        if turningOn {
-            state.isBodySearchEnabled = true
-            // Already scanning this side: just record the choice, the running
-            // scan merges itself in when it lands. Restarting here would cancel
-            // the sibling side's scan for nothing.
-            if state.scanningSides.contains(side) {
-                reloadScopeRow()
-                return
-            }
-            if state.scannedQuery != query || state.countsBySide[side] == nil {
-                // Carry any side that is mid-scan into the new scan. One shared
-                // cancellation token covers both sides, so scanning only `side`
-                // would kill the sibling's in-flight scan and strand its chip on
-                // "scan" with no rows and nothing scheduled to fix it.
-                let sides = Array(Set(state.scanningSides).union([side]))
-                startBodySearch(query: query, sides: sides)
-                return   // the scan reloads once it lands
-            }
-        } else if BodySearchSide.allCases.allSatisfy({ !state.isScopeOn($0) }) {
-            // Last chip off: stop scanning and release the cached hits rather
-            // than leaving the tab armed but searching nothing.
-            disarmBodySearch()
-            reloadScopeRow()
-            return
-        }
-
-        applyFilter()
-        tableView.reloadData()
     }
 
     // MARK: Scan lifecycle
@@ -979,7 +872,6 @@ class NetworkViewController: UIViewController {
             state.scannedQuery = query
             for side in sides { state.countsBySide[side] = 0 }
             state.bodySearchSummary = "Nothing to scan on this tab."
-            reloadScopeRow()
             return
         }
 
@@ -991,7 +883,6 @@ class NetworkViewController: UIViewController {
         scanTotal = candidates.count * sides.count
         state.scanningSides = Set(sides)
         showScanBanner(total: scanTotal)
-        reloadScopeRow()
 
         for side in sides {
             ResponseBodySearch.scan(
@@ -1005,7 +896,6 @@ class NetworkViewController: UIViewController {
                     self.scanBanner?.update(
                         done: self.scanProgress.values.reduce(0, +), total: self.scanTotal
                     )
-                    self.updateScopeRowStatus()
                 },
                 completion: { [weak self] outcome in
                     guard let self = self, self.activeScanToken === token else { return }
@@ -1016,17 +906,15 @@ class NetworkViewController: UIViewController {
     }
 
     private func cancelActiveScan() {
-        let wasScanning = activeScanToken != nil
         activeScanToken?.cancel()
         activeScanToken = nil
         activeScanState?.scanningSides.removeAll()
         activeScanState = nil
         pendingScanSides = 0
         scanProgress = [:]
+        // The banner is the only thing claiming a scan is running, so it has to
+        // go the moment the scan dies — including when its own Cancel killed it.
         hideScanBanner()
-        // The chips must stop claiming "scanning…" the moment the scan dies —
-        // including when the banner's Cancel is what killed it.
-        if wasScanning { reloadScopeRow() }
     }
 
     private func finishScan(_ outcome: ResponseBodySearch.Outcome,
@@ -1035,14 +923,14 @@ class NetworkViewController: UIViewController {
                             state: TabFilterState) {
         state.scanningSides.remove(side)
         pendingScanSides -= 1
-        if pendingScanSides <= 0 {
+        let isLastSide = pendingScanSides <= 0
+        if isLastSide {
             activeScanToken = nil
             activeScanState = nil
-            hideScanBanner()
         }
 
         guard !outcome.wasCancelled else {
-            reloadScopeRow()
+            if isLastSide { hideScanBanner() }
             return
         }
 
@@ -1054,8 +942,24 @@ class NetworkViewController: UIViewController {
         state.countsBySide[side] = outcome.matches.count
         state.bodySearchSummary = Self.summaryText(for: outcome)
 
+        // With every side done, the banner stops reporting progress and reports
+        // the result instead — the per-side hit counts used to live on the
+        // inline scope card, and this is now the only place they surface.
+        if isLastSide { showScanResultInBanner(for: state) }
+
         applyFilter()
         tableView.reloadData()
+    }
+
+    /// Per-side hit counts for the query the scan just finished, e.g.
+    /// "Response body 4 · Request body 0".
+    private func scanCountsText(for state: TabFilterState) -> String {
+        let parts: [String] = [BodySearchSide.response, .request].compactMap { side in
+            guard state.isScopeOn(side), let count = state.countsBySide[side] else { return nil }
+            let name = side == .response ? "Response body" : "Request body"
+            return "\(name) \(count)"
+        }
+        return parts.isEmpty ? "Scan finished" : parts.joined(separator: " \u{00B7} ")
     }
 
     private static func summaryText(for outcome: ResponseBodySearch.Outcome) -> String {
@@ -1087,12 +991,29 @@ class NetworkViewController: UIViewController {
             scanBanner = created
             return created
         }()
+        // Any auto-dismiss scheduled by a previous scan's result must not close
+        // the banner this scan just re-opened.
+        bannerGeneration &+= 1
         view.bringSubviewToFront(banner)
         banner.isHidden = false
         banner.update(done: 0, total: total)
     }
 
+    /// Flips the banner from "scanning" to the result of the scan, then closes
+    /// it on its own so it never sits on top of the results the user came for.
+    private func showScanResultInBanner(for state: TabFilterState) {
+        guard let banner = scanBanner, !banner.isHidden else { return }
+        bannerGeneration &+= 1
+        let generation = bannerGeneration
+        banner.showResult(counts: scanCountsText(for: state), detail: state.bodySearchSummary)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.bannerResultDuration) { [weak self] in
+            guard let self = self, self.bannerGeneration == generation else { return }
+            self.hideScanBanner()
+        }
+    }
+
     private func hideScanBanner() {
+        bannerGeneration &+= 1
         scanBanner?.isHidden = true
     }
 
@@ -1329,7 +1250,6 @@ class NetworkViewController: UIViewController {
         tableView.separatorStyle = .none
         tableView.register(NetworkCell.self, forCellReuseIdentifier: "NetworkCell")
         tableView.register(NetworkGroupCell.self, forCellReuseIdentifier: "NetworkGroupCell")
-        tableView.register(NetworkSearchScopeCell.self, forCellReuseIdentifier: NetworkSearchScopeCell.reuseId)
         tableView.register(NetworkSearchResultCell.self, forCellReuseIdentifier: NetworkSearchResultCell.reuseId)
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 80
@@ -1410,10 +1330,9 @@ class NetworkViewController: UIViewController {
         searchBar.translatesAutoresizingMaskIntoConstraints = false
         searchRow.addSubview(searchBar)
 
-        // Body search deliberately has NO control here. It lives entirely in the
-        // inline card at the top of the results (NetworkSearchScopeCell), where
-        // there is room to say what it searches and what it costs — an icon in
-        // this row could only ever be an unlabelled mystery. (See BODY-SEARCH.)
+        // Body search has no control of its own: "Advanced" owns it, together
+        // with the rest of the search options, so the results list stays nothing
+        // but results. (See BODY-SEARCH.)
         advancedSearchButton = makeSearchControl(action: #selector(didTapAdvancedSearch))
         filterButton = makeSearchControl(action: #selector(didTapFilter))
         layoutToggleButton = makeSearchControl(action: #selector(didTapLayoutToggle))
@@ -1835,12 +1754,11 @@ extension NetworkViewController: UISearchBarDelegate {
 
     func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
         let state = currentTabState
-        let hadScopeRow = showsScopeRow
         state.searchText = searchText
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Typing never reads a body. It only drops hits that belonged to another
-        // query — the chips' on/off choice is deliberately sticky.
+        // query — the chosen scopes are deliberately sticky.
         if state.scannedQuery != query, !state.scannedQuery.isEmpty {
             cancelActiveScan()
             state.resetScanResults()
@@ -1852,7 +1770,6 @@ extension NetworkViewController: UISearchBarDelegate {
         }
         applyFilter()
         tableView.reloadData()
-        if hadScopeRow != showsScopeRow { updateScopeRowStatus() }
 
         // The scan itself is debounced, and only when the tab is armed.
         scheduleAutoScan()
@@ -1890,23 +1807,12 @@ extension NetworkViewController: UITableViewDataSource {
         let dataCount = currentTabState.isGroupedMode ? groupedModels.count : (models?.count ?? 0)
         let hasBodyHits = rowMatches.contains { $0 != nil }
         naviItemTitleLabel?.text = hasBodyHits ? "\u{1f50e}[\(dataCount)]" : "\u{1f680}[\(dataCount)]"
-        // +1 for the inline scope row, which is only present while searching.
-        return dataCount + rowOffset
+        // Rows map 1:1 onto the data — the list is nothing but results.
+        return dataCount
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        // Row 0 while searching: the scope control (BODY-SEARCH).
-        if showsScopeRow, indexPath.row == 0 {
-            let cell = tableView.dequeueReusableCell(
-                withIdentifier: NetworkSearchScopeCell.reuseId, for: indexPath
-            ) as! NetworkSearchScopeCell
-            cell.configure(with: scopeConfig(for: currentTabState))
-            // Keyed by side, never by row index — safe across reuse.
-            cell.onToggle = { [weak self] side in self?.didToggleScope(side) }
-            return cell
-        }
-
-        let dataIndex = indexPath.row - rowOffset
+        let dataIndex = indexPath.row
 
         if currentTabState.isGroupedMode {
             let cell = tableView.dequeueReusableCell(withIdentifier: "NetworkGroupCell", for: indexPath) as! NetworkGroupCell
@@ -1918,7 +1824,7 @@ extension NetworkViewController: UITableViewDataSource {
         // While searching every row uses the search card: same layout as the
         // normal row, plus the extra snippet line when this row matched inside a
         // body. `rowMatches` was built by `applyFilter()` — no disk read here.
-        if showsScopeRow {
+        if isSearching {
             let cell = tableView.dequeueReusableCell(
                 withIdentifier: NetworkSearchResultCell.reuseId, for: indexPath
             ) as! NetworkSearchResultCell
@@ -1951,9 +1857,7 @@ extension NetworkViewController: UITableViewDelegate {
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
 
-        // The scope row is driven by its chips, not by selecting it.
-        if showsScopeRow, indexPath.row == 0 { return }
-        let dataIndex = indexPath.row - rowOffset
+        let dataIndex = indexPath.row
 
         if currentTabState.isGroupedMode {
             guard groupedModels.indices.contains(dataIndex) else { return }
@@ -1994,10 +1898,9 @@ extension NetworkViewController: UITableViewDelegate {
     }
 
     func tableView(_ tableView: UITableView, leadingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
-        // Only in flat (non-grouped) mode, and never on the scope row.
+        // Only in flat (non-grouped) mode.
         guard !currentTabState.isGroupedMode else { return nil }
-        if showsScopeRow, indexPath.row == 0 { return nil }
-        let dataIndex = indexPath.row - rowOffset
+        let dataIndex = indexPath.row
         guard let models = models, models.indices.contains(dataIndex) else { return nil }
 
         let model = models[dataIndex]
@@ -2059,15 +1962,17 @@ private enum BodySearchStyle {
 
 //MARK: - Body search progress banner (determinate + cancellable)
 
-/// Floating card that reports "Scanning 42/210…" while a scan runs. It sits
-/// above the follow button and leaves the rest of the screen interactive, so the
-/// list stays scrollable and new captures keep landing while the scan works.
+/// Floating card that reports "Scanning 42/210…" while a scan runs, then the
+/// hit counts once it lands. It sits above the follow button and leaves the rest
+/// of the screen interactive, so the list stays scrollable and new captures keep
+/// landing while the scan works.
 private final class BodySearchProgressBanner: UIView {
 
     var onCancel: (() -> Void)?
 
     private let titleLabel = UILabel()
     private let countLabel = UILabel()
+    private let detailLabel = UILabel()
     private let progressView = UIProgressView(progressViewStyle: .default)
     private let cancelButton = UIButton(type: .system)
 
@@ -2096,6 +2001,13 @@ private final class BodySearchProgressBanner: UIView {
 
         countLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         countLabel.textColor = BodySearchStyle.value
+        countLabel.numberOfLines = 0
+
+        // What the scan cost, shown only once it has finished.
+        detailLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        detailLabel.textColor = BodySearchStyle.caption
+        detailLabel.numberOfLines = 0
+        detailLabel.isHidden = true
 
         progressView.progressTintColor = DebugTheme.accentColor
         progressView.trackTintColor = UIColor(white: 0.24, alpha: 1)
@@ -2105,7 +2017,7 @@ private final class BodySearchProgressBanner: UIView {
         topRow.alignment = .center
         topRow.spacing = 8
 
-        let stack = UIStackView(arrangedSubviews: [topRow, countLabel, progressView])
+        let stack = UIStackView(arrangedSubviews: [topRow, countLabel, detailLabel, progressView])
         stack.axis = .vertical
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -2122,8 +2034,23 @@ private final class BodySearchProgressBanner: UIView {
     }
 
     func update(done: Int, total: Int) {
+        titleLabel.text = "SCANNING BODIES"
         countLabel.text = "Scanning \(done)/\(total)\u{2026}"
+        detailLabel.isHidden = true
+        progressView.isHidden = false
+        cancelButton.isHidden = false
         progressView.progress = total > 0 ? Float(done) / Float(total) : 0
+    }
+
+    /// End state: what was found and what it cost. There is nothing left to
+    /// cancel, so the Cancel button and the progress bar go away.
+    func showResult(counts: String, detail: String) {
+        titleLabel.text = "BODY SEARCH"
+        countLabel.text = counts
+        detailLabel.text = detail
+        detailLabel.isHidden = detail.isEmpty
+        progressView.isHidden = true
+        cancelButton.isHidden = true
     }
 
     @objc private func cancelTapped() { onCancel?() }
