@@ -201,8 +201,8 @@ Fails the request immediately without sending it.
 **Host and path** replaces both, still keeping the original query string.
 
 ```
-mahaly.com/checkout/abc?p=1  +  beta.mahaly.com
-    → beta.mahaly.com/checkout/abc?p=1
+webapp.com/checkout/abc?p=1  +  beta.webapp.com
+    → beta.webapp.com/checkout/abc?p=1
 ```
 
 A live before/after preview runs the real redirect code. Any query or fragment typed into the target is discarded — the original request's query always wins. The `Host` header is rewritten to match unless your rule overrides it explicitly.
@@ -231,8 +231,8 @@ The edit you'd make by hand at a breakpoint, applied automatically to every matc
 
 ```
 {"data":{"url":"https://google.com/path/to/a"}}
-                ↓   data.url  ·  Change host → salla.com
-{"data":{"url":"https://salla.com/path/to/a"}}
+                ↓   data.url  ·  Change host → webapp.com
+{"data":{"url":"https://webapp.com/path/to/a"}}
 ```
 
 **Path patterns:**
