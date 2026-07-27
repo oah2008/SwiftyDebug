@@ -6,7 +6,7 @@ Pod::Spec.new do |s|
   s.license      = { :type => "MIT", :file => "LICENSE" }
   s.author       = "Omar Hariri"
   s.platform     = :ios, "15.0"
-  s.source       = { :git => "", :tag => s.version.to_s }
+  s.source       = { :git => "https://github.com/oah2008/SwiftyDebug.git", :tag => s.version.to_s }
 
   s.source_files = "Sources/**/*.{swift,h,m}"
   s.resources    = "Sources/Resources/**/*"

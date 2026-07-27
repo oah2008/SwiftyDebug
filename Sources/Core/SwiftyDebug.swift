@@ -62,6 +62,23 @@ public class SwiftyDebug {
     /// Capture console logs.
     public static var enableConsoleLog = true
 
+    /// Whether SwiftyDebug raises the host app's request timeouts while it is
+    /// enabled (default `true`).
+    ///
+    /// A request paused at a breakpoint delivers no bytes, so the app's own
+    /// `timeoutIntervalForRequest` — an *idle* timer — would kill it long before
+    /// anyone could read it. To prevent that, the SDK raises request timeouts to
+    /// cover the hold budget (10 minutes) app-wide, for every request, whether or
+    /// not breakpoints are in use.
+    ///
+    /// That is a real change to the host app's networking behaviour, so it is
+    /// switchable. Set it to `false` if your app depends on its own timeouts —
+    /// breakpoints then only survive as long as the app is willing to wait.
+    public static var extendTimeoutsForBreakpoints: Bool {
+        get { Settings.shared.extendTimeoutsForBreakpoints }
+        set { Settings.shared.extendTimeoutsForBreakpoints = newValue }
+    }
+
     public static func enable() {
         initializationMethod()
     }
