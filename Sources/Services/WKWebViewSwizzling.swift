@@ -13,6 +13,17 @@ import ObjectiveC
 
 /// Wraps an app-registered WKScriptMessageHandler so SwiftyDebug can log the
 /// message before forwarding it to the original handler.
+///
+/// - Important: the original handler is held **strongly**, on purpose. Apple's
+///   documented ownership model is that `WKUserContentController.add(_:name:)`
+///   retains the handler, and apps commonly register a handler object relying on
+///   WebKit to keep it alive. Since we swap our proxy in as the registered
+///   handler, the proxy must strongly retain the app's handler or the app would
+///   silently stop receiving its own messages. This proxy references no web view
+///   or configuration, so it cannot participate in the WKWebView retain cycle —
+///   that leak is fixed separately by registering SwiftyDebug's *own* handler
+///   through `WeakScriptMessageHandler` pointing at an immortal shared instance.
+///   (See WEBVIEW-LEAK.)
 class WKScriptMessageProxy: NSObject, WKScriptMessageHandler {
 
     let originalHandler: WKScriptMessageHandler
@@ -26,20 +37,49 @@ class WKScriptMessageProxy: NSObject, WKScriptMessageHandler {
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        // Log to SwiftyDebug Logs tab (Web section)
-        LogEntryBuilder.handleLog(
-            file: "[WKWebView]",
-            function: message.name,
-            line: 0,
-            message: "\(message.body)",
-            color: .cyan,
-            type: .none
-        )
+        // Skip all work when the SDK is fully stopped.
+        if SwiftyDebugRuntime.isActive {
+            // Log to SwiftyDebug Logs tab (Web section)
+            LogEntryBuilder.handleLog(
+                file: "[WKWebView]",
+                function: message.name,
+                line: 0,
+                message: "\(message.body)",
+                color: .cyan,
+                type: .none
+            )
+        }
 
         // Forward to original handler
         if originalHandler.responds(to: #selector(WKScriptMessageHandler.userContentController(_:didReceive:))) {
             originalHandler.userContentController(userContentController, didReceive: message)
         }
+    }
+}
+
+// MARK: - WeakScriptMessageHandler
+
+/// A weak forwarding shim for SwiftyDebug's *own* handler. Registering a handler
+/// with `WKUserContentController` creates a strong retain from the content
+/// controller (owned by the web view's configuration) to the handler. By
+/// registering this shim instead of the real handler, and having the shim point
+/// weakly at a single shared handler, no per-web-view strong retain cycle keeps
+/// the web view alive. (See WEBVIEW-LEAK.)
+final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+
+    weak var target: WKScriptMessageHandler?
+
+    init(target: WKScriptMessageHandler) {
+        self.target = target
+        super.init()
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard SwiftyDebugRuntime.isActive else { return }
+        target?.userContentController(userContentController, didReceive: message)
     }
 }
 
@@ -52,6 +92,12 @@ class WKScriptMessageProxy: NSObject, WKScriptMessageHandler {
 
     /// Weak set of all live WKWebView instances so we can push rule updates.
     static let trackedWebViews = NSHashTable<WKWebView>.weakObjects()
+
+    /// A single shared handler that actually processes SwiftyDebug's own
+    /// messages (console + networkCapture). Web views register a *weak* shim
+    /// pointing at this instance rather than retaining a per-web-view handler,
+    /// which is what keeps WKWebViews from leaking. (See WEBVIEW-LEAK.)
+    static let sharedScriptHandler = WKWebViewScriptHandler()
 
     /// Call once (e.g. from `SwiftyDebug.enable()`) to install all swizzles.
     /// Idempotent — always enabled.
@@ -70,11 +116,110 @@ class WKScriptMessageProxy: NSObject, WKScriptMessageHandler {
 
     /// Push latest intercept rules to all tracked WKWebViews.
     private static func pushRulesToWebViews() {
+        guard SwiftyDebugRuntime.isActive else { return }
         let json = InterceptRuleStore.shared.rulesAsJSONString()
         let js = "if(window.__cd_updateInterceptRules)window.__cd_updateInterceptRules(\(json));"
         for webView in trackedWebViews.allObjects {
             webView.evaluateJavaScript(js, completionHandler: nil)
+            applyNativeForbiddenHeaders(to: webView)
         }
+    }
+
+    /// Applies the two request headers that JavaScript **cannot** set on webview
+    /// requests (they are "forbidden headers" per the Fetch spec and are silently
+    /// dropped by `setRequestHeader`/`fetch`): `User-Agent` and `Cookie`.
+    ///
+    /// These are the only forbidden headers with a supported native override on
+    /// iOS — `WKWebView.customUserAgent` and `WKHTTPCookieStore`. Every other
+    /// forbidden header (Host, Origin, Referer, …) has no supported override on
+    /// arbitrary host-app web views, so header rules targeting those are
+    /// best-effort JS only (and surfaced as such in the editor UI).
+    ///
+    /// Note: `WKURLSchemeHandler` is intentionally **not** used — WebKit refuses
+    /// to register scheme handlers for `http`/`https`, so it cannot rewrite real
+    /// page traffic.
+    static func applyNativeForbiddenHeaders(to webView: WKWebView) {
+        guard SwiftyDebugRuntime.isActive else { return }
+
+        // Collect the globally-effective User-Agent / Cookie overrides from all
+        // enabled rules that could apply broadly (host/global). We can only set a
+        // single custom UA per web view, so the last-writing rule wins, matching
+        // the "later rule overrides" composition used elsewhere.
+        var userAgent: String?
+        var cookieOverrides: [(name: String, value: String)] = []
+
+        for rule in InterceptRuleStore.shared.allRules() where rule.isEnabled {
+            // Only broad rules (host/global) can be applied natively at the
+            // web-view level, since customUserAgent/cookies are not per-request.
+            guard rule.matchMode == .host || rule.matchMode == .global else { continue }
+            for pair in rule.headerOverrides {
+                let key = pair.key.lowercased()
+                if key == "user-agent" {
+                    userAgent = pair.value
+                } else if key == "cookie" {
+                    // A Cookie header may contain multiple "name=value" pairs.
+                    for cookiePair in pair.value.components(separatedBy: ";") {
+                        let trimmed = cookiePair.trimmingCharacters(in: .whitespaces)
+                        guard let eq = trimmed.firstIndex(of: "=") else { continue }
+                        let name = String(trimmed[..<eq])
+                        let value = String(trimmed[trimmed.index(after: eq)...])
+                        if !name.isEmpty { cookieOverrides.append((name, value)) }
+                    }
+                }
+            }
+        }
+
+        // Apply the User-Agent override only when a rule provides one. Never
+        // clobber an app-set customUserAgent: only overwrite/clear the UA if
+        // SwiftyDebug was the one that set it (tracked via associated object).
+        let sdkSetUAKey = "com.swiftydebug.sdkSetUserAgent"
+        let previouslySDKSet = objc_getAssociatedObject(webView, sdkSetUAKey) as? Bool ?? false
+        if let userAgent {
+            webView.customUserAgent = userAgent
+            objc_setAssociatedObject(webView, sdkSetUAKey, true, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        } else if previouslySDKSet {
+            // A rule that used to set the UA was removed — restore the default.
+            webView.customUserAgent = nil
+            objc_setAssociatedObject(webView, sdkSetUAKey, false, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        }
+        // else: no UA rule and we never set one — leave the app's UA untouched.
+
+        // Apply Cookie overrides via the shared cookie store so they ride along
+        // with subsequent requests from this web view.
+        guard !cookieOverrides.isEmpty else { return }
+        let host = webView.url?.host
+        let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+        for override in cookieOverrides {
+            var props: [HTTPCookiePropertyKey: Any] = [
+                .name: override.name,
+                .value: override.value,
+                .path: "/",
+            ]
+            if let host { props[.domain] = host }
+            if let cookie = HTTPCookie(properties: props) {
+                cookieStore.setCookie(cookie, completionHandler: nil)
+            }
+        }
+    }
+
+    /// All currently-live tracked WKWebViews (most recently created first), for
+    /// the Storage editor's web-view picker. (See Phase 2 webview storage.)
+    static func liveWebViews() -> [WKWebView] {
+        // allObjects order isn't guaranteed; return as-is (UI sorts/labels).
+        return trackedWebViews.allObjects
+    }
+
+    /// Enable/disable the injected JS capture+intercept engine in every live
+    /// WKWebView. When disabled, the injected hooks pass through to the original
+    /// XHR/fetch/console with zero SwiftyDebug work. Used by the kill-switch.
+    static func pushEnabledStateToWebViews(enabled: Bool) {
+        let js = "if(window.__cd_setEnabled)window.__cd_setEnabled(\(enabled ? "true" : "false"));"
+        let run = {
+            for webView in trackedWebViews.allObjects {
+                webView.evaluateJavaScript(js, completionHandler: nil)
+            }
+        }
+        if Thread.isMainThread { run() } else { DispatchQueue.main.async(execute: run) }
     }
 
     // MARK: - Swizzle setup
@@ -87,28 +232,15 @@ class WKScriptMessageProxy: NSObject, WKScriptMessageHandler {
             method_exchangeImplementations(original, replaced)
         }
 
-        // 2. Swizzle WKWebView dealloc
-        let deallocSel = NSSelectorFromString("dealloc")
-        let replacedDeallocSel = #selector(WKWebView.replaced_dealloc)
-        if let originalDealloc = class_getInstanceMethod(WKWebView.self, deallocSel),
-           let replacedDealloc = class_getInstanceMethod(WKWebView.self, replacedDeallocSel) {
-            if !class_addMethod(WKWebView.self, deallocSel,
-                                method_getImplementation(replacedDealloc),
-                                method_getTypeEncoding(replacedDealloc)) {
-                method_exchangeImplementations(originalDealloc, replacedDealloc)
-            }
-        }
+        // NOTE: We intentionally do NOT swizzle WKWebView's `dealloc`. The old
+        // approach swizzled `dealloc` to an empty method (which skipped the real
+        // dealloc chain) plus a `willDealloc` cleanup that was never invoked —
+        // both contributing to the WKWebView leak and risking crashes app-wide.
+        // The leak is now prevented at registration time by using weak message
+        // handler shims (see `replaced_init` / `WeakScriptMessageHandler`), so no
+        // dealloc-time cleanup is required.
 
-        // 3. Add willDealloc method to WKWebView
-        let willDeallocSel = NSSelectorFromString("willDealloc")
-        let replacedWillDeallocSel = #selector(WKWebView.replaced_willDealloc)
-        if let replacedWillDealloc = class_getInstanceMethod(WKWebView.self, replacedWillDeallocSel) {
-            class_addMethod(WKWebView.self, willDeallocSel,
-                            method_getImplementation(replacedWillDealloc),
-                            method_getTypeEncoding(replacedWillDealloc))
-        }
-
-        // 4. Swizzle WKUserContentController addScriptMessageHandler:name:
+        // 2. Swizzle WKUserContentController addScriptMessageHandler:name:
         let ucOriginal = #selector(WKUserContentController.add(_:name:))
         let ucReplaced = #selector(WKUserContentController.replaced_add(_:name:))
         if let ucOrigMethod = class_getInstanceMethod(WKUserContentController.self, ucOriginal),
@@ -127,12 +259,20 @@ class WKScriptMessageProxy: NSObject, WKScriptMessageHandler {
 extension WKUserContentController {
 
     @objc func replaced_add(_ handler: WKScriptMessageHandler, name: String) {
-        // Don't wrap SwiftyDebug's own handlers (WKWebView registers itself)
-        if handler is WKWebViewScriptHandler || handler is WKScriptMessageProxy {
+        // Don't wrap SwiftyDebug's own handlers (WKWebView registers itself).
+        // When the SDK is fully stopped, register the app's handler unchanged so
+        // the SDK has zero involvement.
+        if handler is WKWebViewScriptHandler
+            || handler is WKScriptMessageProxy
+            || handler is WeakScriptMessageHandler
+            || !SwiftyDebugRuntime.isActive {
             replaced_add(handler, name: name) // calls original (swizzled)
             return
         }
 
+        // Wrap the app's handler in a proxy that holds it *weakly* so the
+        // content controller's strong retain of the proxy never keeps the app's
+        // handler alive. (See WEBVIEW-LEAK.)
         let proxy = WKScriptMessageProxy(originalHandler: handler)
         replaced_add(proxy, name: name) // calls original (swizzled)
     }
@@ -148,10 +288,18 @@ extension WKUserContentController {
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
+        // Kill-switch: do nothing when the SDK is fully stopped.
+        guard SwiftyDebugRuntime.isActive else { return }
+
         if message.name == "networkCapture" {
+            // Respect the web-network toggle.
+            guard Settings.shared.webNetworkRequestsEnabled else { return }
             handleNetworkCaptureMessage(message)
             return
         }
+
+        // Console messages — respect the web-logs toggle.
+        guard Settings.shared.webLogsEnabled else { return }
 
         LogEntryBuilder.handleLog(
             file: "[WKWebView]",
@@ -235,6 +383,11 @@ extension WKUserContentController {
                 model.size = String(format: "%lu B", size)
             }
 
+            // Build the searchable metadata index once, while the response body
+            // string is still in memory.
+            let respBodyData = (data["responseBody"] as? String)?.data(using: .utf8)
+            model.buildSearchIndex(responseBody: respBodyData)
+
             // Add to datasource
             NetworkRequestStore.shared.addHttpRequset(model)
 
@@ -252,7 +405,17 @@ extension WKWebView {
 
     @objc func replaced_init(frame: CGRect, configuration: WKWebViewConfiguration) -> WKWebView {
 
-        let handler = WKWebViewScriptHandler()
+        // If the SDK is fully stopped, inject nothing — behave like a plain
+        // WKWebView so there is zero SwiftyDebug involvement.
+        guard SwiftyDebugRuntime.isActive else {
+            return replaced_init(frame: frame, configuration: configuration)
+        }
+
+        // Register *weak* shims pointing at the shared handler. The content
+        // controller strongly retains whatever is registered; a weak shim
+        // therefore never keeps a per-web-view handler (or the VC behind it)
+        // alive, which is the WKWebView leak fix. (See WEBVIEW-LEAK.)
+        let handler = WKWebViewSwizzling.sharedScriptHandler
 
         injectConsoleHook(configuration: configuration, handler: handler, name: "log", consoleFn: "log")
         injectConsoleHook(configuration: configuration, handler: handler, name: "error", consoleFn: "error")
@@ -273,25 +436,9 @@ extension WKWebView {
         // Call original init (swizzled)
         let webView = replaced_init(frame: frame, configuration: configuration)
         WKWebViewSwizzling.trackedWebViews.add(webView)
+        // Apply any User-Agent / Cookie rules natively (JS can't set these).
+        WKWebViewSwizzling.applyNativeForbiddenHeaders(to: webView)
         return webView
-    }
-
-    // MARK: - Swizzled dealloc
-
-    @objc func replaced_dealloc() {
-        
-    }
-
-    // MARK: - willDealloc (added dynamically)
-
-    @objc func replaced_willDealloc() -> Bool {
-        configuration.userContentController.removeScriptMessageHandler(forName: "log")
-        configuration.userContentController.removeScriptMessageHandler(forName: "error")
-        configuration.userContentController.removeScriptMessageHandler(forName: "warn")
-        configuration.userContentController.removeScriptMessageHandler(forName: "debug")
-        configuration.userContentController.removeScriptMessageHandler(forName: "info")
-        configuration.userContentController.removeScriptMessageHandler(forName: "networkCapture")
-        return true
     }
 
     // MARK: - Console hook injection
@@ -303,13 +450,13 @@ extension WKWebView {
         consoleFn: String
     ) {
         configuration.userContentController.removeScriptMessageHandler(forName: name)
-        configuration.userContentController.add(handler, name: name)
+        configuration.userContentController.add(WeakScriptMessageHandler(target: handler), name: name)
 
         // Rewrite the console method to post to native and still call original
         let jsCode = """
         console.\(consoleFn) = (function(oriLogFunc){\
         return function(str){\
-        window.webkit.messageHandlers.\(name).postMessage(str);\
+        if(window.__cd_enabled!==false){try{window.webkit.messageHandlers.\(name).postMessage(str);}catch(e){}}\
         oriLogFunc.call(console,str);\
         }\
         })(console.\(consoleFn));
@@ -325,7 +472,7 @@ extension WKWebView {
         handler: WKScriptMessageHandler
     ) {
         configuration.userContentController.removeScriptMessageHandler(forName: "networkCapture")
-        configuration.userContentController.add(handler, name: "networkCapture")
+        configuration.userContentController.add(WeakScriptMessageHandler(target: handler), name: "networkCapture")
 
         // swiftlint:disable line_length
         let jsCode = """
@@ -333,8 +480,11 @@ extension WKWebView {
         if(window.__cd_net_hooked)return;
         window.__cd_net_hooked=true;
         var MAX_BODY=524288;
+        /* ── Master enable flag (kill-switch). When disabled, hooks pass through. ── */
+        if(typeof window.__cd_enabled==='undefined')window.__cd_enabled=true;
+        window.__cd_setEnabled=function(v){window.__cd_enabled=!!v;};
         function trunc(s){if(typeof s==='string'&&s.length>MAX_BODY)return s.substring(0,MAX_BODY);return s;}
-        function post(d){try{window.webkit.messageHandlers.networkCapture.postMessage(JSON.stringify(d));}catch(e){}}
+        function post(d){if(!window.__cd_enabled)return;try{window.webkit.messageHandlers.networkCapture.postMessage(JSON.stringify(d));}catch(e){}}
         function parseH(raw){var h={};if(!raw)return h;var lines=raw.trim().split('\\r\\n');
         for(var i=0;i<lines.length;i++){var idx=lines[i].indexOf(':');
         if(idx>0)h[lines[i].substring(0,idx).trim()]=lines[i].substring(idx+1).trim();}return h;}
@@ -366,6 +516,7 @@ extension WKWebView {
         return stripped===p||stripped.indexOf(p+'/')===0;}
 
         function resolveRules(urlStr){
+        if(!window.__cd_enabled)return null;
         var rules=window.__cd_intercept_rules;if(!rules||!rules.length)return null;
         var path=getPath(urlStr);var norm=normalizePath(path);var stripped=stripForHost(urlStr);
         var matched=[];
@@ -377,9 +528,10 @@ extension WKWebView {
         for(var j=0;j<r.matchHosts.length;j++){if(hostMatch(stripped,r.matchHosts[j])){matched.push(r);break;}}}}
         if(!matched.length)return null;
         matched.sort(function(a,b){return(a.order||0)-(b.order||0);});
-        var c={isBlocked:false,headerOverrides:[],removedHeaderKeys:[],queryParamOverrides:[],removedQueryParamKeys:[]};
+        var c={isBlocked:false,headerOverrides:[],removedHeaderKeys:[],queryParamOverrides:[],removedQueryParamKeys:[],redirectMode:'none',redirectTarget:''};
         for(var i=0;i<matched.length;i++){var r=matched[i];
         if(r.isBlocked)c.isBlocked=true;
+        if(r.redirectMode&&r.redirectMode!=='none'&&r.redirectTarget){c.redirectMode=r.redirectMode;c.redirectTarget=r.redirectTarget;}
         if(r.headerOverrides){for(var h=0;h<r.headerOverrides.length;h++){var ho=r.headerOverrides[h];var found=false;
         for(var e=0;e<c.headerOverrides.length;e++){if(c.headerOverrides[e].key.toLowerCase()===ho.key.toLowerCase()){c.headerOverrides[e]=ho;found=true;break;}}
         if(!found)c.headerOverrides.push(ho);}}
@@ -401,6 +553,25 @@ extension WKWebView {
         for(var i=0;i<rule.queryParamOverrides.length;i++)u.searchParams.set(rule.queryParamOverrides[i].key,rule.queryParamOverrides[i].value);
         return u.toString();}catch(e){return urlStr;}}
 
+        /* Rewrite host (and optionally path), always preserving the query. */
+        function applyRedirect(urlStr,rule){
+        if(!rule.redirectMode||rule.redirectMode==='none'||!rule.redirectTarget)return urlStr;
+        try{var u=new URL(urlStr,document.baseURI);var t=(''+rule.redirectTarget).trim();
+        if(/^https:\\/\\//i.test(t)){u.protocol='https:';t=t.replace(/^https:\\/\\//i,'');}
+        else if(/^http:\\/\\//i.test(t)){u.protocol='http:';t=t.replace(/^http:\\/\\//i,'');}
+        var qi=t.indexOf('?');if(qi>=0)t=t.substring(0,qi);
+        var fi=t.indexOf('#');if(fi>=0)t=t.substring(0,fi);
+        while(t.length&&t.charAt(t.length-1)==='/')t=t.substring(0,t.length-1);
+        if(!t)return urlStr;
+        var hostPart=t,pathPart='';var si=t.indexOf('/');
+        if(si>=0){hostPart=t.substring(0,si);pathPart=t.substring(si);}
+        var ci=hostPart.lastIndexOf(':');
+        if(ci>0&&/^\\d+$/.test(hostPart.substring(ci+1))){u.port=hostPart.substring(ci+1);hostPart=hostPart.substring(0,ci);}
+        if(!hostPart)return urlStr;
+        u.hostname=hostPart;
+        if(rule.redirectMode==='hostAndPath')u.pathname=pathPart||'/';
+        return u.toString();}catch(e){return urlStr;}}
+
         function resolveUrl(u){try{return new URL(u,document.baseURI).href;}catch(e){return u;}}
 
         /* ── XHR hooks ── */
@@ -413,7 +584,7 @@ extension WKWebView {
         var fullUrl=resolveUrl(urlStr);
         var rule=resolveRules(fullUrl);
         this._cd={method:method,url:fullUrl,headers:{},startTime:Date.now(),rule:rule};
-        if(rule){var effectiveUrl=applyQueryParams(fullUrl,rule);this._cd.url=effectiveUrl;
+        if(rule){var effectiveUrl=applyRedirect(applyQueryParams(fullUrl,rule),rule);this._cd.url=effectiveUrl;
         var args=Array.prototype.slice.call(arguments);args[1]=effectiveUrl;
         return origOpen.apply(this,args);}
         return origOpen.apply(this,arguments);};
@@ -449,10 +620,26 @@ extension WKWebView {
         /* ── Fetch hook ── */
         if(window.fetch){
         var origFetch=window.fetch;
+        /* Copy the standard Request init fields off a Request object so that when
+           we rebuild the call for a matching rule we don't drop credentials/mode/
+           body/etc. */
+        function requestInitFrom(req){
+        var o={};
+        try{o.method=req.method;}catch(e){}
+        try{o.mode=req.mode;}catch(e){}
+        try{o.credentials=req.credentials;}catch(e){}
+        try{o.cache=req.cache;}catch(e){}
+        try{o.redirect=req.redirect;}catch(e){}
+        try{o.referrer=req.referrer;}catch(e){}
+        try{o.referrerPolicy=req.referrerPolicy;}catch(e){}
+        try{o.integrity=req.integrity;}catch(e){}
+        try{o.keepalive=req.keepalive;}catch(e){}
+        return o;}
         window.fetch=function(input,init){
-        var url,method,headers={},body=null;
+        var url,method,headers={},body=null,baseInit=null;
         if(typeof input==='string'){url=input;}
         else if(input instanceof Request){url=input.url;method=input.method;
+        baseInit=requestInitFrom(input);
         try{input.headers.forEach(function(v,k){headers[k]=v;});}catch(e){}}
         else{url=String(input);}
         if(init){
@@ -472,11 +659,15 @@ extension WKWebView {
         status:0,statusText:'Blocked by SwiftyDebug',responseHeaders:{},responseBody:null,
         startTime:startTime,endTime:Date.now(),intercepted:true});
         return Promise.reject(new Error('Blocked by SwiftyDebug intercept rule'));}
-        fullUrl=applyQueryParams(fullUrl,rule);
+        fullUrl=applyRedirect(applyQueryParams(fullUrl,rule),rule);
         for(var i=0;i<rule.removedHeaderKeys.length;i++){var rk=rule.removedHeaderKeys[i];
         var hks=Object.keys(headers);for(var j=0;j<hks.length;j++){if(hks[j].toLowerCase()===rk.toLowerCase())delete headers[hks[j]];}}
         for(var i=0;i<rule.headerOverrides.length;i++){headers[rule.headerOverrides[i].key]=rule.headerOverrides[i].value;}
-        input=fullUrl;init=Object.assign({},init||{});init.method=method;init.headers=headers;
+        /* Rebuild init preserving the original Request's fields (baseInit) so we
+           don't silently drop credentials/mode/body when a Request object was
+           passed with no init. */
+        init=Object.assign({},baseInit||{},init||{});init.method=method;init.headers=headers;
+        input=fullUrl;
         if(body!==null&&init.body===undefined)init.body=body;
         intercepted=true;url=fullUrl;}
         var startTime=Date.now();

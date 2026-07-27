@@ -20,6 +20,149 @@ struct KVPair: Codable, Equatable {
     }
 }
 
+/// How a matching request's URL is rewritten.
+enum RedirectMode: String, Codable {
+    /// No redirect.
+    case none
+    /// Replace only the host (and optional port). Path and query are untouched.
+    /// `mahaly.com/checkout/abc?p=1` + `beta.mahaly.com` → `beta.mahaly.com/checkout/abc?p=1`
+    case host
+    /// Replace host **and** path, preserving the original query string.
+    /// `mahaly.com/checkout/abc?p=1` + `beta.mahaly.com/checkout/xyz`
+    ///   → `beta.mahaly.com/checkout/xyz?p=1`
+    case hostAndPath
+}
+
+/// Where a matching request is paused for manual inspection/editing.
+///
+/// Deliberately a single choice rather than two flags: pausing both before and
+/// after would stop the same request twice, which is confusing.
+enum BreakpointMode: String, Codable {
+    case off
+    /// Hold before sending — edit the outgoing request, then deliver it.
+    case beforeSend
+    /// Let it go out, then hold the response — edit the body, then deliver.
+    case afterResponse
+
+    var title: String {
+        switch self {
+        case .off:            return "Off"
+        case .beforeSend:     return "Before send"
+        case .afterResponse:  return "After response"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .off:           return "Requests are never paused."
+        case .beforeSend:    return "Pause before the request leaves the app so you can edit it."
+        case .afterResponse: return "Let the request go out, then pause so you can edit the response before the app sees it."
+        }
+    }
+}
+
+/// A canned response returned instead of hitting the network.
+struct MockResponse: Codable, Equatable {
+    var isEnabled: Bool
+    var statusCode: Int
+    /// Response body (usually JSON text).
+    var body: String
+    /// Extra response headers to send with the mock.
+    var headers: [KVPair]
+    /// Artificial delay in seconds, to simulate a slow endpoint.
+    var delay: Double
+
+    init(isEnabled: Bool = false, statusCode: Int = 200, body: String = "",
+         headers: [KVPair] = [], delay: Double = 0) {
+        self.isEnabled = isEnabled
+        self.statusCode = statusCode
+        self.body = body
+        self.headers = headers
+        self.delay = delay
+    }
+
+    /// Lenient decoding, matching `InterceptRule`'s own.
+    ///
+    /// Synthesized `Codable` makes every field required, so a rule exported by a
+    /// build that predates one of these fields — or a hand-written document —
+    /// fails to decode the mock and takes the entire rule down with it. Every
+    /// field falls back to its default instead.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Defaults to true, unlike the memberwise init: an absent `mock` key
+        // yields no MockResponse at all, so reaching here means a mock object was
+        // written deliberately and omitting the flag should not disarm it.
+        isEnabled = try c.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        statusCode = try c.decodeIfPresent(Int.self, forKey: .statusCode) ?? 200
+        body = try c.decodeIfPresent(String.self, forKey: .body) ?? ""
+        headers = try c.decodeIfPresent([KVPair].self, forKey: .headers) ?? []
+        delay = try c.decodeIfPresent(Double.self, forKey: .delay) ?? 0
+    }
+
+    /// Common scenarios offered as one-tap presets.
+    struct Scenario {
+        let title: String
+        let subtitle: String
+        let statusCode: Int
+        let body: String
+    }
+
+    static let scenarios: [Scenario] = [
+        .init(title: "200 OK", subtitle: "Success with an empty object",
+              statusCode: 200, body: "{\n  \"success\" : true\n}"),
+        .init(title: "201 Created", subtitle: "Resource created",
+              statusCode: 201, body: "{\n  \"id\" : 1,\n  \"created\" : true\n}"),
+        .init(title: "204 No Content", subtitle: "Success, empty body", statusCode: 204, body: ""),
+        .init(title: "400 Bad Request", subtitle: "Validation failure",
+              statusCode: 400, body: "{\n  \"error\" : \"bad_request\",\n  \"message\" : \"Invalid parameters\"\n}"),
+        .init(title: "401 Unauthorized", subtitle: "Expired or missing token",
+              statusCode: 401, body: "{\n  \"error\" : \"unauthorized\",\n  \"message\" : \"Token expired\"\n}"),
+        .init(title: "403 Forbidden", subtitle: "Not allowed",
+              statusCode: 403, body: "{\n  \"error\" : \"forbidden\",\n  \"message\" : \"Access denied\"\n}"),
+        .init(title: "404 Not Found", subtitle: "Missing resource",
+              statusCode: 404, body: "{\n  \"error\" : \"not_found\",\n  \"message\" : \"Resource not found\"\n}"),
+        .init(title: "409 Conflict", subtitle: "Duplicate / conflicting state",
+              statusCode: 409, body: "{\n  \"error\" : \"conflict\",\n  \"message\" : \"Already exists\"\n}"),
+        .init(title: "422 Unprocessable", subtitle: "Field-level validation errors",
+              statusCode: 422, body: "{\n  \"error\" : \"unprocessable\",\n  \"errors\" : {\n    \"field\" : [\"is required\"]\n  }\n}"),
+        .init(title: "429 Too Many Requests", subtitle: "Rate limited",
+              statusCode: 429, body: "{\n  \"error\" : \"rate_limited\",\n  \"retry_after\" : 60\n}"),
+        .init(title: "500 Server Error", subtitle: "Backend blew up",
+              statusCode: 500, body: "{\n  \"error\" : \"internal_error\",\n  \"message\" : \"Something went wrong\"\n}"),
+        .init(title: "502 Bad Gateway", subtitle: "Upstream failure",
+              statusCode: 502, body: "{\n  \"error\" : \"bad_gateway\"\n}"),
+        .init(title: "503 Unavailable", subtitle: "Maintenance / overloaded",
+              statusCode: 503, body: "{\n  \"error\" : \"unavailable\",\n  \"message\" : \"Try again later\"\n}"),
+        .init(title: "Empty list", subtitle: "Common empty-state test",
+              statusCode: 200, body: "{\n  \"data\" : [\n\n  ],\n  \"total\" : 0\n}"),
+    ]
+}
+
+extension MockResponse {
+
+    /// Response headers this mock should be served with.
+    ///
+    /// `Content-Length` is always recomputed from the body — a stale one makes
+    /// CFNetwork truncate the delivered bytes, which is the same class of bug
+    /// that made edited breakpoint responses arrive empty. A `Content-Type` the
+    /// mock declares itself wins over the JSON default.
+    var headerFields: [String: String] {
+        var out: [String: String] = [:]
+        for pair in headers where !pair.key.isEmpty { out[pair.key] = pair.value }
+        if !out.keys.contains(where: { $0.lowercased() == "content-type" }) {
+            out["Content-Type"] = "application/json"
+        }
+        out["Content-Length"] = "\(body.utf8.count)"
+        return out
+    }
+
+    /// The synthetic response handed to the app in place of a real one.
+    func httpResponse(for url: URL) -> HTTPURLResponse? {
+        HTTPURLResponse(url: url, statusCode: statusCode,
+                        httpVersion: "HTTP/1.1", headerFields: headerFields)
+    }
+}
+
 /// How the rule matches incoming requests.
 enum EndpointMatchMode: String, Codable {
     /// Matches only the exact URL path (e.g. `/api/users/123/orders`).
@@ -54,6 +197,25 @@ struct InterceptRule: Codable {
     let createdAt: Date
     /// Position in the rule list. Lower = applied first, higher = applied later (wins on conflict).
     var order: Int
+    /// How matching requests' URLs are rewritten. `.none` by default.
+    var redirectMode: RedirectMode
+    /// Redirect destination. For `.host`: `"beta.example.com"` (optionally with a
+    /// scheme and/or port). For `.hostAndPath`: `"beta.example.com/checkout/xyz"`.
+    var redirectTarget: String
+    /// Canned response returned instead of hitting the network.
+    var mock: MockResponse
+    /// Where matching requests are paused for manual editing.
+    var breakpointMode: BreakpointMode
+    /// Automated edits applied to a matching JSON response body — the same edits
+    /// people were making by hand at an `.afterResponse` breakpoint, without the
+    /// pause. Empty by default, so an existing rule behaves exactly as before.
+    var responseRewrites: [ResponseRewrite]
+
+    /// True when this rule has at least one armed rewrite. Cheap enough to check
+    /// on every response before touching the body.
+    var hasActiveResponseRewrites: Bool {
+        responseRewrites.contains { $0.isEnabled }
+    }
 
     init(matchEndpoint: String, matchMode: EndpointMatchMode = .normalized) {
         self.id = UUID().uuidString
@@ -68,6 +230,72 @@ struct InterceptRule: Codable {
         self.isEnabled = true
         self.createdAt = Date()
         self.order = 0
+        self.redirectMode = .none
+        self.redirectTarget = ""
+        self.mock = MockResponse()
+        self.breakpointMode = .off
+        self.responseRewrites = []
+    }
+
+    /// Rewrites `url` per this rule's redirect settings, preserving the original
+    /// query string. Returns nil when no redirect applies.
+    ///
+    ///   host        : mahaly.com/checkout/abc?p=1  + "beta.com"
+    ///                 -> beta.com/checkout/abc?p=1
+    ///   hostAndPath : mahaly.com/checkout/abc?p=1  + "beta.com/checkout/xyz"
+    ///                 -> beta.com/checkout/xyz?p=1
+    func redirectedURL(for url: URL) -> URL? {
+        Self.rewritingURL(url, mode: redirectMode, target: redirectTarget)
+    }
+
+    /// The single implementation of "change the host (and optionally the path)".
+    ///
+    /// Both halves of the feature go through this: redirecting a request
+    /// (`redirectedURL(for:)`) and rewriting a URL inside a response body
+    /// (`RewriteAction.replaceHost`). Keeping one implementation means a
+    /// redirect and a rewrite can never disagree about what the user meant.
+    static func rewritingURL(_ url: URL, mode: RedirectMode, target rawTarget: String) -> URL? {
+        guard mode != .none else { return nil }
+        let target = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return nil }
+
+        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+
+        // Peel an optional scheme off the target; otherwise keep the original.
+        var rest = target
+        for prefix in ["https://", "http://"] where rest.lowercased().hasPrefix(prefix) {
+            comps.scheme = String(prefix.dropLast(3))  // "https" / "http"
+            rest = String(rest.dropFirst(prefix.count))
+            break
+        }
+        // Drop any query/fragment the user pasted into the target — the original
+        // request's query is always preserved.
+        if let q = rest.firstIndex(of: "?") { rest = String(rest[..<q]) }
+        if let f = rest.firstIndex(of: "#") { rest = String(rest[..<f]) }
+        while rest.hasSuffix("/") { rest = String(rest.dropLast()) }
+        guard !rest.isEmpty else { return nil }
+
+        // Split "host[:port]/path/segments"
+        var hostPart = rest
+        var pathPart = ""
+        if let slash = rest.firstIndex(of: "/") {
+            hostPart = String(rest[..<slash])
+            pathPart = String(rest[slash...])
+        }
+        // Optional port on the host part.
+        if let colon = hostPart.lastIndex(of: ":"),
+           let port = Int(hostPart[hostPart.index(after: colon)...]) {
+            comps.port = port
+            hostPart = String(hostPart[..<colon])
+        }
+        guard !hostPart.isEmpty else { return nil }
+        comps.host = hostPart
+
+        if mode == .hostAndPath {
+            // Replace the path wholesale; query is left untouched by design.
+            comps.path = pathPart.isEmpty ? "/" : pathPart
+        }
+        return comps.url
     }
 
     /// Convenience initializer for global rules (match every request).
@@ -89,6 +317,9 @@ struct InterceptRule: Codable {
         case id, normalizedEndpoint, matchEndpoint, matchMode, matchHosts, isBlocked
         case headerOverrides, queryParamOverrides, removedHeaderKeys, removedQueryParamKeys
         case isEnabled, createdAt, order
+        case redirectMode, redirectTarget
+        case mock, breakpointMode
+        case responseRewrites
     }
 
     init(from decoder: Decoder) throws {
@@ -109,6 +340,19 @@ struct InterceptRule: Codable {
         isEnabled = try c.decode(Bool.self, forKey: .isEnabled)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
+        // `try?` on the enums, not `try`: decodeIfPresent THROWS on an unknown raw
+        // value, so a rule exported by a newer build (a redirect or breakpoint mode
+        // this build has never heard of) would fail to decode entirely instead of
+        // losing just that one setting.
+        redirectMode = (try? c.decodeIfPresent(RedirectMode.self, forKey: .redirectMode)) as? RedirectMode ?? .none
+        redirectTarget = try c.decodeIfPresent(String.self, forKey: .redirectTarget) ?? ""
+        mock = try c.decodeIfPresent(MockResponse.self, forKey: .mock) ?? MockResponse()
+        breakpointMode = (try? c.decodeIfPresent(BreakpointMode.self, forKey: .breakpointMode)) as? BreakpointMode ?? .off
+        // Decoded element by element: one rewrite written by a newer build is
+        // dropped on its own instead of taking the whole rule with it.
+        let decodedRewrites: [ResponseRewrite.Lenient] =
+            ((try? c.decodeIfPresent([ResponseRewrite.Lenient].self, forKey: .responseRewrites)) ?? nil) ?? []
+        responseRewrites = decodedRewrites.compactMap { $0.rewrite }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -125,5 +369,10 @@ struct InterceptRule: Codable {
         try c.encode(isEnabled, forKey: .isEnabled)
         try c.encode(createdAt, forKey: .createdAt)
         try c.encode(order, forKey: .order)
+        try c.encode(redirectMode, forKey: .redirectMode)
+        try c.encode(redirectTarget, forKey: .redirectTarget)
+        try c.encode(mock, forKey: .mock)
+        try c.encode(breakpointMode, forKey: .breakpointMode)
+        try c.encode(responseRewrites, forKey: .responseRewrites)
     }
 }

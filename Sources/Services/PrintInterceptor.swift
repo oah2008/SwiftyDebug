@@ -23,6 +23,8 @@ public class PrintInterceptor: NSObject {
     
     
     public func handleLog(file: String?, function: String?, line: Int?, message: Any..., color: UIColor?) {
+        // Short-circuit before building the message string when disabled.
+        guard enable, SwiftyDebugRuntime.isActive else { return }
         let stringContent = message.reduce("") { result, next -> String in
             return "\(result)\(result.count > 0 ? " " : "")\(next)"
         }

@@ -38,7 +38,15 @@ class Settings: NSObject {
     var consoleLogsEnabled: Bool = true {
         didSet {
             save(.consoleLogsEnabled, value: consoleLogsEnabled)
-            PrintInterceptor.shared.enable = consoleLogsEnabled && SwiftyDebug.enableConsoleLog
+            let on = consoleLogsEnabled && SwiftyDebug.enableConsoleLog
+            PrintInterceptor.shared.enable = on
+            // Start/stop the expensive OSLog poll timer + stdout pipe so turning
+            // console logs off has (near) zero CPU cost. (See CONSOLE-COST.)
+            if on {
+                NSLogHook.enableIfNeeded()
+            } else {
+                NSLogHook.disable()
+            }
         }
     }
 
@@ -58,6 +66,34 @@ class Settings: NSObject {
             save(.monitorMedia, value: monitorMediaEnabled)
             SwiftyDebug.monitorMedia = monitorMediaEnabled
         }
+    }
+
+    /// When `true`, shaking to "disable" performs a full stop (see
+    /// `SettingsKey.fullStopOnDisable`). Default `false` — legacy behavior where
+    /// shake only hides the overlay bubble.
+    var fullStopOnDisable: Bool = false {
+        didSet { save(.fullStopOnDisable, value: fullStopOnDisable) }
+    }
+
+    /// Fixed network-link-conditioner preset applied to every captured request.
+    /// `.off` by default.
+    var networkConditionerPreset: NetworkConditionerPreset = .off {
+        didSet { saveString(.networkConditionerPreset, value: networkConditionerPreset.rawValue) }
+    }
+
+    /// Raises host-app request timeouts to `breakpointHoldSeconds` so a paused
+    /// request survives long enough to be edited. ON by default — see
+    /// `SettingsKey.extendTimeoutsForBreakpoints` for why a breakpoint is
+    /// otherwise unusable in an app that sets a short timeout.
+    var extendTimeoutsForBreakpoints: Bool = true {
+        didSet { save(.extendTimeoutsForBreakpoints, value: extendTimeoutsForBreakpoints) }
+    }
+
+    /// Seconds a request may be held at a breakpoint. Default 10 minutes —
+    /// long enough to reshape a payload by hand, short enough that a forgotten
+    /// breakpoint doesn't wedge the app forever.
+    var breakpointHoldSeconds: TimeInterval = 600 {
+        didSet { saveDouble(.breakpointHoldSeconds, value: breakpointHoldSeconds) }
     }
 
     private override init() {
@@ -86,11 +122,34 @@ class Settings: NSObject {
         // Toggle defaults: OFF
         monitorAllRequests = ud.bool(forKey: SettingsKey.monitorAllRequests.rawValue)
         monitorMediaEnabled = ud.bool(forKey: SettingsKey.monitorMedia.rawValue)
+
+        // Kill-switch behavior: OFF by default (shake only hides overlay)
+        fullStopOnDisable = ud.bool(forKey: SettingsKey.fullStopOnDisable.rawValue)
+
+        // Network conditioner: OFF by default
+        let presetRaw = ud.string(forKey: SettingsKey.networkConditionerPreset.rawValue) ?? ""
+        networkConditionerPreset = NetworkConditionerPreset(rawValue: presetRaw) ?? .off
+
+        // Breakpoint hold: ON by default — a breakpoint that the host app times
+        // out from is worse than no breakpoint at all.
+        extendTimeoutsForBreakpoints = ud.object(forKey: SettingsKey.extendTimeoutsForBreakpoints.rawValue) == nil
+            ? true
+            : ud.bool(forKey: SettingsKey.extendTimeoutsForBreakpoints.rawValue)
+        let hold = ud.double(forKey: SettingsKey.breakpointHoldSeconds.rawValue)
+        breakpointHoldSeconds = hold > 0 ? hold : 600
     }
 
     // MARK: - Private
 
     private func save(_ key: SettingsKey, value: Bool) {
+        UserDefaults.standard.set(value, forKey: key.rawValue)
+    }
+
+    private func saveString(_ key: SettingsKey, value: String) {
+        UserDefaults.standard.set(value, forKey: key.rawValue)
+    }
+
+    private func saveDouble(_ key: SettingsKey, value: Double) {
         UserDefaults.standard.set(value, forKey: key.rawValue)
     }
 

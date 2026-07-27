@@ -57,11 +57,15 @@ private var orig_defaultSessionConfiguration: IMP?
 private var orig_ephemeralSessionConfiguration: IMP?
 /// Store original IMP for protocolClasses getter.
 private var orig_protocolClassesGetter: IMP?
+/// Store original IMP for the request-timeout setter.
+private var orig_setTimeoutIntervalForRequest: IMP?
 
 /// Type alias for the original session configuration constructor.
 private typealias SessionConfigConstructor = @convention(c) (AnyObject, Selector) -> URLSessionConfiguration
 /// Type alias for the protocolClasses getter.
 private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selector) -> NSArray?
+/// Type alias for `-[NSURLSessionConfiguration setTimeoutIntervalForRequest:]`.
+private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeInterval) -> Void
 
 // MARK: - CustomHTTPProtocolDelegate
 
@@ -211,6 +215,46 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
 
                 method_setImplementation(getterMethod, imp_implementationWithBlock(replacedGetter))
             }
+
+            swizzleRequestTimeoutSetter(on: configClass)
+    }
+
+    /// Raises any request timeout the host app sets below the breakpoint hold
+    /// budget.
+    ///
+    /// This is what makes breakpoints work at all. `timeoutIntervalForRequest` is
+    /// an **idle** timer: it resets only when real bytes reach the client. A
+    /// request held at an `.afterResponse` breakpoint delivers nothing until you
+    /// tap Deliver, so the timer runs uninterrupted and the app gives up with
+    /// NSURLErrorTimedOut — the demo's own stack sets 10 seconds, which is gone
+    /// before you have finished reading the payload, let alone editing it. The
+    /// edited body is then delivered to a task that no longer exists, and the
+    /// screen stays empty with no error.
+    ///
+    /// Swizzling the *setter* (rather than only the config constructors) is
+    /// required because apps typically do `URLSessionConfiguration.default` and
+    /// then assign their own timeout, which would overwrite anything we set at
+    /// construction. (See BREAKPOINTS.)
+    private class func swizzleRequestTimeoutSetter(on configClass: AnyClass) {
+        let sel = NSSelectorFromString("setTimeoutIntervalForRequest:")
+        guard let method = class_getInstanceMethod(configClass, sel) else { return }
+        orig_setTimeoutIntervalForRequest = method_getImplementation(method)
+
+        let replaced: @convention(block) (AnyObject, TimeInterval) -> Void = { configObj, value in
+            let original = unsafeBitCast(orig_setTimeoutIntervalForRequest!, to: TimeoutSetterFunc.self)
+            original(configObj, sel, Self.effectiveRequestTimeout(value))
+        }
+        method_setImplementation(method, imp_implementationWithBlock(replaced))
+    }
+
+    /// The timeout to actually apply, given what the host app asked for.
+    /// Pure and `internal` so it can be unit-tested without CFNetwork.
+    static func effectiveRequestTimeout(_ requested: TimeInterval) -> TimeInterval {
+        guard SwiftyDebugRuntime.isActive,
+              Settings.shared.extendTimeoutsForBreakpoints else { return requested }
+        let floor = Settings.shared.breakpointHoldSeconds
+        // A host app asking for MORE than the hold budget keeps its own value.
+        return max(requested, floor)
     }
 
     /// Injects `CustomHTTPProtocol` at the front of the given configuration's `protocolClasses`.
@@ -224,6 +268,9 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
             }
             config.protocolClasses = urlProtocolClasses
         }
+        // Covers configs the app never assigns a timeout to (the setter swizzle
+        // covers the ones it does).
+        config.timeoutIntervalForRequest = effectiveRequestTimeout(config.timeoutIntervalForRequest)
     }
 
     // MARK: Instance properties
@@ -245,10 +292,46 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
     /// The request after intercept rules have been applied (headers/query params modified).
     /// Used in stopLoading() so the UI reflects the actual request that was sent.
     private var interceptedRequest: URLRequest?
+    /// The composite rule matched for this request (mock / breakpoint / redirect).
+    private var resolvedRule: InterceptRule?
+    /// True when the response was served from a mock rather than the network.
+    private var isMocked = false
+    /// While an `.afterResponse` breakpoint is armed — or the rule has armed
+    /// response rewrites — we buffer the response instead of streaming it to the
+    /// client, so the whole body can be edited before the app sees any of it.
+    private var isHoldingResponse = false
+    /// True when the ONLY reason we are holding is response rewrites (no
+    /// breakpoint). Such a hold is abandonable: if the body outgrows the rewrite
+    /// engine's cap there is nothing left to rewrite, so we flush and stream the
+    /// rest rather than buffer a payload we have no use for.
+    private var isHoldingForRewriteOnly = false
+    private var heldResponse: URLResponse?
+    /// The cache policy computed for the held response, so a body we buffered
+    /// but did not touch is delivered exactly as it would have been streamed.
+    private var heldCacheStoragePolicy: URLCache.StoragePolicy = .notAllowed
+    /// What `ResponseRewriteEngine` did (or why it never ran). Copied onto the
+    /// transaction in `stopLoading` — a response the app sees but the server
+    /// never sent has to be traceable.
+    private var rewriteReport: RewriteReport?
+    /// The breakpoint entry parked for this request, if any. Held so that if the
+    /// app gives up first (timeout / cancellation) we can drop it from the inbox
+    /// instead of leaving a row that can never be delivered.
+    ///
+    /// Strong on purpose: a weak reference could be nil by the time `stopLoading`
+    /// runs, which would skip the expiry and leave a row whose Deliver button
+    /// silently does nothing. No cycle — the parked entry's handlers capture this
+    /// protocol weakly.
+    private var parkedBreakpoint: BreakpointCenter.PausedRequest?
 
     // MARK: Recursive request flag
 
     private static let kOurRecursiveRequestFlagProperty = "com.apple.dts.CustomHTTPProtocol"
+
+    /// Mark a request with this key (via `URLProtocol.setProperty`) to make
+    /// `canInit` skip it entirely. Used by SwiftyDebug's own internal fetches
+    /// (e.g. `ImageLoader` thumbnails) so they are never captured — otherwise
+    /// loading a captured image would itself be captured, in an infinite loop.
+    static var recursiveRequestFlagProperty: String { kOurRecursiveRequestFlagProperty }
 
     // MARK: Skipped file extensions
 
@@ -263,6 +346,13 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
     // MARK: NSURLProtocol overrides
 
     override class func canInit(with request: URLRequest) -> Bool {
+        // Global kill-switch: when the SDK is fully stopped, do zero
+        // interception — this is the real off-switch even though the swizzled
+        // `protocolClasses` getter still lists us for already-created sessions.
+        guard SwiftyDebugRuntime.isActive, NetworkMonitor.shared.isNetworkEnable else {
+            return false
+        }
+
         guard let scheme = request.url?.scheme, scheme == "http" || scheme == "https" else {
             return false
         }
@@ -366,7 +456,8 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
 
         // --- Interception: check for matching intercept rules ---
         if let url = recursiveRequest.url {
-            if let rule = InterceptRuleStore.shared.resolvedRule(forURL: url) {
+            self.resolvedRule = InterceptRuleStore.shared.resolvedRule(forURL: url)
+            if let rule = self.resolvedRule {
                 if rule.isBlocked {
                     let error = NSError(
                         domain: NSURLErrorDomain,
@@ -399,6 +490,18 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
                         recursiveRequest.url = newURL
                     }
                 }
+                // Apply redirect last, so it rewrites the URL that already has
+                // the rule's query-param edits (the original query is preserved).
+                if let current = recursiveRequest.url,
+                   let redirected = rule.redirectedURL(for: current) {
+                    recursiveRequest.url = redirected
+                    // Keep Host consistent with the new destination unless the
+                    // rule explicitly overrides it.
+                    let overridesHost = rule.headerOverrides.contains { $0.key.lowercased() == "host" }
+                    if !overridesHost, let newHost = redirected.host {
+                        recursiveRequest.setValue(newHost, forHTTPHeaderField: "Host")
+                    }
+                }
                 // Save the modified request so stopLoading() reflects what was actually sent.
                 // Only set when a rule was applied; non-intercepted requests use self.request as before.
                 self.interceptedRequest = recursiveRequest as URLRequest
@@ -411,20 +514,148 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
         // Latch the thread we were called on, primarily for debugging purposes.
         self.clientThread = Thread.current
 
-        // Once everything is ready to go, create a data task with the new request.
+        // Network Link Conditioner simulation (see NETWORK-SIM). Reads the fixed
+        // preset chosen on the Info tab and either fails the request (100% loss)
+        // or delays it by the preset's latency so loader/spinner states can be
+        // observed. Off by default.
+        let preset = Settings.shared.networkConditionerPreset
+        if preset.dropsAllRequests {
+            let error = NSError(
+                domain: NSURLErrorDomain,
+                code: NSURLErrorNotConnectedToInternet,
+                userInfo: [NSLocalizedDescriptionKey: "Dropped by SwiftyDebug network simulation (100% Loss)"]
+            )
+            self.client?.urlProtocol(self, didFailWithError: error)
+            return
+        }
+
+        // --- Mock response: answer locally, never touch the network. ---
+        // The active mock profile is consulted too, not just this rule. A rule's
+        // own mock wins — the specific beats the general — which is what
+        // `resolvedMock` encodes. Without this call an activated profile is
+        // inert and the UI's "N mocks active" is a lie.
+        // While the profiles feature is hidden, only the rule's own mock applies.
+        //
+        // ORDER vs. RESPONSE REWRITES: a mock REPLACES the response entirely and
+        // never touches the network, so it returns here and the rewrite engine
+        // never runs on a mocked body. That is deliberate — the mock body is
+        // already exactly what the developer typed, and silently rewriting it
+        // afterwards would mean the mock editor showed one thing and the app got
+        // another. To change a mock, edit the mock.
+        let profileMock = MockProfileStore.isFeatureEnabled
+            ? (recursiveRequest as URLRequest).url.flatMap {
+                MockProfileStore.shared.resolvedMock(forURL: $0, ruleMock: self.resolvedRule?.mock)
+              }
+            : MockProfileStore.resolveMock(ruleMock: self.resolvedRule?.mock, profileMock: nil)
+        if let mock = profileMock {
+            deliverMock(mock, for: recursiveRequest as URLRequest)
+            return
+        }
+
+        // --- Breakpoint (before send): park the request for editing. ---
+        if self.resolvedRule?.breakpointMode == .beforeSend {
+            let paused = BreakpointCenter.PausedRequest(
+                stage: .beforeSend,
+                request: recursiveRequest as URLRequest,
+                resume: { [weak self] edited in
+                    // Continue with whatever the developer changed.
+                    self?.performOnThread(self?.clientThread, modes: self?.modes) {
+                        self?.sendUpstream(edited.request)
+                    }
+                },
+                abort: { [weak self] in
+                    guard let self else { return }
+                    self.performOnThread(self.clientThread, modes: self.modes) {
+                        self.client?.urlProtocol(self, didFailWithError: NSError(
+                            domain: NSURLErrorDomain, code: NSURLErrorCancelled,
+                            userInfo: [NSLocalizedDescriptionKey: "Aborted at breakpoint"]))
+                    }
+                }
+            )
+            self.parkedBreakpoint = paused
+            BreakpointCenter.shared.park(paused)
+            return
+        }
+
+        sendUpstream(recursiveRequest as URLRequest)
+    }
+
+    /// Actually issues the (possibly breakpoint-edited) request upstream,
+    /// honoring the network-conditioner latency.
+    private func sendUpstream(_ request: URLRequest) {
         self._dataTask = type(of: self).sharedDemux().dataTask(
-            with: recursiveRequest as URLRequest,
+            with: request,
             delegate: self,
             modes: self.modes
         )
 
-        self._dataTask?.resume()
+        let latency = Settings.shared.networkConditionerPreset.addedLatency
+        if latency > 0 {
+            // Defer resume (non-blocking) so the whole request is delayed by the
+            // preset's simulated latency. Never sleep the client thread.
+            let task = self._dataTask
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + latency) {
+                task?.resume()
+            }
+        } else {
+            self._dataTask?.resume()
+        }
+    }
+
+    /// Synthesizes a response from a mock rule and hands it to the client without
+    /// any network access. (See MOCK.)
+    private func deliverMock(_ mock: MockResponse, for request: URLRequest) {
+        let body = mock.body.data(using: .utf8) ?? Data()
+        let url = request.url ?? URL(string: "https://swiftydebug.mock")!
+        let response = mock.httpResponse(for: url)
+
+        // Record it so the mock shows up in the request list like a real call.
+        self.response = response
+        self.data = NSMutableData(data: body)
+        self.isMocked = true
+
+        // A mock REPLACES the response, so rewrites never see it. Say so on the
+        // transaction rather than leaving an armed rewrite that quietly did
+        // nothing — that silent no-op is the exact failure this feature exists
+        // to avoid, and the rule editor warns about the same conflict up front.
+        if resolvedRule?.hasActiveResponseRewrites == true {
+            self.rewriteReport = RewriteReport(
+                skippedReason: "This response came from a mock, so response rewrites were skipped. "
+                             + "Edit the mock body instead.")
+        }
+
+        let deliver = { [weak self] in
+            guard let self, let response else { return }
+            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if !body.isEmpty { self.client?.urlProtocol(self, didLoad: body) }
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
+
+        let delay = max(mock.delay, Settings.shared.networkConditionerPreset.addedLatency)
+        if delay > 0 {
+            let thread = self.clientThread, modes = self.modes
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.performOnThread(thread, modes: modes, block: deliver)
+            }
+        } else {
+            deliver()
+        }
     }
 
     override func stopLoading() {
         // The implementation just cancels the current load (if it's still running).
 
         cancelPendingChallenge()
+
+        // The app gave up on this request (cancelled, or its own timeout elapsed
+        // while it sat at a breakpoint). Delivering now would go nowhere, so drop
+        // the row rather than leave a "Deliver" button that silently does nothing.
+        if let parked = parkedBreakpoint, !parked.isSettled {
+            BreakpointCenter.shared.expire(parked)
+            parkedBreakpoint = nil
+        }
+        isHoldingResponse = false
+        isHoldingForRewriteOnly = false
 
         if let task = self._dataTask {
             task.cancel()
@@ -508,8 +739,20 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
             }
         }
 
+        // Response rewrites: `self.data` above is the body the app actually
+        // received, so record what produced it. Reports are attached even when
+        // nothing changed — an armed rewrite that matched zero values has to say
+        // so somewhere, and this is the only place that survives the request.
+        if let report = self.rewriteReport {
+            model.recordRewriteReport(report, rewrites: self.resolvedRule?.responseRewrites ?? [])
+        }
+
         // Handling errors 404...
         handleError(self.error, model: model)
+
+        // Build the searchable metadata index once, while the response body is
+        // still in memory (self.data). Avoids per-keystroke disk reads later.
+        model.buildSearchIndex(responseBody: self.data as Data?)
 
         if NetworkRequestStore.shared.addHttpRequset(model) {
             NotificationCenter.default.post(
@@ -525,6 +768,7 @@ private typealias ProtocolClassesGetterFunc = @convention(c) (AnyObject, Selecto
         self.response = nil
         self.error = nil
         self.interceptedRequest = nil
+        self.rewriteReport = nil
     }
 
     // MARK: Authentication challenge handling
@@ -888,6 +1132,25 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
             cacheStoragePolicy = .notAllowed
         }
 
+        // Two things need the WHOLE body before the app sees any of it, and both
+        // buffer here instead of streaming:
+        //  • an `.afterResponse` breakpoint (the body has to be editable first —
+        //    see BREAKPOINTS), and
+        //  • armed response rewrites (a JSON document cannot be rewritten one
+        //    chunk at a time — see RESPONSE-REWRITE).
+        // Which runs first is decided in `didCompleteWithError`, not here.
+        let holdForBreakpoint = (self.resolvedRule?.breakpointMode == .afterResponse)
+        let holdForRewrites = shouldBufferForRewrites(response)
+        if holdForBreakpoint || holdForRewrites {
+            self.isHoldingResponse = true
+            self.isHoldingForRewriteOnly = holdForRewrites && !holdForBreakpoint
+            self.heldResponse = response
+            self.heldCacheStoragePolicy = cacheStoragePolicy
+            self.response = response
+            completionHandler(.allow)
+            return
+        }
+
         self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: cacheStoragePolicy)
 
         self.response = response
@@ -898,8 +1161,23 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
     func urlSession(_ session: URLSession,
                     dataTask: URLSessionDataTask,
                     didReceive data: Data) {
-        // Just pass the call on to our client.
-        self.client?.urlProtocol(self, didLoad: data)
+        // A rewrite-only hold is bounded by the engine's own cap. The moment the
+        // body grows past it there is nothing left to rewrite, so stop holding,
+        // flush what was buffered and go back to streaming. Without this, a large
+        // response would be buffered in full and then hit the 10 MB capture cap
+        // below — which TRUNCATES `self.data`, and the app would receive the
+        // truncated bytes. A breakpoint hold is never abandoned: the developer
+        // asked for the pause.
+        if self.isHoldingResponse, self.isHoldingForRewriteOnly,
+           (self.data?.length ?? 0) + data.count > ResponseRewriteEngine.maxBodyBytes {
+            abandonRewriteHold()
+        }
+
+        // While holding for an `.afterResponse` breakpoint, accumulate only —
+        // the client must not see any bytes until the developer releases it.
+        if !self.isHoldingResponse {
+            self.client?.urlProtocol(self, didLoad: data)
+        }
 
         // Only accumulate for SwiftyDebug's capture if under the size cap.
         // The client always receives the full, unmodified data above.
@@ -929,10 +1207,218 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
                     task: URLSessionTask,
                     didCompleteWithError error: Error?) {
         if let error = error {
+            // A failure releases any hold — nothing to edit.
+            self.isHoldingResponse = false
+            self.isHoldingForRewriteOnly = false
             self.client?.urlProtocol(self, didFailWithError: error)
             self.error = error
-        } else {
-            self.client?.urlProtocolDidFinishLoading(self)
+            return
         }
+
+        guard self.isHoldingResponse else {
+            self.client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+
+        // ORDER OF THE THREE WAYS A BODY CAN BE CHANGED — deliberate:
+        //
+        //  1. A MOCK never reaches this method. It replaces the response
+        //     entirely in `startLoading()` and never touches the network, so
+        //     rewrites do not apply to mocked bodies (see the comment there).
+        //  2. REWRITES run HERE, on the complete body, before anything else
+        //     sees it — including SwiftyDebug's own capture.
+        //  3. The `.afterResponse` BREAKPOINT parks the ALREADY-rewritten body,
+        //     so the editor shows what the rules produced and any manual edit
+        //     composes on top of them instead of fighting them.
+        let deliverableBody = applyResponseRewrites(to: self.data as Data? ?? Data())
+        let didRewrite = (self.rewriteReport?.didChange == true)
+        if didRewrite {
+            // Keep the captured transaction honest: what the UI shows is what
+            // the app actually received.
+            self.data = NSMutableData(data: deliverableBody)
+        }
+
+        // No breakpoint — the rewrite was the only reason we held. Deliver now.
+        // Headers are only rebuilt when the bytes actually changed, so an
+        // untouched body is delivered exactly as it would have been streamed.
+        guard self.resolvedRule?.breakpointMode == .afterResponse else {
+            deliverHeldResponse(body: deliverableBody, rebuildHeaders: didRewrite)
+            return
+        }
+
+        // `.afterResponse` breakpoint: park the buffered response for editing
+        // instead of finishing. The app stays waiting until it's released.
+        let paused = BreakpointCenter.PausedRequest(
+            stage: .afterResponse,
+            request: self.interceptedRequest ?? self.request,
+            response: self.heldResponse as? HTTPURLResponse,
+            responseBody: deliverableBody,
+            resume: { [weak self] edited in
+                guard let self else { return }
+                self.performOnThread(self.clientThread, modes: self.modes) {
+                    self.deliverHeldResponse(body: edited.responseBody ?? Data())
+                }
+            },
+            abort: { [weak self] in
+                guard let self else { return }
+                self.performOnThread(self.clientThread, modes: self.modes) {
+                    self.isHoldingResponse = false
+                    self.client?.urlProtocol(self, didFailWithError: NSError(
+                        domain: NSURLErrorDomain, code: NSURLErrorCancelled,
+                        userInfo: [NSLocalizedDescriptionKey: "Aborted at breakpoint"]))
+                }
+            }
+        )
+        self.parkedBreakpoint = paused
+        BreakpointCenter.shared.park(paused)
+    }
+
+    // MARK: - Response rewrites (see RESPONSE-REWRITE)
+
+    /// Decides — before a single byte is buffered — whether this response is
+    /// worth holding for `ResponseRewriteEngine`.
+    ///
+    /// This runs on every response a rule matches, so it bails on the cheapest
+    /// checks first: nothing armed, a Content-Type that cannot be JSON, or a
+    /// declared length past the engine's cap. When rewrites ARE armed but the
+    /// response is skipped, the reason is recorded — an armed rule that quietly
+    /// does nothing is exactly the failure this feature must not produce.
+    private func shouldBufferForRewrites(_ response: URLResponse) -> Bool {
+        guard let rule = resolvedRule, rule.hasActiveResponseRewrites else { return false }
+
+        let expected = response.expectedContentLength
+        if expected > Int64(ResponseRewriteEngine.maxBodyBytes) {
+            let limit = ResponseRewriteEngine.maxBodyBytes / 1024 / 1024
+            rewriteReport = RewriteReport(skippedReason:
+                "The response declares \(ByteCountFormatter().string(fromByteCount: expected)), "
+                + "past the \(limit) MB rewrite limit, so rewrites were skipped.")
+            return false
+        }
+
+        guard Self.mimeTypeCanBeJSON(response.mimeType) else {
+            rewriteReport = RewriteReport(skippedReason:
+                "The response is \(response.mimeType ?? "an unknown type"), not JSON, "
+                + "so rewrites were skipped.")
+            return false
+        }
+        return true
+    }
+
+    /// Cheap Content-Type pre-filter, kept `static` so it is unit-testable.
+    ///
+    /// Deliberately permissive at the edges: no Content-Type at all means "let
+    /// the engine's JSON parse decide", and `text/*` covers the servers that
+    /// send JSON as `text/plain`. Anything else (images, video, protobuf,
+    /// octet-stream) is refused here so a binary download is never buffered.
+    static func mimeTypeCanBeJSON(_ mimeType: String?) -> Bool {
+        guard let mime = mimeType?.lowercased().trimmingCharacters(in: .whitespaces),
+              !mime.isEmpty else { return true }
+        return mime.contains("json") || mime.hasPrefix("text/")
+    }
+
+    /// Applies the resolved rule's rewrites to the finished body, returning the
+    /// bytes to deliver. Returns `body` unchanged whenever nothing applied.
+    private func applyResponseRewrites(to body: Data) -> Data {
+        guard let rule = resolvedRule, rule.hasActiveResponseRewrites else { return body }
+        // Already ruled out before we buffered (too big / not JSON). Don't redo
+        // the work, and don't clobber the reason the detail screen will show.
+        guard rewriteReport?.skippedReason == nil else { return body }
+
+        // Synchronous on the delivery thread, and safe to be: the engine caps
+        // the body it will parse (2 MB) and the number of nodes a pattern may
+        // visit, so this is bounded work, not an open-ended traversal.
+        let (rewritten, report) = ResponseRewriteEngine.apply(rule.responseRewrites, to: body)
+        rewriteReport = report
+        return rewritten
+    }
+
+    /// Gives up a rewrite-only hold mid-stream: flushes the buffered head to the
+    /// client and returns to normal streaming. Only ever called when no
+    /// breakpoint is involved, so nothing is waiting to edit this body.
+    private func abandonRewriteHold() {
+        isHoldingResponse = false
+        isHoldingForRewriteOnly = false
+        let limit = ResponseRewriteEngine.maxBodyBytes / 1024 / 1024
+        rewriteReport = RewriteReport(skippedReason:
+            "The response body grew past the \(limit) MB rewrite limit, so rewrites were skipped.")
+
+        if let held = heldResponse {
+            client?.urlProtocol(self, didReceive: held, cacheStoragePolicy: heldCacheStoragePolicy)
+        }
+        if let buffered = self.data as Data?, !buffered.isEmpty {
+            client?.urlProtocol(self, didLoad: buffered)
+        }
+        heldResponse = nil
+    }
+
+    /// Delivers the (possibly edited or rewritten) buffered response to the app.
+    ///
+    /// `rebuildHeaders` must be true whenever the bytes differ from what the
+    /// server sent. It is false only for a body we buffered but did not touch,
+    /// which is then delivered byte- and header-identical to the streamed path.
+    private func deliverHeldResponse(body: Data, rebuildHeaders: Bool = true) {
+        isHoldingResponse = false
+        isHoldingForRewriteOnly = false
+        guard let original = heldResponse else {
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        // Keep what the UI shows in sync with what the app actually received.
+        self.data = NSMutableData(data: body)
+
+        // CRITICAL: the original response's headers describe the ORIGINAL body.
+        // Delivering an edited body behind them breaks the app in two ways:
+        //  • `Content-Length` no longer matches — CFNetwork truncates the edited
+        //    body back to the old length (or treats it as incomplete), so the app
+        //    decodes garbage and shows nothing.
+        //  • `Content-Encoding: gzip` is a lie — URLSession already decompressed
+        //    what we buffered, so our edited body is plain text and the client
+        //    would try to gunzip it.
+        // Rebuild the response so the headers describe what we actually send.
+        // Non-HTTP responses have no headers to correct, so they pass through.
+        let response: URLResponse
+        if rebuildHeaders {
+            response = (original as? HTTPURLResponse)
+                .flatMap { Self.responseForEditedBody(original: $0, bodyLength: body.count) } ?? original
+        } else {
+            response = original
+        }
+
+        // A body we changed must never be cached — the cache would then serve
+        // SwiftyDebug's edit long after the rule was switched off.
+        let policy: URLCache.StoragePolicy = rebuildHeaders ? .notAllowed : heldCacheStoragePolicy
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: policy)
+        if !body.isEmpty { client?.urlProtocol(self, didLoad: body) }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    /// Rebuilds an `HTTPURLResponse` so its headers match an edited body:
+    /// corrects `Content-Length` and drops the encoding headers that no longer
+    /// apply. Returns nil only if the response can't be reconstructed.
+    static func responseForEditedBody(original: HTTPURLResponse, bodyLength: Int) -> HTTPURLResponse? {
+        guard let url = original.url else { return nil }
+        // Non-string header keys (never produced by CFNetwork) are dropped.
+        let headers = Self.headersForEditedBody(
+            original: original.allHeaderFields, bodyLength: bodyLength)
+        return HTTPURLResponse(url: url,
+                               statusCode: original.statusCode,
+                               httpVersion: "HTTP/1.1",
+                               headerFields: headers)
+    }
+
+    /// Pure header transform — extracted so it can be unit-tested.
+    static func headersForEditedBody(original: [AnyHashable: Any], bodyLength: Int) -> [String: String] {
+        var out: [String: String] = [:]
+        for (key, value) in original {
+            guard let name = key as? String else { continue }
+            let lower = name.lowercased()
+            // These describe the ORIGINAL bytes and are wrong for an edited body.
+            if lower == "content-length" || lower == "content-encoding" || lower == "transfer-encoding" {
+                continue
+            }
+            out[name] = "\(value)"
+        }
+        out["Content-Length"] = "\(bodyLength)"
+        return out
     }
 }

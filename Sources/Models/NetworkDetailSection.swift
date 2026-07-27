@@ -31,6 +31,8 @@ struct NetworkDetailSection {
     var sizeTag: String? = nil
     /// Other requests shown horizontally in the "SIMILAR REQUESTS" section
     var similarRequests: [NetworkTransaction]? = nil
+    /// Image URLs parsed from the response JSON, shown in the "MEDIA" grid section.
+    var mediaImageURLs: [String]? = nil
     /// Original content before display transformation — used for copying valid JSON.
     var rawContent: String? = nil
 

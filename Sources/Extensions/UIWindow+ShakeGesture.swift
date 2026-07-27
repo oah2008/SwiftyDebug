@@ -40,6 +40,21 @@ extension UIWindow {
         guard Settings.shared.shakeGestureEnabled,
               motion == .motionShake,
               !Settings.shared.debugUIVisible else { return }
-        Settings.shared.bubbleVisible.toggle()
+
+        // `willBeVisible` reflects the state *after* this shake.
+        let willBeVisible = !Settings.shared.bubbleVisible
+
+        if Settings.shared.fullStopOnDisable {
+            // Full-stop mode: shaking off performs a complete teardown so the
+            // SDK has ~zero cost; shaking on resumes all capture.
+            if willBeVisible {
+                SwiftyDebug.resumeFromFullStop()
+            } else {
+                SwiftyDebug.fullStop()
+            }
+        }
+
+        // In both modes the overlay visibility follows the shake.
+        Settings.shared.bubbleVisible = willBeVisible
     }
 }

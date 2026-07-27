@@ -74,6 +74,11 @@ public class SwiftyDebug {
 // MARK: - Override Swift `print`
 
 public func print<T>(file: String = #file, function: String = #function, line: Int = #line, _ message: T, color: UIColor = .white) {
+    // Host stdout always passes through, unchanged.
     Swift.print(message)
+
+    // Skip all SwiftyDebug work (string building, DB writes) when capture is off
+    // or the SDK is fully stopped — this is the hot path for a disabled SDK.
+    guard SwiftyDebugRuntime.isActive, PrintInterceptor.shared.enable else { return }
     PrintInterceptor.shared.handleLog(file: file, function: function, line: line, message: message, color: color)
 }

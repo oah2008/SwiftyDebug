@@ -16,8 +16,19 @@ class NetworkRequestStore: NSObject {
     private override init() {
         httpModels = NSMutableArray(capacity: 500)
         super.init()
-        // Clear leftover disk cache from previous app session
-        NetworkTransaction.clearDiskCache()
+        // The previous-session sweep does NOT happen here.
+        //
+        // This is a lazily-created singleton, and the thing that first touches it
+        // is `CustomHTTPProtocol.stopLoading` — which has already written the
+        // response body to disk 55 lines earlier. Wiping the directory from this
+        // initializer therefore deleted the body of the very request that caused
+        // the initialization, leaving `responseDataSize` reporting N bytes while
+        // `responseData` returned nil, and the RESPONSE section silently absent.
+        // It looked intermittent because it can only fire once per session, and
+        // not at all if the debug UI is opened before the first network call.
+        //
+        // `SwiftyDebug.initializationMethod()` now runs the sweep at startup,
+        // before the URLProtocol is registered and while nothing is in flight.
         // Restore pinned requests from previous session
         let pinned = NetworkTransaction.loadPinnedFromDisk()
         for model in pinned {
@@ -65,10 +76,13 @@ class NetworkRequestStore: NSObject {
         for model in pinned {
             httpModels.add(model)
         }
-        // Only clear disk cache for non-pinned entries (pinned files still on disk)
-        if pinned.isEmpty {
-            NetworkTransaction.clearDiskCache()
-        }
+        // No directory wipe here. `removeAllObjects()` above dropped the last
+        // reference to every non-pinned model, and `NetworkTransaction.deinit`
+        // removes exactly that model's own two files. A directory-wide wipe would
+        // additionally destroy the bodies of requests still being captured — a
+        // request completing around the moment Clear is tapped would land in the
+        // list with its file already gone, which is indistinguishable from having
+        // had no response at all.
     }
 
     func clearPinned() {

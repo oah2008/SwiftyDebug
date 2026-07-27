@@ -12,6 +12,21 @@ class SwiftyDebugTabBarController: UITabBarController {
     /// Remembers last selected tab bar index during app session (reset on app kill)
     static var savedTabIndex: Int = 0
 
+    /// A screen to jump to as soon as the tab bar appears (used by the paused
+    /// request overlay so one tap lands directly on the editor).
+    enum InitialScreen { case breakpointInbox }
+    var pendingInitialScreen: InitialScreen?
+
+    /// Pushes the paused-requests inbox on the Network tab.
+    func showBreakpointInbox() {
+        // Network tab hosts the inbox.
+        selectedIndex = 0
+        guard let nav = viewControllers?.first as? UINavigationController else { return }
+        // Don't stack duplicates.
+        if nav.viewControllers.contains(where: { $0 is BreakpointInboxViewController }) { return }
+        nav.pushViewController(BreakpointInboxViewController(), animated: true)
+    }
+
     //MARK: - init
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -54,16 +69,39 @@ class SwiftyDebugTabBarController: UITabBarController {
     
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        
+
         Settings.shared.debugUIVisible = true
+        // The inbox is reachable from in here — no need for the banner on top.
+        BreakpointOverlay.shared.refreshVisibility()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        if pendingInitialScreen == .breakpointInbox {
+            pendingInitialScreen = nil
+            showBreakpointInbox()
+        }
     }
     
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        // Only mark the debug UI hidden when it's genuinely going away — not
+        // when it's merely covered by a modal we presented ourselves.
+        guard presentedViewController == nil else { return }
         Settings.shared.debugUIVisible = false
+        // Back in the host app — re-show the banner if anything is still held.
+        BreakpointOverlay.shared.refreshVisibility()
     }
+
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        // CRITICAL: `displayedList` gates `SwiftyDebugWindow.point(inside:)` —
+        // when false the overlay window only accepts touches inside the bubble.
+        // Presenting a full-screen modal from inside the debug UI (e.g. the
+        // media viewer) fires viewDidDisappear here; clearing the flag then made
+        // the window swallow every touch in that modal, so its buttons appeared
+        // dead. Keep the gate open while we still have something presented.
+        guard presentedViewController == nil else { return }
         DebugWindowPresenter.shared.displayedList = false
     }
     
@@ -71,9 +109,10 @@ class SwiftyDebugTabBarController: UITabBarController {
     func setChildControllers() {
         let network = makeNav(root: NetworkViewController(),  tabTitle: "Network", systemImage: "arrow.up.arrow.down")
         let logs    = makeNav(root: LogViewController(),      tabTitle: "Logs",    systemImage: "doc.text")
+        let media   = makeNav(root: MediaTabViewController(), tabTitle: "Media",   systemImage: "photo.on.rectangle")
         let app     = makeNav(root: AppInfoViewController(),  tabTitle: "App",     systemImage: "info.circle")
 
-        let navs: [UINavigationController] = [network, logs, app]
+        let navs: [UINavigationController] = [network, logs, media, app]
 
         self.viewControllers = navs
 

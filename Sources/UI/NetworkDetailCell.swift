@@ -376,18 +376,14 @@ class NetworkDetailCell: UITableViewCell {
     }
 
     @objc private func tapCopy() {
+        // Copy from rawContent (the original, before display transforms that
+        // slash-unescape / re-indent) and produce guaranteed-valid JSON via the
+        // single canonical producer — objects, arrays and fragments all copy
+        // cleanly, slashes are not escaped, and no per-line leading space is
+        // added. Non-JSON is copied verbatim (trimmed). (See COPY.)
         let source = detailModel?.rawContent ?? detailModel?.content ?? ""
         guard !source.isEmpty else { return }
-
-        // Try to re-serialize as valid, clean JSON
-        if let data = source.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data),
-           let pretty = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted),
-           let str = String(data: pretty, encoding: .utf8) {
-            UIPasteboard.general.string = str
-        } else {
-            UIPasteboard.general.string = source.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
+        UIPasteboard.general.string = JSONExporter.clipboardString(from: source)
 
         // Brief visual feedback — flash the icon color
         let config = UIImage.SymbolConfiguration(pointSize: 12, weight: .medium)

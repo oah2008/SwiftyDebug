@@ -88,9 +88,10 @@ extension Data {
     }
 
     func dataToPrettyPrintString() -> String? {
-        //1.pretty json (handles both dictionaries and arrays)
+        //1.pretty json (handles both dictionaries and arrays). `.withoutEscapingSlashes`
+        //  keeps URLs/paths readable and valid when copied (see COPY).
         if let jsonObject = self.dataToJSONObject(),
-           let prettyData = try? JSONSerialization.data(withJSONObject: jsonObject, options: .prettyPrinted),
+           let prettyData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.prettyPrinted, .withoutEscapingSlashes]),
            let str = String(data: prettyData, encoding: .utf8) {
             return str
         }
