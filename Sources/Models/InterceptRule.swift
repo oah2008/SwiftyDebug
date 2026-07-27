@@ -206,6 +206,16 @@ struct InterceptRule: Codable {
     var mock: MockResponse
     /// Where matching requests are paused for manual editing.
     var breakpointMode: BreakpointMode
+    /// Automated edits applied to a matching JSON response body — the same edits
+    /// people were making by hand at an `.afterResponse` breakpoint, without the
+    /// pause. Empty by default, so an existing rule behaves exactly as before.
+    var responseRewrites: [ResponseRewrite]
+
+    /// True when this rule has at least one armed rewrite. Cheap enough to check
+    /// on every response before touching the body.
+    var hasActiveResponseRewrites: Bool {
+        responseRewrites.contains { $0.isEnabled }
+    }
 
     init(matchEndpoint: String, matchMode: EndpointMatchMode = .normalized) {
         self.id = UUID().uuidString
@@ -224,6 +234,7 @@ struct InterceptRule: Codable {
         self.redirectTarget = ""
         self.mock = MockResponse()
         self.breakpointMode = .off
+        self.responseRewrites = []
     }
 
     /// Rewrites `url` per this rule's redirect settings, preserving the original
@@ -234,8 +245,18 @@ struct InterceptRule: Codable {
     ///   hostAndPath : mahaly.com/checkout/abc?p=1  + "beta.com/checkout/xyz"
     ///                 -> beta.com/checkout/xyz?p=1
     func redirectedURL(for url: URL) -> URL? {
-        guard redirectMode != .none else { return nil }
-        let target = redirectTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        Self.rewritingURL(url, mode: redirectMode, target: redirectTarget)
+    }
+
+    /// The single implementation of "change the host (and optionally the path)".
+    ///
+    /// Both halves of the feature go through this: redirecting a request
+    /// (`redirectedURL(for:)`) and rewriting a URL inside a response body
+    /// (`RewriteAction.replaceHost`). Keeping one implementation means a
+    /// redirect and a rewrite can never disagree about what the user meant.
+    static func rewritingURL(_ url: URL, mode: RedirectMode, target rawTarget: String) -> URL? {
+        guard mode != .none else { return nil }
+        let target = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return nil }
 
         guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
@@ -270,7 +291,7 @@ struct InterceptRule: Codable {
         guard !hostPart.isEmpty else { return nil }
         comps.host = hostPart
 
-        if redirectMode == .hostAndPath {
+        if mode == .hostAndPath {
             // Replace the path wholesale; query is left untouched by design.
             comps.path = pathPart.isEmpty ? "/" : pathPart
         }
@@ -298,6 +319,7 @@ struct InterceptRule: Codable {
         case isEnabled, createdAt, order
         case redirectMode, redirectTarget
         case mock, breakpointMode
+        case responseRewrites
     }
 
     init(from decoder: Decoder) throws {
@@ -326,6 +348,11 @@ struct InterceptRule: Codable {
         redirectTarget = try c.decodeIfPresent(String.self, forKey: .redirectTarget) ?? ""
         mock = try c.decodeIfPresent(MockResponse.self, forKey: .mock) ?? MockResponse()
         breakpointMode = (try? c.decodeIfPresent(BreakpointMode.self, forKey: .breakpointMode)) as? BreakpointMode ?? .off
+        // Decoded element by element: one rewrite written by a newer build is
+        // dropped on its own instead of taking the whole rule with it.
+        let decodedRewrites: [ResponseRewrite.Lenient] =
+            ((try? c.decodeIfPresent([ResponseRewrite.Lenient].self, forKey: .responseRewrites)) ?? nil) ?? []
+        responseRewrites = decodedRewrites.compactMap { $0.rewrite }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -346,5 +373,6 @@ struct InterceptRule: Codable {
         try c.encode(redirectTarget, forKey: .redirectTarget)
         try c.encode(mock, forKey: .mock)
         try c.encode(breakpointMode, forKey: .breakpointMode)
+        try c.encode(responseRewrites, forKey: .responseRewrites)
     }
 }

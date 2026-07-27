@@ -154,6 +154,17 @@ class InterceptRuleStore {
             if rule.breakpointMode != .off {
                 composite.breakpointMode = rule.breakpointMode
             }
+            // Response rewrites: ACCUMULATE, unlike everything above. Two rules
+            // that both match (say a global one and an endpoint one) each have
+            // something to say about the body, and last-wins would throw one
+            // away. `enabled` is already sorted by `order`, so the rewrites come
+            // out in rule order and a later one sees what an earlier one wrote.
+            //
+            // Copying this through is not optional: `mock` and `breakpointMode`
+            // above BOTH shipped completely inert because the composite dropped
+            // them, and a rewrite dropped here would look exactly the same —
+            // armed in the editor, doing nothing on the wire.
+            composite.responseRewrites.append(contentsOf: rule.responseRewrites)
             for pair in rule.headerOverrides {
                 if let idx = composite.headerOverrides.firstIndex(where: { $0.key.lowercased() == pair.key.lowercased() }) {
                     composite.headerOverrides[idx] = pair

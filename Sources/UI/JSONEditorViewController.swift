@@ -29,6 +29,21 @@ final class JSONEditorViewController: UIViewController {
     /// Shown as the save button title (e.g. "Save", "Use Response").
     var saveButtonTitle: String = "Save"
 
+    /// Set to turn the tree into a **value picker**: tapping any row returns its
+    /// path and pops, instead of opening an editor.
+    ///
+    /// This is how a response rewrite gets its path without anyone typing
+    /// `data.items[*].url` by hand — you tap the value you can already see.
+    /// Assigning it also hides Save and the editing affordances, because a
+    /// picker that silently let you mutate the sample body would be a trap.
+    var onPickPath: ((JSONPath) -> Void)?
+
+    private var isPicking: Bool { onPickPath != nil }
+
+    /// Offered on every scalar row when set, so a rewrite can be authored from
+    /// the response you are looking at rather than from the rules screen.
+    var onRequestRewrite: ((JSONPath) -> Void)?
+
     private let document: JSONDocument
     private let editorTitle: String
 
@@ -105,9 +120,13 @@ final class JSONEditorViewController: UIViewController {
         titleLabel.sizeToFit()
         navigationItem.titleView = titleLabel
 
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            title: saveButtonTitle, style: .done, target: self, action: #selector(saveTapped))
-        navigationItem.rightBarButtonItem?.tintColor = DebugTheme.accentColor
+        // No Save in picker mode: the sample body is a reference, not something
+        // to edit, and offering Save would imply the edit went somewhere.
+        if !isPicking {
+            navigationItem.rightBarButtonItem = UIBarButtonItem(
+                title: saveButtonTitle, style: .done, target: self, action: #selector(saveTapped))
+            navigationItem.rightBarButtonItem?.tintColor = DebugTheme.accentColor
+        }
         if navigationController?.viewControllers.first === self {
             navigationItem.leftBarButtonItem = UIBarButtonItem(
                 barButtonSystemItem: .cancel, target: self, action: #selector(cancelTapped))
@@ -636,6 +655,17 @@ final class JSONEditorViewController: UIViewController {
         }()
 
         if !row.isContainer {
+            // Leads the menu when available: editing this value changes it once,
+            // rewriting it changes it on every future response. That is usually
+            // what you actually wanted after editing the same field twice.
+            if let requestRewrite = onRequestRewrite {
+                options.append(.init(title: "Rewrite this always\u{2026}",
+                                     subtitle: "Change it automatically on every response",
+                                     symbol: "wand.and.stars",
+                                     tint: DebugTheme.accentColor) {
+                    requestRewrite(path)
+                })
+            }
             options.append(.init(title: "Edit on its own page", subtitle: row.preview,
                                  symbol: "arrow.up.left.and.arrow.down.right",
                                  tint: DebugTheme.accentColor) { [weak self] in
@@ -824,6 +854,14 @@ extension JSONEditorViewController: UITableViewDataSource, UITableViewDelegate {
         tableView.deselectRow(at: indexPath, animated: true)
         guard rows.indices.contains(indexPath.row) else { return }
         let row = rows[indexPath.row]
+
+        // Picker mode: one tap IS the answer. Containers still expand via their
+        // chevron, but picking one is legitimate — a rewrite can target an object.
+        if let pick = onPickPath {
+            pick(row.path)
+            navigationController?.popViewController(animated: true)
+            return
+        }
 
         // Tapping a container opens actions (its chevron toggles expansion).
         if row.isContainer {

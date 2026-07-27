@@ -12,6 +12,7 @@ import UIKit
 /// Layout (mobile-first):
 ///   SCOPE      — how the rule matches (pattern / exact / hosts / global)
 ///   ACTION     — block, redirect, delete
+///   REWRITES   — automated edits applied to the response body (see RESPONSE-REWRITE)
 ///   HEADERS    — the headers this rule SETs or REMOVEs, one card each
 ///                (key on its own line, value on its own line)
 ///   AVAILABLE  — every header known for this scope, one tap to pull into the rule
@@ -35,10 +36,13 @@ class InterceptRuleEditorViewController: UITableViewController {
     private enum Section: Int, CaseIterable {
         case endpoint = 0
         case action = 1
-        case headers = 2
-        case availableHeaders = 3
-        case queryParams = 4
-        case availableParams = 5
+        /// Sits with the other "what to do with a matching request" choices —
+        /// a rewrite is the same kind of decision as mock/breakpoint/redirect.
+        case responseRewrites = 2
+        case headers = 3
+        case availableHeaders = 4
+        case queryParams = 5
+        case availableParams = 6
     }
 
     struct EditItem {
@@ -80,6 +84,9 @@ class InterceptRuleEditorViewController: UITableViewController {
     private var breakpointMode: BreakpointMode = .off
     private var headerItems: [EditItem] = []
     private var queryParamItems: [EditItem] = []
+    /// Automated edits applied to the response body of a matching request.
+    /// Saved with the rule through the same path as headers and params.
+    private var responseRewrites: [ResponseRewrite] = []
     private var existingRule: InterceptRule?
 
     /// Everything known for the current scope (persisted + current request).
@@ -154,6 +161,7 @@ class InterceptRuleEditorViewController: UITableViewController {
             redirectTarget = rule.redirectTarget
             mock = rule.mock
             breakpointMode = rule.breakpointMode
+            responseRewrites = rule.responseRewrites
             headerItems = rule.headerOverrides.map {
                 EditItem(key: $0.key, value: $0.value, isRemoving: false, isKeyEditable: false)
             }
@@ -252,6 +260,9 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     private func reloadAll() {
         refreshAvailable()
+        // The scope may have just changed, so the captured response the rewrite
+        // editor previews against has to be looked up again.
+        cachedSample = nil
         tableView.reloadData()
     }
 
@@ -283,6 +294,7 @@ class InterceptRuleEditorViewController: UITableViewController {
         rule.redirectTarget = redirectTarget.trimmingCharacters(in: .whitespacesAndNewlines)
         rule.mock = mock
         rule.breakpointMode = breakpointMode
+        rule.responseRewrites = responseRewrites
 
         // `isActive` is the guarantee that a rule only ever carries what was
         // explicitly switched on. Everything else is inert editor state.
@@ -299,8 +311,10 @@ class InterceptRuleEditorViewController: UITableViewController {
             || rule.redirectMode != .none && !rule.redirectTarget.isEmpty
             || !rule.headerOverrides.isEmpty || !rule.removedHeaderKeys.isEmpty
             || !rule.queryParamOverrides.isEmpty || !rule.removedQueryParamKeys.isEmpty
+            || !rule.responseRewrites.isEmpty
         guard hasEffect else {
-            showAlert(title: "Empty Rule", message: "Add a header/parameter change, a redirect, or enable blocking.")
+            showAlert(title: "Empty Rule",
+                      message: "Add a header/parameter change, a response rewrite, a redirect, or enable blocking.")
             return
         }
 
@@ -438,6 +452,124 @@ class InterceptRuleEditorViewController: UITableViewController {
             options: options, selectedIndex: modes.firstIndex(of: breakpointMode))
     }
 
+    // MARK: - Response rewrites
+
+    /// Opens the rewrite authoring screen.
+    ///
+    /// `destination: .caller` on purpose: this screen already owns the rule and
+    /// its scope, so the rewrite comes back through `onSave` and is saved with
+    /// the rule. Letting the editor attach it as well would arm the same edit
+    /// twice, on two different rules.
+    private func presentRewriteEditor(_ existing: ResponseRewrite?) {
+        let sample = sampleResponse()
+        let editor = ResponseRewriteEditorViewController(rewrite: existing,
+                                                         sampleBody: sample.body,
+                                                         sampleLabel: sample.label,
+                                                         destination: .caller)
+        editor.onSave = { [weak self] rewrite in
+            guard let self else { return }
+            // Match on id, so editing replaces instead of adding a second copy.
+            if let index = self.responseRewrites.firstIndex(where: { $0.id == rewrite.id }) {
+                self.responseRewrites[index] = rewrite
+            } else {
+                self.responseRewrites.append(rewrite)
+            }
+            self.tableView.reloadData()
+        }
+        if let existing = existing {
+            editor.onDelete = { [weak self] in
+                guard let self else { return }
+                self.responseRewrites.removeAll { $0.id == existing.id }
+                self.tableView.reloadData()
+            }
+        }
+        if let nav = navigationController {
+            nav.pushViewController(editor, animated: true)
+        } else {
+            present(SwiftyDebugNavigationController(rootViewController: editor), animated: true)
+        }
+    }
+
+    private func setRewrite(id: String, enabled: Bool) {
+        guard let index = responseRewrites.firstIndex(where: { $0.id == id }) else { return }
+        responseRewrites[index].isEnabled = enabled
+        // Whole section: the header counts how many are on, and the footer is
+        // what says "all of them are off" out loud.
+        tableView.reloadSections([Section.responseRewrites.rawValue], with: .none)
+    }
+
+    // MARK: Sample response for the rewrite editor
+
+    /// The captured response the rewrite editor previews and counts matches
+    /// against, resolved once per scope. Response bodies are disk-backed, so
+    /// this runs when an editor is opened — never from `cellForRowAt`.
+    private var cachedSample: (body: Data?, label: String?)?
+    /// How many captured responses are opened while looking for a JSON body.
+    private static let sampleScanLimit = 8
+
+    private func sampleResponse() -> (body: Data?, label: String?) {
+        if let cachedSample = cachedSample { return cachedSample }
+        let found = findSampleResponse()
+        cachedSample = found
+        return found
+    }
+
+    /// Newest captured JSON response inside this rule's scope, or `(nil, nil)`
+    /// when nothing has been captured yet — the editor handles that case and
+    /// says so rather than pretending to preview.
+    private func findSampleResponse() -> (body: Data?, label: String?) {
+        var candidates: [NetworkTransaction] = []
+        if let model = httpModel { candidates.append(model) }
+        // Same live store the host picker reads for this screen's suggestions.
+        let captured = (NetworkRequestStore.shared.httpModels.copy() as? NSArray as? [NetworkTransaction]) ?? []
+        for model in captured.reversed() where model !== httpModel && scopeMatches(model) {
+            candidates.append(model)
+        }
+
+        var opened = 0
+        for model in candidates {
+            // Cheap in-memory checks first; only then touch the disk.
+            guard model.responseDataSize > 0,
+                  model.responseDataSize <= UInt(ResponseRewriteEngine.maxBodyBytes) else { continue }
+            guard opened < Self.sampleScanLimit else { break }
+            opened += 1
+            guard let body = model.responseData, !body.isEmpty,
+                  (try? JSONSerialization.jsonObject(with: body, options: [.fragmentsAllowed])) != nil
+            else { continue }
+            return (body, sampleLabel(for: model))
+        }
+        return (nil, nil)
+    }
+
+    /// Does this captured request fall inside the scope currently on screen?
+    private func scopeMatches(_ model: NetworkTransaction) -> Bool {
+        guard let url = model.url as URL? else { return false }
+        switch matchMode {
+        case .global:
+            return true
+        case .host:
+            let hosts = selectedHosts.isEmpty ? (requestHost.isEmpty ? [] : [requestHost]) : selectedHosts
+            return hosts.contains { InterceptRuleStore.urlMatchesPattern(url, pattern: $0) }
+        case .exact:
+            return !requestPath.isEmpty && url.path == requestPath
+        case .normalized:
+            return !normalizedPath.isEmpty && EndpointNormalizer.normalize(url.path) == normalizedPath
+        }
+    }
+
+    /// "GET /v1/products · 200" — shown as the editor's prompt so it is never a
+    /// mystery which body the preview is running against.
+    private func sampleLabel(for model: NetworkTransaction) -> String {
+        var parts: [String] = []
+        let method = (model.method ?? "").uppercased()
+        if !method.isEmpty { parts.append(method) }
+        if let path = (model.url as URL?)?.path, !path.isEmpty { parts.append(path) }
+        let head = parts.joined(separator: " ")
+        let status = model.statusCode ?? ""
+        if status.isEmpty { return head.isEmpty ? "Captured response" : head }
+        return head.isEmpty ? status : head + " · " + status
+    }
+
     // MARK: - Breakpoint hold budget
 
     /// How long a paused request is actually held (`Settings.breakpointHoldSeconds`),
@@ -564,6 +696,10 @@ class InterceptRuleEditorViewController: UITableViewController {
             return 2
         case .action:
             return existingRule != nil ? 5 : 4      // block, redirect, mock, breakpoint (+ delete)
+        case .responseRewrites:
+            // A blocked request never gets a response, so there is nothing for a
+            // rewrite to act on — the section disappears, exactly like headers.
+            return isBlocked ? 0 : responseRewrites.count + 1     // +1 = "Add rewrite"
         case .headers:
             return isBlocked ? 0 : headerItems.count + 1     // +1 = "Add header"
         case .availableHeaders:
@@ -581,6 +717,11 @@ class InterceptRuleEditorViewController: UITableViewController {
         switch Section(rawValue: indexPath.section)! {
         case .endpoint:   return endpointCell(indexPath)
         case .action:     return actionCell(indexPath)
+        case .responseRewrites:
+            guard responseRewrites.indices.contains(indexPath.row) else {
+                return addButtonCell(title: "Add rewrite")
+            }
+            return rewriteCell(responseRewrites[indexPath.row])
         case .headers:
             if indexPath.row == headerItems.count { return addButtonCell(title: "Add header") }
             return cardCell(indexPath, isHeader: true)
@@ -791,6 +932,79 @@ class InterceptRuleEditorViewController: UITableViewController {
         return cell
     }
 
+    /// One rewrite: what it is called, what it does, and the switch that decides
+    /// whether it runs. Tapping the row opens the same editor that made it.
+    private func rewriteCell(_ rewrite: ResponseRewrite) -> UITableViewCell {
+        let c = plainCell("rewrite", style: .subtitle)
+        let on = rewrite.isEnabled
+        c.textLabel?.text = rewrite.displayName
+        c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+        c.textLabel?.textColor = on ? .white : UIColor(white: 0.5, alpha: 1)
+        c.textLabel?.numberOfLines = 2
+        c.detailTextLabel?.text = Self.rewriteSubtitle(rewrite)
+        c.detailTextLabel?.font = .systemFont(ofSize: 11)
+        c.detailTextLabel?.textColor = on ? DebugTheme.accentColor : UIColor(white: 0.4, alpha: 1)
+        c.detailTextLabel?.numberOfLines = 2
+
+        // Keyed by the rewrite's id, never by row index — the list is re-sorted
+        // by nothing today, but an index captured here would be a live landmine.
+        let id = rewrite.id
+        let sw = UISwitch()
+        sw.isOn = on
+        sw.onTintColor = DebugTheme.accentColor
+        sw.addAction(UIAction { [weak self] action in
+            guard let self, let toggle = action.sender as? UISwitch else { return }
+            self.setRewrite(id: id, enabled: toggle.isOn)
+        }, for: .valueChanged)
+
+        let cfg = UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        let chevron = UIImageView(image: UIImage(systemName: "chevron.right", withConfiguration: cfg)?
+            .withTintColor(UIColor(white: 0.45, alpha: 1), renderingMode: .alwaysOriginal))
+        chevron.contentMode = .center
+
+        // `accessoryView` is laid out from its frame, so the stack gets one.
+        let accessory = UIStackView(arrangedSubviews: [sw, chevron])
+        accessory.axis = .horizontal
+        accessory.alignment = .center
+        accessory.spacing = 8
+        let switchSize = sw.intrinsicContentSize
+        accessory.frame = CGRect(x: 0, y: 0,
+                                 width: switchSize.width + 8 + 14,
+                                 height: max(switchSize.height, 31))
+        accessory.forceLTR()
+        c.accessoryView = accessory
+        return c
+    }
+
+    /// "data.items[*].url · Replace the host with salla.com" — the pattern plus
+    /// what the action does, in the same plain words the rewrite editor uses.
+    private static func rewriteSubtitle(_ rewrite: ResponseRewrite) -> String {
+        let pattern = rewrite.pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (pattern.isEmpty ? "(no path yet)" : pattern) + " · " + actionSummary(rewrite.action)
+    }
+
+    private static func actionSummary(_ action: RewriteAction) -> String {
+        func clean(_ text: String) -> String {
+            text.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")
+        }
+        switch action {
+        case .replaceHost(let target):
+            let t = clean(target)
+            return t.isEmpty ? "Replace the host — no host set yet" : "Replace the host with \(t)"
+        case .replaceHostAndPath(let target):
+            let t = clean(target)
+            return t.isEmpty ? "Replace the host and path — nothing set yet" : "Replace the host and path with \(t)"
+        case .setValue(let value):
+            let v = clean(value)
+            return v.isEmpty ? "Set to an empty value" : "Set to \(v)"
+        case .findReplace(let find, let replace, let isRegex):
+            return "Replace \u{201C}\(clean(find))\u{201D} with \u{201C}\(clean(replace))\u{201D}"
+                + (isRegex ? " (regex)" : "")
+        case .removeKey:
+            return "Remove it from the response"
+        }
+    }
+
     private func addButtonCell(title: String) -> UITableViewCell {
         let c = plainCell("add")
         let cfg = UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
@@ -841,6 +1055,9 @@ class InterceptRuleEditorViewController: UITableViewController {
             else if ip.row == 2 { presentMockEditor() }
             else if ip.row == 3 { presentBreakpointPicker() }
             else if ip.row == 4 { removeRuleTapped() }
+        case .responseRewrites:
+            guard responseRewrites.indices.contains(ip.row) else { presentRewriteEditor(nil); return }
+            presentRewriteEditor(responseRewrites[ip.row])
         case .headers:
             if ip.row == headerItems.count { addHeader() }
         case .queryParams:
@@ -860,9 +1077,10 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, canEditRowAt ip: IndexPath) -> Bool {
         switch Section(rawValue: ip.section)! {
-        case .headers:     return ip.row < headerItems.count
-        case .queryParams: return ip.row < queryParamItems.count
-        default:           return false
+        case .headers:          return ip.row < headerItems.count
+        case .queryParams:      return ip.row < queryParamItems.count
+        case .responseRewrites: return ip.row < responseRewrites.count
+        default:                return false
         }
     }
 
@@ -871,6 +1089,9 @@ class InterceptRuleEditorViewController: UITableViewController {
         switch Section(rawValue: ip.section)! {
         case .headers:     headerItems.remove(at: ip.row)
         case .queryParams: queryParamItems.remove(at: ip.row)
+        case .responseRewrites:
+            guard responseRewrites.indices.contains(ip.row) else { return }
+            responseRewrites.remove(at: ip.row)
         default: return
         }
         reloadAll()
@@ -882,6 +1103,10 @@ class InterceptRuleEditorViewController: UITableViewController {
         switch s {
         case .endpoint: return matchMode == .global ? "SCOPE" : matchMode == .host ? "URLS" : "ENDPOINT"
         case .action:   return "ACTION"
+        case .responseRewrites:
+            guard !isBlocked else { return nil }
+            if responseRewrites.isEmpty { return "RESPONSE REWRITES" }
+            return "RESPONSE REWRITES (\(responseRewrites.filter { $0.isEnabled }.count) of \(responseRewrites.count) on)"
         case .headers:
             guard !isBlocked else { return nil }
             return headerItems.isEmpty ? "HEADERS"
@@ -918,6 +1143,8 @@ class InterceptRuleEditorViewController: UITableViewController {
         case .headers, .queryParams:
             // Say out loud that the checkbox is what makes a row take effect.
             hint.text = isBlocked ? nil : "only checked rows apply"
+        case .responseRewrites:
+            hint.text = isBlocked ? nil : "only switched-on ones run"
         default: break
         }
         header.addSubview(hint)
@@ -936,8 +1163,61 @@ class InterceptRuleEditorViewController: UITableViewController {
         guard let s = Section(rawValue: section), sectionTitle(s) != nil else { return 0 }
         return 38
     }
-    override func tableView(_ tableView: UITableView, viewForFooterInSection section: Int) -> UIView? { nil }
-    override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat { 4 }
+    private static let footerFont = UIFont.systemFont(ofSize: 11)
+
+    /// What the section does, in one plain sentence — and when the honest answer
+    /// is "nothing right now", it says that instead.
+    private func sectionFooterText(_ s: Section) -> String? {
+        guard s == .responseRewrites, !isBlocked else { return nil }
+        // A mock replaces the whole response, so rewrites never see it. Better to
+        // say so here than to let someone arm a rewrite that can never run.
+        if mock.isEnabled, !responseRewrites.isEmpty {
+            return "This rule returns a mock, so rewrites never run. Edit the mock body instead."
+        }
+        if !responseRewrites.isEmpty, !responseRewrites.contains(where: { $0.isEnabled }) {
+            return responseRewrites.count == 1
+                ? "This rewrite is switched off, so responses arrive unchanged."
+                : "All \(responseRewrites.count) rewrites are switched off, so responses arrive unchanged."
+        }
+        var text = "Change values in the response before the app sees them — no need to pause."
+        // Rewrites run in the URLProtocol, which never sees WKWebView traffic.
+        // A rule scoped wide enough to imply web views must not overpromise.
+        if matchMode == .global || matchMode == .host {
+            text += " Web view requests are not rewritten."
+        }
+        return text
+    }
+
+    override func tableView(_ tableView: UITableView, viewForFooterInSection section: Int) -> UIView? {
+        guard let s = Section(rawValue: section), let text = sectionFooterText(s) else { return nil }
+        let footer = UIView()
+        let label = UILabel()
+        label.font = Self.footerFont
+        label.textColor = UIColor(white: 0.45, alpha: 1)
+        label.numberOfLines = 0
+        label.text = text
+        label.translatesAutoresizingMaskIntoConstraints = false
+        footer.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 18),
+            label.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -18),
+            label.topAnchor.constraint(equalTo: footer.topAnchor, constant: 6),
+            label.bottomAnchor.constraint(lessThanOrEqualTo: footer.bottomAnchor, constant: -6),
+        ])
+        footer.forceLTR()
+        return footer
+    }
+
+    override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat {
+        guard let s = Section(rawValue: section), let text = sectionFooterText(s) else { return 4 }
+        let width = max(tableView.bounds.width - 36, 80)
+        let box = (text as NSString).boundingRect(
+            with: CGSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: Self.footerFont],
+            context: nil)
+        return ceil(box.height) + 14
+    }
 
     // MARK: - Keyboard dismiss button
 

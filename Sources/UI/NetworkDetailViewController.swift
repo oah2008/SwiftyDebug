@@ -30,6 +30,39 @@ class NetworkDetailViewController: UITableViewController {
     /// JSON body data inside the cURL command.
     private var rawCurlString: String = ""
 
+    // MARK: - Response rewrite entry point (see RESPONSE-REWRITE)
+
+    /// Title of the marker section that renders the "Rewrite a value…" card.
+    /// The card carries no text of its own in the model, so it never leaks into
+    /// the shared/copied details text.
+    private static let rewriteActionTitle = "AUTOMATE THIS RESPONSE"
+
+    /// The response bytes, read from disk ONCE in `setupModels`.
+    /// `httpModel.responseData` hits the disk on every access, so the rewrite
+    /// flow reuses this and never re-reads — least of all from `cellForRowAt`.
+    /// Released in `viewWillDisappear` with the rest of the big strings.
+    private var cachedResponseBody: Data?
+
+    /// Whether the rewrite card can do anything, decided once at setup.
+    private enum RewriteEntryState {
+        /// Nothing worth saying — no body, an image, or a replay result.
+        case hidden
+        /// Tappable: JSON, within the engine's size cap, with a URL to scope a rule to.
+        case ready
+        /// Shown but inert, carrying the reason in words. A control that is
+        /// visible and silently does nothing is the thing this avoids.
+        case blocked(String)
+
+        var isHidden: Bool {
+            if case .hidden = self { return true }
+            return false
+        }
+    }
+
+    /// Computed in `setupModels` from the single response parse — never derived
+    /// in `cellForRowAt`.
+    private var rewriteEntryState: RewriteEntryState = .hidden
+
     var headerCell: NetworkCell?
     
     var messageBody: String {
@@ -171,18 +204,52 @@ class NetworkDetailViewController: UITableViewController {
         }
         model_4.showPreview = true
 
+        // Parse the response body ONCE. Both the pretty-printed text below and
+        // the "can this be rewritten?" decision come out of this single parse —
+        // parsing twice is what makes a big response stutter on open.
+        // `.fragmentsAllowed` matches ResponseRewriteEngine exactly, so the card
+        // can never offer a rewrite the engine would then refuse.
+        var responseRoot: Any? = nil
+        if httpModel?.isImage != true, let data = cachedResponseData, !data.isEmpty {
+            responseRoot = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        }
+
         // Response body
         var model_5: NetworkDetailSection
-        if httpModel?.isImage == true {
-            if let responseData = cachedResponseData {
-                model_5 = NetworkDetailSection(title: "RESPONSE", content: nil, url: urlStr, image: UIImage.imageWithGIFData(responseData), httpModel: httpModel)
-            } else {
-                model_5 = NetworkDetailSection(title: "RESPONSE", content: nil, url: urlStr, httpModel: httpModel)
-            }
+        // An image only takes the image path when its bytes actually decode.
+        // `isImage` can come from the URL's extension alone, so a .png endpoint
+        // returning a JSON error envelope used to produce a section with neither
+        // image nor text — which the filter below then dropped entirely, hiding a
+        // response that was there and was exactly what you needed to read.
+        let decodedImage: UIImage? = (httpModel?.isImage == true)
+            ? cachedResponseData.flatMap { UIImage.imageWithGIFData($0) }
+            : nil
+        if let decodedImage {
+            model_5 = NetworkDetailSection(title: "RESPONSE", content: nil, url: urlStr,
+                                           image: decodedImage, httpModel: httpModel)
         } else {
-            model_5 = NetworkDetailSection(title: "RESPONSE", content: cachedResponseData?.dataToPrettyPrintString(), url: urlStr, httpModel: httpModel)
+            // Same output as `dataToPrettyPrintString()`, reusing the parse above:
+            // pretty JSON when it is JSON, the raw UTF-8 text when it is not.
+            let prettyResponse: String? = {
+                guard let data = cachedResponseData else { return nil }
+                if let root = responseRoot,
+                   let out = try? JSONSerialization.data(withJSONObject: root,
+                                                         options: [.prettyPrinted, .withoutEscapingSlashes]),
+                   let text = String(data: out, encoding: .utf8) {
+                    return text
+                }
+                return data.dataToPrettyPrintString()
+            }()
+            model_5 = NetworkDetailSection(title: "RESPONSE", content: prettyResponse, url: urlStr, httpModel: httpModel)
         }
         model_5.showPreview = true
+        // The body above is what the APP received, which is not what the server
+        // sent when a rewrite fired. Say so on the section itself — a developer
+        // reading a value that no server ever returned has to see it here, not
+        // three hours into a phantom bug hunt. (See RESPONSE-REWRITE.)
+        if httpModel?.isResponseRewritten == true {
+            model_5.title = "RESPONSE  ·  ✎ REWRITTEN"
+        }
         if httpModel?.isImage != true {
             let respBytes = Int(httpModel?.responseDataSize ?? 0)
             if respBytes > 0 {
@@ -350,15 +417,80 @@ class NetworkDetailViewController: UITableViewController {
             content: cacheLines.isEmpty ? nil : cacheLines.joined(separator: "\n"),
             url: urlStr, httpModel: httpModel)
 
+        // MARK: Response Rewrites (see RESPONSE-REWRITE)
+        // Present whenever a rule had rewrites armed for this request — NOT only
+        // when something changed. A rewrite that matched zero values is the
+        // failure mode this codebase keeps producing, so it is listed with its
+        // "matched 0" in full rather than vanishing.
+        var modelRewrites = NetworkDetailSection(title: "RESPONSE REWRITES", content: nil,
+                                                 url: urlStr, httpModel: httpModel)
+        // `isResponseRewritten` is included in the condition on purpose: a body
+        // badged "REWRITTEN" with no section under it would be a badge with no
+        // explanation, which is exactly the phantom bug hunt this exists to stop.
+        if httpModel?.hasRewriteInfo == true || httpModel?.isResponseRewritten == true {
+            var rewriteLines: [String] = []
+            let changed = httpModel?.rewrittenValueCount ?? 0
+            let notes = httpModel?.rewriteNotes ?? []
+            if httpModel?.isResponseRewritten == true {
+                rewriteLines.append("⚠︎ SwiftyDebug changed \(changed) "
+                                    + (changed == 1 ? "value" : "values")
+                                    + " in the body below. The server did not send this.")
+            } else if !notes.isEmpty {
+                rewriteLines.append("Nothing was changed — the body below is exactly "
+                                    + "what the server sent.")
+            }
+            if let reason = httpModel?.rewriteSkippedReason, !reason.isEmpty {
+                rewriteLines.append(reason)
+            }
+            if notes.isEmpty {
+                // Every rewrite that runs leaves a note, so this only happens for
+                // a record restored from before notes were persisted. Say that,
+                // rather than leaving the badge unexplained.
+                if httpModel?.isResponseRewritten == true {
+                    rewriteLines.append("Per-rewrite detail was not recorded for this request.")
+                }
+            } else {
+                // One block per rewrite that ran — name, how many values it
+                // matched, how many it changed, and any engine error. Rewrites
+                // that matched ZERO values are in here too; that is the whole
+                // point of listing them.
+                rewriteLines.append("")
+                rewriteLines.append(contentsOf: notes)
+                modelRewrites.sizeTag = notes.count == 1 ? "1 rewrite ran" : "\(notes.count) rewrites ran"
+            }
+            modelRewrites.content = rewriteLines.joined(separator: "\n")
+            modelRewrites.isInfoOnly = true
+        }
+
+        // MARK: Rewrite entry point (see RESPONSE-REWRITE)
+        // The three-tap flow starts here: this card → tap the value → Save.
+        // Decided once, from the parse above, because `cellForRowAt` has to stay
+        // pure layout — and because an action that is offered has to work.
+        cachedResponseBody = cachedResponseData
+        // The card was removed from this screen at the user's request. Rewrites
+        // are authored from the intercept rule editor's RESPONSE REWRITES
+        // section instead. The state stays `.hidden` so the row is never built.
+        rewriteEntryState = .hidden
+        // Content stays nil: the card draws its own text, so this section never
+        // shows up in the copied/shared details.
+        let modelRewriteAction = NetworkDetailSection(title: Self.rewriteActionTitle, content: nil,
+                                                      url: urlStr, httpModel: httpModel)
+
         // Build final list — only include sections that have content.
         // URL is always included (hidden placeholder row).
         // REQUEST CURL is always included (useful even with just URL + method).
         // Everything else is filtered out when empty.
-        let alwaysInclude: Set<String> = ["URL", "REQUEST CURL"]
+        // The rewrite card carries no content, so it is included by title.
+        let alwaysInclude: Set<String> = ["URL", "REQUEST CURL", Self.rewriteActionTitle]
 
-        let allSections = [model_1, modelParams, model_2, model_3, model_4, model_5,
-                           model_6, model_7, modelCurl,
-                           modelTiming, modelJWT, modelErrorDetails, modelCache]
+        // The card sits immediately under the response body — the moment you are
+        // reading a value you want changed is the moment the action has to be
+        // within reach.
+        var allSections = [model_1, modelParams, model_2, model_3, model_4,
+                           modelRewrites, model_5]
+        if !rewriteEntryState.isHidden { allSections.append(modelRewriteAction) }
+        allSections += [model_6, model_7, modelCurl,
+                        modelTiming, modelJWT, modelErrorDetails, modelCache]
         for section in allSections {
             let title = section.title ?? ""
             if alwaysInclude.contains(title) {
@@ -422,6 +554,99 @@ class NetworkDetailViewController: UITableViewController {
                 return seg
             }
             .joined(separator: "/")
+    }
+
+    // MARK: - Response rewrite flow (see RESPONSE-REWRITE)
+
+    /// Whether "Rewrite a value…" is offered, and if not, whether that is worth
+    /// saying out loud. `.blocked` is deliberately preferred over hiding whenever
+    /// there IS a body on screen: "why is there no rewrite button" has to have an
+    /// answer where the body is.
+    private static func rewriteEntry(body: Data?, root: Any?, url: URL?,
+                                     isImage: Bool, isReplayResult: Bool) -> RewriteEntryState {
+        // A replay result is a one-off the developer fired by hand; the screen
+        // already hides Intercept/Replay there, and a rule armed from it would
+        // silently apply to live traffic instead.
+        guard !isReplayResult else { return .hidden }
+        // Without a URL there is nothing to scope an intercept rule to.
+        guard url != nil else { return .hidden }
+        // No body, or a body that is a picture: nothing is being read, so there
+        // is no question to answer.
+        guard let body = body, !body.isEmpty, !isImage else { return .hidden }
+
+        guard body.count <= ResponseRewriteEngine.maxBodyBytes else {
+            let size = ByteCountFormatter.string(fromByteCount: Int64(body.count), countStyle: .binary)
+            return .blocked("Can't rewrite this one: the body is \(size), over the "
+                            + "\(ResponseRewriteEngine.maxBodyBytes / 1024 / 1024) MB limit, "
+                            + "so rewrites are skipped for responses this big.")
+        }
+        guard root != nil else {
+            return .blocked("Can't rewrite this one: the body isn't JSON, so it has no "
+                            + "named values to change.")
+        }
+        return .ready
+    }
+
+    /// Tap 1 of 3. Opens the response as a tree in picker mode — one tap on the
+    /// value is tap 2, and the editor it lands in is pre-filled well enough that
+    /// Save is tap 3.
+    private func startRewriteFlow() {
+        guard case .ready = rewriteEntryState,
+              let body = cachedResponseBody,          // already in memory, no disk read
+              let url = httpModel?.url as URL?,
+              let root = try? JSONSerialization.jsonObject(with: body, options: [.fragmentsAllowed])
+        else { return }
+
+        let picker = JSONEditorViewController(document: JSONDocument(root: root),
+                                              title: "Tap the value to rewrite")
+        picker.onPickPath = { [weak self] path in
+            guard let self = self else { return }
+            // The picker pops ITSELF as soon as this returns. Pushing the editor
+            // here would put it underneath that pop and it would vanish, so hand
+            // it to the next runloop turn instead.
+            DispatchQueue.main.async { [weak self] in
+                self?.pushRewriteEditor(seedPath: path, body: body, url: url)
+            }
+        }
+        if let nav = navigationController {
+            nav.pushViewController(picker, animated: true)
+        } else {
+            present(SwiftyDebugNavigationController(rootViewController: picker), animated: true)
+        }
+    }
+
+    /// Tap 3 lives here. `.rule(forURL:)` is used rather than `.caller` because
+    /// no rule is open — the editor owns creating (or reusing) an intercept rule
+    /// and showing the APPLIES TO scope choice for it.
+    private func pushRewriteEditor(seedPath: JSONPath, body: Data, url: URL) {
+        let editor = ResponseRewriteEditorViewController(
+            rewrite: nil,
+            sampleBody: body,
+            sampleLabel: url.absoluteString,
+            seedPath: seedPath,
+            destination: .rule(forURL: url))
+
+        guard let nav = navigationController else {
+            // No nav of our own: the picker was presented modally inside one, so
+            // the editor goes on top of THAT stack. Presenting from self while it
+            // is already presenting the picker would just be dropped.
+            if let modalNav = presentedViewController as? UINavigationController {
+                modalNav.pushViewController(editor, animated: true)
+            } else {
+                (presentedViewController ?? self)
+                    .present(SwiftyDebugNavigationController(rootViewController: editor), animated: true)
+            }
+            return
+        }
+        // The picker's pop is still animating at this point; pushing into a
+        // running transition is what corrupts the navigation bar.
+        if let coordinator = nav.transitionCoordinator {
+            coordinator.animate(alongsideTransition: nil) { _ in
+                nav.pushViewController(editor, animated: true)
+            }
+        } else {
+            nav.pushViewController(editor, animated: true)
+        }
     }
 
     private func humanDuration(_ seconds: Int) -> String {
@@ -537,6 +762,8 @@ class NetworkDetailViewController: UITableViewController {
         tableView.register(NetworkDetailCell.self, forCellReuseIdentifier: "NetworkDetailCell")
         tableView.register(NetworkSimilarRequestsCell.self, forCellReuseIdentifier: "NetworkSimilarRequestsCell")
         tableView.register(NetworkMediaGridCell.self, forCellReuseIdentifier: "NetworkMediaGridCell")
+        tableView.register(NetworkRewriteActionCell.self,
+                           forCellReuseIdentifier: NetworkRewriteActionCell.reuseID)
 
         // Table styling
         tableView.backgroundColor = .black
@@ -672,6 +899,7 @@ class NetworkDetailViewController: UITableViewController {
         // Release large strings (response body, request body) immediately
         // when navigating away instead of waiting for dealloc.
         detailModels.removeAll()
+        cachedResponseBody = nil
     }
     
     //MARK: - target action
@@ -850,6 +1078,27 @@ extension NetworkDetailViewController {
             return cell
         }
 
+        // Rewrite entry point — the card that starts the three-tap flow. Its
+        // state was decided in setupModels; nothing here parses or reads disk.
+        if model.title == Self.rewriteActionTitle {
+            let cell = tableView.dequeueReusableCell(
+                withIdentifier: NetworkRewriteActionCell.reuseID, for: indexPath)
+                as! NetworkRewriteActionCell
+            switch rewriteEntryState {
+            case .ready:
+                cell.configure(isActionable: true,
+                               title: "Rewrite a value\u{2026}",
+                               subtitle: "Change it automatically on every response")
+            case .blocked(let reason):
+                cell.configure(isActionable: false, title: "Rewrite a value", subtitle: reason)
+            case .hidden:
+                // Unreachable: a hidden card is never added to detailModels.
+                cell.configure(isActionable: false, title: "Rewrite a value",
+                               subtitle: "Not available for this response.")
+            }
+            return cell
+        }
+
         let cell = tableView.dequeueReusableCell(withIdentifier: "NetworkDetailCell", for: indexPath)
             as! NetworkDetailCell
         cell.detailModel = model
@@ -890,6 +1139,152 @@ extension NetworkDetailViewController {
         if detailModels[detailIndex].title == "URL" { return 0 }
 
         return UITableView.automaticDimension
+    }
+
+    /// The only selectable row on this screen: the rewrite card, and only when
+    /// it can actually do something. A blocked card explains itself in place and
+    /// does not pretend to be a button.
+    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: false)
+        let detailIndex = indexPath.row - 1
+        guard detailModels.indices.contains(detailIndex),
+              detailModels[detailIndex].title == Self.rewriteActionTitle,
+              case .ready = rewriteEntryState else { return }
+        startRewriteFlow()
+    }
+}
+
+// MARK: - Rewrite action card
+
+/// The card under the response body that turns "I keep changing this value by
+/// hand" into an armed rewrite. It is a plain row rather than a button on the
+/// RESPONSE card because it needs a line of explanation next to it — the whole
+/// point is that the change happens on *every* future response, and that has to
+/// be said before it is agreed to.
+///
+/// When the response cannot be rewritten the card stays put and carries the
+/// reason instead of disappearing, so "where is the rewrite action" always has
+/// an answer at the place the question is asked.
+final class NetworkRewriteActionCell: UITableViewCell {
+
+    static let reuseID = "NetworkRewriteActionCell"
+
+    private static let cardColor = UIColor(white: 0.11, alpha: 1)
+    private static let highlightColor = UIColor(white: 0.16, alpha: 1)
+
+    private let cardView = UIView()
+    private let iconView = UIImageView()
+    private let titleLabel = UILabel()
+    private let subtitleLabel = UILabel()
+    private let chevronView = UIImageView()
+
+    /// Per-row flag — reset in prepareForReuse so a recycled card never keeps a
+    /// previous row's highlight behaviour.
+    private var isActionable = false
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+        selectionStyle = .none
+
+        cardView.backgroundColor = Self.cardColor
+        cardView.layer.cornerRadius = 10
+        cardView.layer.borderWidth = 1
+        cardView.layer.borderColor = DebugTheme.accentColor.withAlphaComponent(0.35).cgColor
+        cardView.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(cardView)
+
+        iconView.contentMode = .scaleAspectFit
+        iconView.setContentHuggingPriority(.required, for: .horizontal)
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        cardView.addSubview(iconView)
+
+        titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        titleLabel.numberOfLines = 0
+
+        subtitleLabel.font = .systemFont(ofSize: 11)
+        subtitleLabel.numberOfLines = 0
+
+        let stack = UIStackView(arrangedSubviews: [titleLabel, subtitleLabel])
+        stack.axis = .vertical
+        stack.spacing = 3
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        cardView.addSubview(stack)
+
+        let chevronConfig = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        chevronView.image = UIImage(systemName: "chevron.right", withConfiguration: chevronConfig)?
+            .withTintColor(DebugTheme.accentColor, renderingMode: .alwaysOriginal)
+        chevronView.contentMode = .scaleAspectFit
+        chevronView.setContentHuggingPriority(.required, for: .horizontal)
+        chevronView.translatesAutoresizingMaskIntoConstraints = false
+        cardView.addSubview(chevronView)
+
+        let cardBottom = cardView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -3)
+        cardBottom.priority = UILayoutPriority(999)
+
+        // The stack is pinned to BOTH the top and the bottom of the card, and the
+        // card to both edges of the contentView — self-sizing depends on it.
+        NSLayoutConstraint.activate([
+            cardView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 8),
+            cardView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -8),
+            cardView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 3),
+            cardBottom,
+
+            iconView.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 14),
+            iconView.centerYAnchor.constraint(equalTo: cardView.centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 22),
+            iconView.heightAnchor.constraint(equalToConstant: 22),
+
+            stack.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: chevronView.leadingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: cardView.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -12),
+
+            chevronView.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -14),
+            chevronView.centerYAnchor.constraint(equalTo: cardView.centerYAnchor),
+            chevronView.widthAnchor.constraint(equalToConstant: 12),
+        ])
+        forceLTR()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        isActionable = false
+        titleLabel.text = nil
+        subtitleLabel.text = nil
+        iconView.image = nil
+        chevronView.isHidden = true
+        cardView.backgroundColor = Self.cardColor
+    }
+
+    func configure(isActionable: Bool, title: String, subtitle: String) {
+        self.isActionable = isActionable
+        titleLabel.text = title
+        subtitleLabel.text = subtitle
+
+        let tint = isActionable ? DebugTheme.accentColor : UIColor(white: 0.42, alpha: 1)
+        let iconConfig = UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+        iconView.image = UIImage(systemName: "wand.and.stars", withConfiguration: iconConfig)?
+            .withTintColor(tint, renderingMode: .alwaysOriginal)
+
+        titleLabel.textColor = isActionable ? .white : UIColor(white: 0.55, alpha: 1)
+        // The unavailable reason is the point of the card in that state, so it is
+        // the loud element rather than a grey aside.
+        subtitleLabel.textColor = isActionable ? UIColor(white: 0.55, alpha: 1) : .systemOrange
+        chevronView.isHidden = !isActionable
+        cardView.layer.borderColor = (isActionable
+            ? DebugTheme.accentColor.withAlphaComponent(0.35)
+            : UIColor(white: 0.20, alpha: 1)).cgColor
+        cardView.backgroundColor = Self.cardColor
+    }
+
+    override func setHighlighted(_ highlighted: Bool, animated: Bool) {
+        super.setHighlighted(highlighted, animated: animated)
+        guard isActionable else { return }
+        cardView.backgroundColor = highlighted ? Self.highlightColor : Self.cardColor
     }
 }
 

@@ -35,6 +35,61 @@ class NetworkTransaction: NSObject {
     var errorLocalizedDescription: String?
     var size: String?
 
+    // MARK: - Response rewrites (see RESPONSE-REWRITE)
+
+    /// True when `ResponseRewriteEngine` actually changed the response body
+    /// before the app saw it — i.e. the app was handed data the server never
+    /// sent. Everything that displays this transaction has to say so, otherwise
+    /// the next bug report is a phantom hunt for a value no server ever returned.
+    var isResponseRewritten: Bool = false
+
+    /// How many individual JSON values were changed. 0 with
+    /// `isResponseRewritten == false` still leaves `rewriteNotes` populated —
+    /// "armed and matched nothing" is a result the developer needs to see.
+    var rewrittenValueCount: Int = 0
+
+    /// One human-readable line per rewrite that ran, INCLUDING the ones that
+    /// matched nothing. Built at capture time (never re-derived in
+    /// `cellForRowAt`) so the detail screen is pure layout.
+    var rewriteNotes: [String] = []
+
+    /// Why the engine never ran at all: body not JSON, body over the size cap,
+    /// re-encoding failed. Shown verbatim so "my rewrite did nothing" always has
+    /// an answer.
+    var rewriteSkippedReason: String?
+
+    /// True when this transaction has anything to say about rewrites.
+    var hasRewriteInfo: Bool {
+        !rewriteNotes.isEmpty || (rewriteSkippedReason?.isEmpty == false)
+    }
+
+    /// Copies a `RewriteReport` onto this transaction, resolving each entry's
+    /// id back to the rewrite it came from so the notes carry the rule's own
+    /// display name rather than a UUID.
+    ///
+    /// Called once, from `CustomHTTPProtocol.stopLoading()`, while the engine's
+    /// result is still in memory.
+    func recordRewriteReport(_ report: RewriteReport, rewrites: [ResponseRewrite]) {
+        isResponseRewritten = report.didChange
+        rewrittenValueCount = report.changedCount
+        rewriteSkippedReason = report.skippedReason
+        rewriteNotes = report.entries.map { entry in
+            let name = rewrites.first { $0.id == entry.rewriteId }?.displayName ?? "Rewrite"
+            var line = "\(name)\n  matched \(entry.matched), changed \(entry.changed)"
+            // A rewrite that matched nothing is the failure mode this feature has
+            // to make impossible to miss, so it gets said in words, not just a 0.
+            if entry.matched == 0 {
+                line += "\n  ⚠︎ no values matched this path"
+            } else if entry.changed == 0 && entry.error == nil {
+                line += "\n  ⚠︎ every matched value already had this value"
+            }
+            if let error = entry.error {
+                line += "\n  ⚠︎ \(error)"
+            }
+            return line
+        }
+    }
+
     /// Precomputed searchable metadata, built once at capture time so search
     /// never touches disk. See `RequestSearchIndex`. Also exposes `imageURLs`
     /// for the media grid / Media tab.
@@ -116,6 +171,13 @@ class NetworkTransaction: NSObject {
         dict["errorDescription"] = errorDescription
         dict["errorLocalizedDescription"] = errorLocalizedDescription
         dict["size"] = size
+        // A pinned rewritten response must keep saying it was rewritten. Pinning
+        // is the only place a transaction outlives the process, so this is the
+        // only persistence the badge needs.
+        dict["isResponseRewritten"] = isResponseRewritten
+        dict["rewrittenValueCount"] = rewrittenValueCount
+        dict["rewriteNotes"] = rewriteNotes
+        dict["rewriteSkippedReason"] = rewriteSkippedReason
 
         // Serialize headers as JSON-compatible dictionaries
         if let reqHeaders = requestHeaderFields as? [String: Any] {
@@ -184,6 +246,10 @@ class NetworkTransaction: NSObject {
             model.errorDescription = dict["errorDescription"] as? String
             model.errorLocalizedDescription = dict["errorLocalizedDescription"] as? String
             model.size = dict["size"] as? String
+            model.isResponseRewritten = dict["isResponseRewritten"] as? Bool ?? false
+            model.rewrittenValueCount = dict["rewrittenValueCount"] as? Int ?? 0
+            model.rewriteNotes = dict["rewriteNotes"] as? [String] ?? []
+            model.rewriteSkippedReason = dict["rewriteSkippedReason"] as? String
 
             if let reqHeaders = dict["requestHeaderFields"] as? [String: Any] {
                 model.requestHeaderFields = reqHeaders as NSDictionary
@@ -258,10 +324,19 @@ class NetworkTransaction: NSObject {
                 return
             }
 
+            // Record the path ONLY on a successful write. Assigning it
+            // unconditionally after `try?` meant a failed write left the model
+            // claiming N bytes it could never produce, and the body silently
+            // rendered as nothing.
             let fileName = "req_\(UUID().uuidString)"
             let filePath = (NetworkTransaction.diskCacheDirectory() as NSString).appendingPathComponent(fileName)
-            try? data.write(to: URL(fileURLWithPath: filePath))
-            _requestDataFilePath = filePath
+            do {
+                try data.write(to: URL(fileURLWithPath: filePath), options: .atomic)
+                _requestDataFilePath = filePath
+            } catch {
+                _requestDataFilePath = nil
+                requestDataSize = 0
+            }
         }
     }
 
@@ -285,10 +360,17 @@ class NetworkTransaction: NSObject {
                 return
             }
 
+            // See requestData: size and path must agree, or the UI reports a
+            // body that cannot be read back.
             let fileName = "res_\(UUID().uuidString)"
             let filePath = (NetworkTransaction.diskCacheDirectory() as NSString).appendingPathComponent(fileName)
-            try? data.write(to: URL(fileURLWithPath: filePath))
-            _responseDataFilePath = filePath
+            do {
+                try data.write(to: URL(fileURLWithPath: filePath), options: .atomic)
+                _responseDataFilePath = filePath
+            } catch {
+                _responseDataFilePath = nil
+                responseDataSize = 0
+            }
         }
     }
 }

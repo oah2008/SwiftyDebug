@@ -16,6 +16,14 @@ extension SwiftyDebug {
 
         _ = LogStore.shared
 
+        // Sweep the previous session's captured bodies BEFORE anything can be
+        // captured, then force the store into existence so nothing later can
+        // trigger a lazy init that wipes live files. Order matters: this must
+        // stay ahead of `NetworkMonitor.shared.enable()` below, which registers
+        // the URLProtocol and opens the door to captures.
+        NetworkTransaction.clearDiskCache()
+        _ = NetworkRequestStore.shared
+
         // Apply persisted toggle states
         let settings = Settings.shared
         SwiftyDebug.monitorAllUrls = settings.monitorAllRequests
