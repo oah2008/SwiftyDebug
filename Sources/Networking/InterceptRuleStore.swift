@@ -24,8 +24,43 @@ class InterceptRuleStore {
     /// In-memory cache keyed by `matchEndpoint`. Each key maps to an ordered array of rules.
     private var rules: [String: [InterceptRule]] = [:]
 
+    /// What went wrong the last time `rules.json` was read, if anything.
+    ///
+    /// Losing rules silently is the worst outcome here — they are invisible
+    /// state that changes how the host app's network behaves — so a lossy load
+    /// is recorded, the original bytes are copied aside, and the UI says so.
+    struct LoadIssue: Equatable {
+        /// Rules that decoded and are now live.
+        let recovered: Int
+        /// Rules that were present but unreadable and had to be skipped.
+        /// Zero when the file could not be parsed as a list at all.
+        let skipped: Int
+        /// True when the file itself was not decodable as a rule list.
+        let fileUnreadable: Bool
+        /// Where the untouched original bytes were copied, if the copy worked.
+        let backupURL: URL?
+    }
+
+    private var loadIssue: LoadIssue?
+
+    /// Set only when the file on disk existed, was non-empty and yielded ZERO
+    /// rules. While it is set, an EMPTY rule set is never written back — see
+    /// `saveToDisk()`.
+    private var refusesEmptyOverwrite = false
+
     private init() {
         loadFromDisk()
+    }
+
+    /// Returns the last load problem **once**, then forgets it, so the UI
+    /// reports it a single time per launch instead of on every appearance.
+    /// Returns nil — a no-op for the caller — when the load was clean.
+    func takeLoadIssue() -> LoadIssue? {
+        objc_sync_enter(self)
+        defer { objc_sync_exit(self) }
+        let issue = loadIssue
+        loadIssue = nil
+        return issue
     }
 
     // MARK: - Lookup
@@ -289,6 +324,9 @@ class InterceptRuleStore {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
         rules.removeAll()
+        // An explicit wipe is honored even after an unreadable load: the user
+        // asked for empty, and the original bytes are already backed up.
+        refusesEmptyOverwrite = false
         saveToDisk()
     }
 
@@ -311,10 +349,26 @@ class InterceptRuleStore {
     }
 
     private func saveToDisk() {
+        let allRules = rules.values.flatMap { $0 }
+
+        // NO-OP ON PURPOSE. If the file on disk existed but produced no rules at
+        // all, we do not know what is in it — only that we could not read it.
+        // Writing our empty in-memory state over it is exactly the sequence that
+        // destroyed every rule on the device: one unreadable rule -> empty
+        // memory -> first `addOrUpdate` overwrites the file. The original bytes
+        // are already copied aside by `loadFromDisk()`, and the flag clears the
+        // moment there is real content to write (or on an explicit `removeAll`).
+        if allRules.isEmpty && refusesEmptyOverwrite {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .interceptRulesDidChange, object: nil)
+            }
+            return
+        }
+
         do {
-            let allRules = rules.values.flatMap { $0 }
             let data = try JSONEncoder().encode(allRules)
             try data.write(to: fileURL, options: .atomic)
+            refusesEmptyOverwrite = false
         } catch {
             // Silent failure — debug tool, not critical path
         }
@@ -353,11 +407,70 @@ class InterceptRuleStore {
         return str
     }
 
-    private func loadFromDisk() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let loaded = try? JSONDecoder().decode([InterceptRule].self, from: data) else {
-            return
+    /// Decodes the on-disk rule list, keeping every rule it can.
+    ///
+    /// Split out and `static` so the recovery behaviour is testable without a
+    /// singleton or a Caches directory.
+    /// - Returns: the rules that decoded, and how many were present but
+    ///   unreadable. `total == nil` means the payload was not a rule list at
+    ///   all (not even an array), which is a different failure from "an array
+    ///   with a bad element in it".
+    static func decodeRules(from data: Data) -> (rules: [InterceptRule], total: Int?) {
+        // Per ELEMENT, not per file: one rule this build cannot make sense of —
+        // an enum case added by a newer version, a hand-edited export — used to
+        // make `try?` swallow the ENTIRE array and hand back nil.
+        let decoder = JSONDecoder()
+        // Our own file: keep everything readable rather than reporting what is
+        // not. (An imported file wants the opposite — see the key's docs.)
+        decoder.userInfo[.swiftyDebugLenientRuleDecoding] = true
+        guard let wrapped = try? decoder.decode([LenientElement<InterceptRule>].self, from: data) else {
+            return ([], nil)
         }
+        return (wrapped.compactMap { $0.value }, wrapped.count)
+    }
+
+    private static let backupPrefix = "rules-unreadable-"
+    /// A file that will not parse tends not to start parsing, so this would
+    /// otherwise leave one copy per launch in the user's Caches forever.
+    private static let maxBackups = 3
+
+    /// Copies bytes we could not fully read next to the live file, so a lossy
+    /// load is recoverable by hand. Returns nil if even the copy failed.
+    private func backUpUnreadable(_ data: Data) -> URL? {
+        let dir = fileURL.deletingLastPathComponent()
+        let stamp = Int(Date().timeIntervalSince1970)
+        let url = dir.appendingPathComponent("\(Self.backupPrefix)\(stamp).json")
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            return nil
+        }
+
+        let existing = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasPrefix(Self.backupPrefix) }
+            .sorted()
+        for stale in existing.dropLast(Self.maxBackups) {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(stale))
+        }
+        return url
+    }
+
+    private func loadFromDisk() {
+        guard let data = try? Data(contentsOf: fileURL), !data.isEmpty else { return }
+
+        let (loaded, total) = Self.decodeRules(from: data)
+        let skipped = (total ?? 0) - loaded.count
+        if total == nil || skipped > 0 {
+            // Preserve the original before anything can write over it, and
+            // remember to tell someone.
+            let backup = backUpUnreadable(data)
+            loadIssue = LoadIssue(recovered: loaded.count,
+                                  skipped: max(skipped, 0),
+                                  fileUnreadable: total == nil,
+                                  backupURL: backup)
+            refusesEmptyOverwrite = loaded.isEmpty
+        }
+
         for rule in loaded {
             var list = rules[rule.matchEndpoint] ?? []
             list.append(rule)

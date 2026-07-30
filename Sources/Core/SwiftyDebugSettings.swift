@@ -82,10 +82,17 @@ class Settings: NSObject {
     }
 
     /// Raises host-app request timeouts to `breakpointHoldSeconds` so a paused
-    /// request survives long enough to be edited. ON by default — see
-    /// `SettingsKey.extendTimeoutsForBreakpoints` for why a breakpoint is
-    /// otherwise unusable in an app that sets a short timeout.
-    var extendTimeoutsForBreakpoints: Bool = true {
+    /// request survives long enough to be edited.
+    ///
+    /// **OFF by default.** While on, *every* request in the app — not just paused
+    /// ones — gets its timeout raised to the hold budget, which is a real change
+    /// to host-app networking behaviour that nobody asked for by merely enabling
+    /// the SDK. While off the app's own timeout is passed through untouched and a
+    /// breakpoint only survives as long as the app is willing to wait.
+    ///
+    /// Changing this at runtime does **not** retroactively fix `URLSession`s that
+    /// already exist — see `CustomHTTPProtocol.timeoutSettingChangeEffect`.
+    var extendTimeoutsForBreakpoints: Bool = false {
         didSet { save(.extendTimeoutsForBreakpoints, value: extendTimeoutsForBreakpoints) }
     }
 
@@ -130,13 +137,29 @@ class Settings: NSObject {
         let presetRaw = ud.string(forKey: SettingsKey.networkConditionerPreset.rawValue) ?? ""
         networkConditionerPreset = NetworkConditionerPreset(rawValue: presetRaw) ?? .off
 
-        // Breakpoint hold: ON by default — a breakpoint that the host app times
-        // out from is worse than no breakpoint at all.
-        extendTimeoutsForBreakpoints = ud.object(forKey: SettingsKey.extendTimeoutsForBreakpoints.rawValue) == nil
-            ? true
-            : ud.bool(forKey: SettingsKey.extendTimeoutsForBreakpoints.rawValue)
+        // Breakpoint timeout extension: OFF by default, including for installs
+        // that predate this change (see `extendTimeoutsDefault(in:)`).
+        extendTimeoutsForBreakpoints = Settings.extendTimeoutsDefault(in: ud)
         let hold = ud.double(forKey: SettingsKey.breakpointHoldSeconds.rawValue)
         breakpointHoldSeconds = hold > 0 ? hold : 600
+    }
+
+    // MARK: - Defaults resolution
+
+    /// Resolves `extendTimeoutsForBreakpoints` from stored defaults.
+    ///
+    /// The absent-key answer is **false**, deliberately: this setting used to
+    /// default to `true`, and the only trace of that old default was the absence
+    /// of the key (property observers don't run inside this class's `init`, so
+    /// the old `true` was never written to disk). Reading an absent key as
+    /// `false` is therefore the whole migration — an existing install that never
+    /// touched the toggle stops having its request timeouts rewritten. An install
+    /// where somebody explicitly turned it *on* keeps that stored `true`, because
+    /// that was a real choice.
+    ///
+    /// Static and injectable so the rule is unit-testable without the singleton.
+    static func extendTimeoutsDefault(in defaults: UserDefaults) -> Bool {
+        return defaults.bool(forKey: SettingsKey.extendTimeoutsForBreakpoints.rawValue)
     }
 
     // MARK: - Private

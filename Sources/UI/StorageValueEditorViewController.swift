@@ -34,6 +34,21 @@ final class StorageValueEditorViewController: UIViewController, UITextViewDelega
     /// Called when the user asks to delete this entry.
     var onDelete: (() -> Void)?
 
+    /// An optional force-overwrite ("keep re-applying this value") switch.
+    ///
+    /// Only web-view storage has this concept — the UserDefaults and Keychain
+    /// browsers leave it nil and the control is not built at all, rather than
+    /// appearing as a switch that does nothing.
+    struct PinControl {
+        let isOn: Bool
+        let title: String
+        let footnote: String
+        let onChange: (Bool) -> Void
+    }
+
+    /// Set before pushing. Read once in `viewDidLoad`.
+    var pinControl: PinControl?
+
     private var currentValue: String
     private var currentKey: String
 
@@ -138,6 +153,48 @@ final class StorageValueEditorViewController: UIViewController, UITextViewDelega
             l.textColor = UIColor(white: 0.45, alpha: 1)
             l.numberOfLines = 0
             stack.addArrangedSubview(l)
+        }
+
+        // FORCE OVERWRITE — web-view storage only.
+        if let pin = pinControl {
+            let pinCard = card()
+            let sw = UISwitch()
+            sw.isOn = pin.isOn
+            sw.onTintColor = DebugTheme.accentColor
+            sw.addAction(UIAction { [weak self] action in
+                guard let toggle = action.sender as? UISwitch else { return }
+                self?.pinControl?.onChange(toggle.isOn)
+            }, for: .valueChanged)
+            sw.translatesAutoresizingMaskIntoConstraints = false
+
+            let title = UILabel()
+            title.text = pin.title
+            title.font = .systemFont(ofSize: 14, weight: .semibold)
+            title.textColor = .white
+
+            let note = UILabel()
+            note.text = pin.footnote
+            note.font = .systemFont(ofSize: 11)
+            note.textColor = UIColor(white: 0.45, alpha: 1)
+            note.numberOfLines = 0
+
+            let texts = UIStackView(arrangedSubviews: [title, note])
+            texts.axis = .vertical
+            texts.spacing = 3
+            texts.translatesAutoresizingMaskIntoConstraints = false
+            pinCard.addSubview(texts)
+            pinCard.addSubview(sw)
+
+            NSLayoutConstraint.activate([
+                texts.leadingAnchor.constraint(equalTo: pinCard.leadingAnchor, constant: 12),
+                // Text drives the height — pinned top AND bottom.
+                texts.topAnchor.constraint(equalTo: pinCard.topAnchor, constant: 12),
+                texts.bottomAnchor.constraint(equalTo: pinCard.bottomAnchor, constant: -12),
+                texts.trailingAnchor.constraint(equalTo: sw.leadingAnchor, constant: -10),
+                sw.trailingAnchor.constraint(equalTo: pinCard.trailingAnchor, constant: -12),
+                sw.centerYAnchor.constraint(equalTo: pinCard.centerYAnchor),
+            ])
+            stack.addArrangedSubview(pinCard)
         }
 
         // JSON card — appears only when the value parses as JSON.

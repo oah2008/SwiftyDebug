@@ -70,8 +70,8 @@ final class BreakpointOverlay {
             w.windowLevel = .alert - 2
             w.backgroundColor = .clear
             w.isHidden = false
-            // The SDK is always LTR, even in an RTL host app.
-            w.semanticContentAttribute = .forceLeftToRight
+            // LTR is enforced by PassthroughWindow's base class, for the banner
+            // and every subview it grows later — not set here.
 
             let host = UIViewController()
             host.view.backgroundColor = .clear
@@ -134,7 +134,13 @@ final class BreakpointOverlay {
 
 /// A window that lets every touch through to the host app except those landing
 /// on `passthroughExcept` — so the banner never blocks the app underneath.
-private final class PassthroughWindow: UIWindow {
+///
+/// Inherits forced left-to-right from `SwiftyDebugHostingWindow`. It used to be a
+/// plain `UIWindow` with a single `semanticContentAttribute` on the window
+/// itself, which an RTL host's `UIView.appearance()` proxy then overrode on every
+/// banner subview as it entered the window — the chevron and icon came out
+/// mirrored.
+final class PassthroughWindow: SwiftyDebugHostingWindow {
     weak var passthroughExcept: UIView?
 
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {

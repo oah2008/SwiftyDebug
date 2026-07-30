@@ -35,10 +35,19 @@ enum SettingsKey: String {
     /// Raises any host-app request timeout below `breakpointHoldSeconds` so a
     /// request can actually sit at a breakpoint while you edit it.
     ///
-    /// Without this a breakpoint is useless in most apps: `timeoutIntervalForRequest`
-    /// is an *idle* timer, and a held request delivers nothing to the client, so the
-    /// app gives up (NSURLErrorTimedOut) long before you finish editing — the demo
-    /// app's own stack sets 10 seconds. ON by default. (See BREAKPOINTS.)
+    /// **OFF by default.** Turning it on rewrites `timeoutIntervalForRequest` for
+    /// *every* request the app makes, not just paused ones — a real, unrequested
+    /// change to host-app networking — so the SDK no longer does it just because
+    /// it was enabled.
+    ///
+    /// The cost of leaving it off: `timeoutIntervalForRequest` is an *idle* timer,
+    /// and a held request delivers nothing to the client, so the app gives up
+    /// (NSURLErrorTimedOut) as soon as its own timeout elapses — the demo app's
+    /// own stack sets 10 seconds, which is gone before you finish editing.
+    /// (See BREAKPOINTS.)
+    ///
+    /// Absent key means **false**: an existing install that never touched this
+    /// setting must not inherit the old ON-by-default behaviour.
     case extendTimeoutsForBreakpoints = "extendTimeoutsForBreakpoints_SwiftyDebug"
 
     /// How long (seconds) a request may be held at a breakpoint. Also the floor

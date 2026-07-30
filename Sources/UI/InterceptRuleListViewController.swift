@@ -91,41 +91,41 @@ class InterceptRuleListViewController: UITableViewController {
         dismiss(animated: true)
     }
 
+    /// Scope chooser for a new rule. Uses `OptionPickerSheetViewController` rather
+    /// than a system action sheet so the endpoint/host each option matches can be
+    /// shown in full — an alert row truncates them. (See INTERCEPT-UX.)
     @objc private func addRuleTapped() {
-        let alert = UIAlertController(title: "New Rule", message: nil, preferredStyle: .actionSheet)
-
-        alert.addAction(UIAlertAction(title: "Intercept Endpoint", style: .default) { [weak self] _ in
+        let openEditor: (EndpointMatchMode) -> Void = { [weak self] mode in
             guard let self = self else { return }
             let editor = InterceptRuleEditorViewController()
             editor.httpModel = self.httpModel
-            editor.initialMatchMode = .normalized
+            editor.initialMatchMode = mode
             self.navigationController?.pushViewController(editor, animated: true)
-        })
-
-        alert.addAction(UIAlertAction(title: "Intercept Host", style: .default) { [weak self] _ in
-            guard let self = self else { return }
-            let editor = InterceptRuleEditorViewController()
-            editor.httpModel = self.httpModel
-            editor.initialMatchMode = .host
-            self.navigationController?.pushViewController(editor, animated: true)
-        })
-
-        alert.addAction(UIAlertAction(title: "Global Rule", style: .default) { [weak self] _ in
-            guard let self = self else { return }
-            let editor = InterceptRuleEditorViewController()
-            editor.httpModel = self.httpModel
-            editor.initialMatchMode = .global
-            self.navigationController?.pushViewController(editor, animated: true)
-        })
-
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = view
-            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-            popover.permittedArrowDirections = []
         }
-        present(alert, animated: true)
+
+        let host = httpModel?.url?.host ?? ""
+
+        OptionPickerSheetViewController.present(
+            from: self,
+            title: "New Rule",
+            message: "Choose what the new rule should apply to.",
+            options: [
+                .init(title: "Intercept Endpoint",
+                      subtitle: normalizedPath.isEmpty
+                          ? "This endpoint only"
+                          : "This endpoint only — \(normalizedPath)",
+                      symbol: "point.topleft.down.curvedto.point.bottomright.up",
+                      tint: DebugTheme.accentColor) { openEditor(.normalized) },
+                .init(title: "Intercept Host",
+                      subtitle: host.isEmpty
+                          ? "Every request to this host"
+                          : "Every request to \(host)",
+                      symbol: "network", tint: .systemPurple) { openEditor(.host) },
+                .init(title: "Global Rule",
+                      subtitle: "Every request in the app and web views",
+                      symbol: "globe", tint: .systemPink) { openEditor(.global) },
+            ]
+        )
     }
 
     // MARK: - Export / import

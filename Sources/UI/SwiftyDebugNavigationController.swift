@@ -13,6 +13,12 @@ class SwiftyDebugNavigationController: UINavigationController {
         super.viewDidLoad()
 
         overrideUserInterfaceStyle = .dark
+        // The guarantee that this whole controller stays LTR in an RTL host comes
+        // from SwiftyDebugHostingWindow (see UIView+ForceLTR.swift), which covers
+        // views created after this point too. These two lines only settle the bar
+        // one layout pass earlier: UINavigationBar propagates its own semantic
+        // attribute to its internal subviews, so setting it before the bar builds
+        // its button bar avoids a first frame with the back button on the right.
         view.semanticContentAttribute = .forceLeftToRight
         navigationBar.semanticContentAttribute = .forceLeftToRight
         navigationBar.tintColor = DebugTheme.accentColor

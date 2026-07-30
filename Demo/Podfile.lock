@@ -34,7 +34,7 @@ SPEC CHECKSUMS:
   Factory: 66a2f463af85017d321cc6e43d768d1a522a2518
   Kingfisher: ff0d31a1f07bdff6a1ebb3ba08b8e6e567b6500c
   SwiftyConstraint: 40b788b71ec4475a8243c5941e57f411bd3388ce
-  SwiftyDebug: 891b3b988023c32e172a3358759056f8ffaa93e3
+  SwiftyDebug: 41c42eec2e5a360b308044a750f94e052eb2eda6
   SwiftyJSON: f5b1bf1cd8dd53cd25887ac0eabcfd92301c6a5a
   SwiftyNetworkIOS: 2799dca8902be5fd23bece9d7618b15bc63defff
 

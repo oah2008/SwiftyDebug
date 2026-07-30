@@ -349,8 +349,10 @@ SwiftyDebug.monitorAllUrls: Bool            // default false
 SwiftyDebug.monitorMedia: Bool              // default false
 SwiftyDebug.enableConsoleLog: Bool          // default true
 
-// Raises host-app request timeouts so paused requests survive. Default true.
+// Raises host-app request timeouts so paused requests survive. Default FALSE.
 SwiftyDebug.extendTimeoutsForBreakpoints: Bool
+SwiftyDebug.extendTimeoutsChangeEffect: TimeoutChangeEffect          // preview, changes nothing
+SwiftyDebug.setExtendTimeoutsForBreakpoints(_:) -> TimeoutChangeEffect
 
 // Tags — a URL substring becomes a labelled pill in the list
 SwiftyDebug.addTag(keyword: String, label: String)
@@ -375,7 +377,9 @@ print(_ message: T, color: UIColor = .white)
 
 ## Things to know before you integrate
 
-**It raises your app's request timeouts.** While the SDK is enabled, `timeoutIntervalForRequest` is raised to the breakpoint hold budget — **600 seconds by default** — app-wide, whether or not you use breakpoints. A held request delivers no bytes, so an idle timer would kill it before you could look. This is a real change to your app's networking behaviour. Turn it off with `SwiftyDebug.extendTimeoutsForBreakpoints = false` if your app depends on its own timeouts — breakpoints then only survive as long as the app is willing to wait.
+**Request timeouts are left alone unless you opt in.** A request paused at a breakpoint delivers no bytes, so your app's own idle timeout would kill it before you could edit it. Turning on **Extend Request Timeouts** (App tab, or `SwiftyDebug.extendTimeoutsForBreakpoints = true`) raises request timeouts app-wide to the hold budget — ~10 minutes, for *every* request, not just paused ones — so retry ladders, watchdogs and "poor connection" banners stop firing while it's on. It is **off by default**; the SDK never touches your timeouts until you ask.
+
+`URLSession` copies its configuration at init, so sessions your app has already built keep their old timeout either way. Use `SwiftyDebug.setExtendTimeoutsForBreakpoints(_:)`, which returns a `TimeoutChangeEffect` telling you whether a relaunch is needed; the App tab toggle prompts you automatically.
 
 **`monitorAllUrls` and `monitorMedia` set before `enable()` are overwritten** by the persisted values of the App tab toggles from the previous launch. Set them from the App tab, or reassign after `enable()`.
 

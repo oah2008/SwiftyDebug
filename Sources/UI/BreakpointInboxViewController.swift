@@ -16,6 +16,9 @@ import UIKit
 final class BreakpointInboxViewController: UITableViewController {
 
     private var items: [BreakpointCenter.PausedRequest] = []
+    /// Breakpoints that were armed but never paused, and why. Shown here because
+    /// this is the screen a developer stares at when the pause does not come.
+    private var notices: [BreakpointCenter.Notice] = []
     private var observer: NSObjectProtocol?
     private var ticker: Timer?
 
@@ -72,6 +75,7 @@ final class BreakpointInboxViewController: UITableViewController {
 
     private func reload() {
         items = BreakpointCenter.shared.pausedRequests
+        notices = BreakpointCenter.shared.notices
         if let label = navigationItem.titleView as? UILabel {
             label.text = items.isEmpty ? "Paused" : "Paused · \(items.count)"
             label.sizeToFit()
@@ -86,11 +90,35 @@ final class BreakpointInboxViewController: UITableViewController {
 
     // MARK: - Table
 
+    override func numberOfSections(in tableView: UITableView) -> Int {
+        notices.isEmpty ? 1 : 2
+    }
+
+    override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
+        section == 1 ? "DIDN'T PAUSE" : nil
+    }
+
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        max(items.count, 1)
+        section == 1 ? notices.count : max(items.count, 1)
     }
 
     override func tableView(_ tableView: UITableView, cellForRowAt ip: IndexPath) -> UITableViewCell {
+        if ip.section == 1 {
+            let c = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
+            c.backgroundColor = UIColor(white: 0.11, alpha: 1)
+            c.selectionStyle = .none
+            c.textLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
+            c.textLabel?.textColor = .systemOrange
+            c.textLabel?.numberOfLines = 0
+            c.detailTextLabel?.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            c.detailTextLabel?.textColor = UIColor(white: 0.5, alpha: 1)
+            c.detailTextLabel?.numberOfLines = 2
+            c.forceLTR()
+            guard notices.indices.contains(ip.row) else { return c }
+            c.textLabel?.text = notices[ip.row].message
+            c.detailTextLabel?.text = notices[ip.row].url
+            return c
+        }
         if items.isEmpty {
             let c = UITableViewCell(style: .subtitle, reuseIdentifier: "empty")
             c.backgroundColor = .clear
@@ -117,13 +145,14 @@ final class BreakpointInboxViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, didSelectRowAt ip: IndexPath) {
         tableView.deselectRow(at: ip, animated: true)
+        guard ip.section == 0 else { return }   // notices are read-only
         guard ip.row < items.count else { return }
         let detail = BreakpointDetailViewController(paused: items[ip.row])
         navigationController?.pushViewController(detail, animated: true)
     }
 
     override func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt ip: IndexPath) -> UISwipeActionsConfiguration? {
-        guard ip.row < items.count else { return nil }
+        guard ip.section == 0, ip.row < items.count else { return nil }
         let item = items[ip.row]
         let resume = UIContextualAction(style: .normal, title: "Resume") { _, _, done in
             BreakpointCenter.shared.resume(item); done(true)

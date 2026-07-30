@@ -8,247 +8,26 @@
 import UIKit
 import WebKit
 
-// MARK: - WebView picker
-
-/// Lists all live WKWebViews so the user can pick which one to inspect storage
-/// for. (Storage is per-web-view.)
-final class WebViewStoragePickerViewController: UITableViewController {
-
-    private var webViews: [WKWebView] = []
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        let titleLabel = UILabel()
-        titleLabel.text = "Web Views"
-        titleLabel.font = .boldSystemFont(ofSize: 18)
-        titleLabel.textColor = DebugTheme.accentColor
-        titleLabel.sizeToFit()
-        navigationItem.titleView = titleLabel
-
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            image: UIImage(systemName: "arrow.clockwise"), style: .plain,
-            target: self, action: #selector(refreshTapped))
-        navigationItem.rightBarButtonItem?.tintColor = DebugTheme.accentColor
-
-        tableView.register(WebViewCardCell.self, forCellReuseIdentifier: "WVCard")
-        tableView.backgroundColor = .black
-        tableView.separatorStyle = .none
-        tableView.rowHeight = UITableView.automaticDimension
-        tableView.estimatedRowHeight = 110
-        tableView.contentInset.bottom = 24
-        view.forceLTR()
-    }
-
-    override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        refreshTapped()
-    }
-
-    @objc private func refreshTapped() {
-        webViews = WKWebViewSwizzling.liveWebViews()
-        if let label = navigationItem.titleView as? UILabel {
-            label.text = webViews.isEmpty ? "Web Views" : "Web Views · \(webViews.count)"
-            label.sizeToFit()
-        }
-        tableView.reloadData()
-    }
-
-    override func numberOfSections(in tableView: UITableView) -> Int { 1 }
-
-    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        max(webViews.count, 1)
-    }
-
-    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        // Bounds guard rather than `isEmpty` — the live web-view list can shrink
-        // between the row count and this call (web views are weakly held and can
-        // deallocate at any time).
-        if indexPath.row >= webViews.count {
-            let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "empty")
-            cell.backgroundColor = .clear
-            cell.selectionStyle = .none
-            cell.textLabel?.text = "No live web views"
-            cell.textLabel?.textColor = UIColor(white: 0.5, alpha: 1)
-            cell.textLabel?.font = .systemFont(ofSize: 15, weight: .medium)
-            cell.textLabel?.textAlignment = .center
-            cell.detailTextLabel?.text = "Open a screen with a WKWebView, then pull refresh."
-            cell.detailTextLabel?.textColor = UIColor(white: 0.35, alpha: 1)
-            cell.detailTextLabel?.font = .systemFont(ofSize: 12)
-            cell.detailTextLabel?.textAlignment = .center
-            cell.forceLTR()
-            return cell
-        }
-        let cell = tableView.dequeueReusableCell(withIdentifier: "WVCard", for: indexPath) as! WebViewCardCell
-        cell.configure(webView: webViews[indexPath.row], index: indexPath.row)
-        return cell
-    }
-
-    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-        tableView.deselectRow(at: indexPath, animated: true)
-        guard !webViews.isEmpty, indexPath.row < webViews.count else { return }
-        navigationController?.pushViewController(
-            WebViewStorageViewController(webView: webViews[indexPath.row]), animated: true
-        )
-    }
-}
-
-// MARK: - WebView card cell
-
-/// Identifies one live WKWebView at a glance: page title, full URL, host, and
-/// load state.
-///
-/// Built from real constraints rather than the stock `UITableViewCell` labels —
-/// those don't self-size with `numberOfLines = 0` + `automaticDimension`, which
-/// is what broke this list's layout.
-private final class WebViewCardCell: UITableViewCell {
-
-    private let card = UIView()
-    private let indexPill = PaddedPill()
-    private let titleLabel = UILabel()
-    private let urlLabel = UILabel()
-    private let hostLabel = UILabel()
-    private let statePill = PaddedPill()
-    private let chevron = UIImageView()
-
-    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
-        super.init(style: style, reuseIdentifier: reuseIdentifier)
-        backgroundColor = .clear
-        contentView.backgroundColor = .clear
-        selectionStyle = .none
-
-        card.backgroundColor = UIColor(white: 0.13, alpha: 1)
-        card.layer.cornerRadius = 14
-        card.layer.cornerCurve = .continuous
-        card.layer.borderWidth = 1
-        card.layer.borderColor = UIColor(white: 0.24, alpha: 1).cgColor
-        card.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(card)
-
-        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        titleLabel.textColor = .white
-        titleLabel.numberOfLines = 2
-
-        urlLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        urlLabel.textColor = UIColor(white: 0.62, alpha: 1)
-        urlLabel.numberOfLines = 3
-
-        hostLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        hostLabel.textColor = DebugTheme.accentColor
-
-        chevron.image = UIImage(systemName: "chevron.right",
-                                withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold))?
-            .withTintColor(UIColor(white: 0.4, alpha: 1), renderingMode: .alwaysOriginal)
-        chevron.setContentHuggingPriority(.required, for: .horizontal)
-        chevron.translatesAutoresizingMaskIntoConstraints = false
-
-        // Top row: index pill + state pill
-        let pills = UIStackView(arrangedSubviews: [indexPill, statePill, UIView()])
-        pills.axis = .horizontal
-        pills.spacing = 6
-        pills.alignment = .center
-
-        let stack = UIStackView(arrangedSubviews: [pills, titleLabel, hostLabel, urlLabel])
-        stack.axis = .vertical
-        stack.spacing = 5
-        stack.setCustomSpacing(7, after: pills)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(stack)
-        card.addSubview(chevron)
-
-        NSLayoutConstraint.activate([
-            card.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
-            card.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
-            card.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 5),
-            card.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -5),
-
-            // Text drives the height: pinned top AND bottom.
-            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
-            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
-            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
-            stack.trailingAnchor.constraint(equalTo: chevron.leadingAnchor, constant: -10),
-
-            chevron.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            chevron.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            chevron.widthAnchor.constraint(equalToConstant: 12),
-        ])
-        forceLTR()
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func setHighlighted(_ highlighted: Bool, animated: Bool) {
-        super.setHighlighted(highlighted, animated: animated)
-        UIView.animate(withDuration: 0.12) {
-            self.card.backgroundColor = highlighted
-                ? UIColor(white: 0.20, alpha: 1) : UIColor(white: 0.13, alpha: 1)
-        }
-    }
-
-    func configure(webView: WKWebView, index: Int) {
-        indexPill.set(text: "#\(index + 1)",
-                      color: UIColor(white: 0.6, alpha: 1),
-                      background: UIColor(white: 0.22, alpha: 1))
-
-        let url = webView.url
-        let hasPage = (url != nil)
-
-        if webView.isLoading {
-            statePill.set(text: "LOADING", color: .black, background: .systemOrange)
-        } else if hasPage {
-            statePill.set(text: "LOADED", color: .black, background: DebugTheme.accentColor)
-        } else {
-            statePill.set(text: "NO PAGE", color: .white, background: UIColor(white: 0.3, alpha: 1))
-        }
-
-        let pageTitle = webView.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        titleLabel.text = pageTitle.isEmpty ? (url?.host ?? "Untitled web view") : pageTitle
-
-        hostLabel.text = url?.host
-        hostLabel.isHidden = (url?.host?.isEmpty ?? true)
-
-        urlLabel.text = url?.absoluteString ?? "No page loaded yet"
-        urlLabel.textColor = hasPage ? UIColor(white: 0.62, alpha: 1) : UIColor(white: 0.4, alpha: 1)
-    }
-}
-
-// MARK: - Small pill label
-
-private final class PaddedPill: UILabel {
-    private let inset = UIEdgeInsets(top: 2, left: 7, bottom: 2, right: 7)
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        font = .systemFont(ofSize: 9, weight: .heavy)
-        layer.cornerRadius = 5
-        clipsToBounds = true
-        textAlignment = .center
-        setContentHuggingPriority(.required, for: .horizontal)
-        semanticContentAttribute = .forceLeftToRight
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    func set(text: String, color: UIColor, background: UIColor) {
-        self.text = text
-        self.textColor = color
-        self.backgroundColor = background
-    }
-
-    override func drawText(in rect: CGRect) { super.drawText(in: rect.inset(by: inset)) }
-    override var intrinsicContentSize: CGSize {
-        let s = super.intrinsicContentSize
-        return CGSize(width: s.width + inset.left + inset.right,
-                      height: s.height + inset.top + inset.bottom)
-    }
-}
-
 // MARK: - Storage editor
 
 /// Editable storage viewer for one WKWebView: Local / Session / Cookies.
-/// Each entry is a card with the **key on its own line and the value on its own
-/// line**, edited inline (no modal alerts) and saved as you type.
+///
+/// Two rules this screen is built around:
+///
+/// 1. **Reading changes nothing.** Listing a store runs a read-only enumeration
+///    (`length` / `key(i)` / `getItem`) or `getAllCookies`. Nothing is written,
+///    re-serialised, normalised or deleted in order to display it.
+/// 2. **A write is not believed until it is read back.** WebKit will happily
+///    report success for a script that never ran, and the page can overwrite a
+///    value microseconds after the SDK sets it. Every save and delete therefore
+///    re-reads the store and compares, and says so when the value did not stick.
 final class WebViewStorageViewController: UITableViewController {
 
     private let service: WebViewStorageService
+    /// Held weakly and separately from the service, which does not expose it.
+    /// The pin store is keyed by web view, so it needs the instance.
+    private weak var webView: WKWebView?
+
     private var scope: WebViewStorageService.Scope = .local
     private var items: [WebViewStorageService.Item] = []
     /// Preview text computed ONCE per reload. Stored values can be hundreds of
@@ -257,13 +36,17 @@ final class WebViewStorageViewController: UITableViewController {
     /// TextKit to lay out every character just to truncate it — blew up while
     /// scrolling. Everything the cell needs is precomputed and length-capped.
     private var displays: [StorageRowDisplay] = []
-    /// Keys added in this session that haven't been written yet (blank cards).
-    private var draftKeys = Set<Int>()
 
     private let segment = UISegmentedControl(items: WebViewStorageService.Scope.allCases.map { $0.title })
+    private let forceSwitch = UISwitch()
+    private let forceLabel = UILabel()
+    private let reapplyButton = UIButton(type: .system)
+
+    private var pins: WebViewStoragePinStore { .shared }
 
     init(webView: WKWebView) {
         self.service = WebViewStorageService(webView: webView)
+        self.webView = webView
         super.init(style: .plain)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -286,18 +69,7 @@ final class WebViewStorageViewController: UITableViewController {
         ]
         navigationItem.rightBarButtonItems?.forEach { $0.tintColor = DebugTheme.accentColor }
 
-        segment.selectedSegmentIndex = 0
-        segment.selectedSegmentTintColor = DebugTheme.accentColor
-        segment.setTitleTextAttributes([.foregroundColor: UIColor(white: 0.65, alpha: 1)], for: .normal)
-        segment.setTitleTextAttributes([.foregroundColor: UIColor.black], for: .selected)
-        segment.addTarget(self, action: #selector(scopeChanged), for: .valueChanged)
-
-        let header = UIView(frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: 54))
-        header.backgroundColor = .black
-        segment.frame = CGRect(x: 12, y: 11, width: view.bounds.width - 24, height: 32)
-        segment.autoresizingMask = [.flexibleWidth]
-        header.addSubview(segment)
-        tableView.tableHeaderView = header
+        buildHeader()
 
         tableView.register(StorageRowCell.self, forCellReuseIdentifier: "Card")
         tableView.backgroundColor = .black
@@ -306,21 +78,156 @@ final class WebViewStorageViewController: UITableViewController {
         tableView.estimatedRowHeight = 120
         tableView.keyboardDismissMode = .interactive
 
+        if let webView { pins.register(webView) }
         reload()
         view.forceLTR()
     }
 
-    private func reload() {
-        service.loadItems(scope: scope) { [weak self] items in
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        sizeTableHeaderToFit()
+    }
+
+    /// A `tableHeaderView` never sizes itself from its own constraints — its
+    /// height must be measured and assigned by hand, against the table's real
+    /// width. Re-measured on rotation and on any width change.
+    private func sizeTableHeaderToFit() {
+        guard let header = tableView.tableHeaderView else { return }
+        let width = tableView.bounds.width
+        guard width > 0 else { return }
+        header.frame.size.width = width
+        let target = header.systemLayoutSizeFitting(
+            CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel).height
+        guard abs(header.frame.height - target) > 0.5 else { return }
+        header.frame.size.height = target
+        // Reassigning is what makes UITableView pick up the new height.
+        tableView.tableHeaderView = header
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        // The pin switch may have been changed from the value editor.
+        syncForceControls()
+        reload()
+    }
+
+    // MARK: - Header
+
+    private func buildHeader() {
+        segment.selectedSegmentIndex = 0
+        segment.selectedSegmentTintColor = DebugTheme.accentColor
+        segment.setTitleTextAttributes([.foregroundColor: UIColor(white: 0.65, alpha: 1)], for: .normal)
+        segment.setTitleTextAttributes([.foregroundColor: UIColor.black], for: .selected)
+        segment.addTarget(self, action: #selector(scopeChanged), for: .valueChanged)
+
+        forceLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        forceLabel.textColor = .white
+        forceLabel.text = "Force overwrite"
+
+        reapplyButton.setTitle("Re-apply now", for: .normal)
+        reapplyButton.titleLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
+        reapplyButton.setTitleColor(DebugTheme.accentColor, for: .normal)
+        reapplyButton.setTitleColor(UIColor(white: 0.3, alpha: 1), for: .disabled)
+        reapplyButton.addTarget(self, action: #selector(reapplyTapped), for: .touchUpInside)
+
+        forceSwitch.onTintColor = DebugTheme.accentColor
+        forceSwitch.addTarget(self, action: #selector(forceChanged), for: .valueChanged)
+
+        // Auto Layout, NOT frame math. This ran in `viewDidLoad`, where
+        // `view.bounds.width` is still the default size, and the stack carried an
+        // autoresizing mask on a `tableHeaderView` — UIKit sizes those specially,
+        // so the row ended up wider than the screen and clipped at BOTH edges.
+        let header = UIView()
+        header.backgroundColor = .black
+
+        segment.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(segment)
+
+        forceLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        reapplyButton.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        reapplyButton.titleLabel?.adjustsFontSizeToFitWidth = true
+        reapplyButton.titleLabel?.minimumScaleFactor = 0.8
+        forceSwitch.setContentHuggingPriority(.required, for: .horizontal)
+        forceSwitch.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let row = UIStackView(arrangedSubviews: [forceLabel, UIView(), reapplyButton, forceSwitch])
+        row.axis = .horizontal
+        row.spacing = 10
+        row.alignment = .center
+        row.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(row)
+
+        NSLayoutConstraint.activate([
+            segment.topAnchor.constraint(equalTo: header.topAnchor, constant: 10),
+            segment.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 12),
+            segment.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -12),
+            segment.heightAnchor.constraint(equalToConstant: 32),
+
+            row.topAnchor.constraint(equalTo: segment.bottomAnchor, constant: 10),
+            row.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+            row.heightAnchor.constraint(equalToConstant: 36),
+            // Pinned bottom so the header can size itself.
+            row.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -10),
+        ])
+        header.forceLTR()
+
+        tableView.tableHeaderView = header
+        syncForceControls()
+    }
+
+    /// Mirrors the pin store into the header controls. Force-overwrite is
+    /// per-store, so this runs on every scope change.
+    private func syncForceControls() {
+        guard let webView else {
+            forceSwitch.isOn = false
+            forceSwitch.isEnabled = false
+            reapplyButton.isEnabled = false
+            return
+        }
+        let set = pins.pinSet(for: webView, scope: scope)
+        forceSwitch.isOn = set.isForcing
+        forceSwitch.isEnabled = true
+        reapplyButton.isEnabled = set.isForcing && !set.isEmpty
+        forceLabel.text = set.pins.isEmpty
+            ? "Force overwrite"
+            : "Force overwrite · \(set.pins.count)"
+    }
+
+    // MARK: - Loading
+
+    private func reload(then completion: (([WebViewStorageService.Item]) -> Void)? = nil) {
+        let requestedScope = scope
+        service.loadItems(scope: requestedScope) { [weak self] items in
             guard let self else { return }
+            // The user can switch tabs while a load is in flight; a late result
+            // for the previous scope must not replace the current one's rows.
+            guard requestedScope == self.scope else { return }
+
             self.items = items
-            self.displays = items.map { item in
-                var detail: String?
-                if self.scope == .cookies, let c = item.cookie { detail = "\(c.domain)\(c.path)" }
-                return StorageRowDisplay(key: item.key, value: item.value, detail: detail)
-            }
-            self.draftKeys.removeAll()
+            self.rebuildDisplays()
+            self.syncForceControls()
             self.tableView.reloadData()
+            completion?(items)
+        }
+    }
+
+    /// Recomputes the precomputed row models from `items`. Kept separate from
+    /// `reload` so pinning a key can refresh the FORCED badges without another
+    /// round trip into the web view.
+    private func rebuildDisplays() {
+        let set = webView.map { pins.pinSet(for: $0, scope: scope) }
+        let isCookies = (scope == .cookies)
+        displays = items.map { item in
+            var detail: String?
+            if isCookies, let c = item.cookie { detail = "\(c.domain)\(c.path)" }
+            return StorageRowDisplay(
+                key: item.key,
+                value: item.value,
+                detail: detail,
+                isPinned: (set?.isForcing ?? false) && (set?.isPinned(item.key) ?? false))
         }
     }
 
@@ -329,6 +236,7 @@ final class WebViewStorageViewController: UITableViewController {
     @objc private func scopeChanged() {
         view.endEditing(true)
         scope = WebViewStorageService.Scope(rawValue: segment.selectedSegmentIndex) ?? .local
+        syncForceControls()
         reload()
     }
 
@@ -336,15 +244,274 @@ final class WebViewStorageViewController: UITableViewController {
         presentEditor(for: WebViewStorageService.Item(key: "", value: "", cookie: nil), isNew: true)
     }
 
-    /// Writes an entry back to the web view.
-    private func commit(row: Int) {
-        guard row < items.count else { return }
-        let item = items[row]
-        guard !item.key.isEmpty else { return }
-        if scope == .cookies, let cookie = item.cookie {
-            service.updateCookie(cookie, newValue: item.value) { _ in }
+    // MARK: - Force overwrite
+
+    @objc private func forceChanged() {
+        guard let webView else { forceSwitch.isOn = false; return }
+        let on = forceSwitch.isOn
+        pins.setForcing(on, webView: webView, scope: scope)
+        syncForceControls()
+        reload()
+
+        guard on else { return }
+        let set = pins.pinSet(for: webView, scope: scope)
+        if set.isEmpty {
+            // Switching this on with nothing pinned is a legitimate thing to do
+            // (pin as you go) but it does nothing *right now*, so say so.
+            alert(title: "Force overwrite is on",
+                  message: "Nothing is pinned yet. Every value you save from now on is "
+                         + "re-applied to \(scope.title) after each page load, until you switch this off.")
         } else {
-            service.setItem(scope: scope, key: item.key, value: item.value) { _ in }
+            pins.reapply(webView: webView, scope: scope) { [weak self] outcome in
+                self?.reload()
+                self?.reportReapply(outcome, silentOnSuccess: true)
+            }
+        }
+    }
+
+    @objc private func reapplyTapped() {
+        guard let webView else { return }
+        pins.reapply(webView: webView, scope: scope) { [weak self] outcome in
+            self?.reload()
+            self?.reportReapply(outcome, silentOnSuccess: false)
+        }
+    }
+
+    private func reportReapply(_ outcome: WebViewStoragePinStore.Outcome, silentOnSuccess: Bool) {
+        switch outcome {
+        case .applied(let count):
+            guard !silentOnSuccess else { return }
+            alert(title: "Re-applied", message: "\(count) pinned key\(count == 1 ? "" : "s") written back.")
+        case .notForcing:
+            alert(title: "Not forcing", message: "Force overwrite is off for \(scope.title).")
+        case .noPins:
+            alert(title: "Nothing pinned",
+                  message: "No key in \(scope.title) has been edited in this session, so there is "
+                         + "nothing to re-apply.")
+        case .originMismatch(let pinned, let current):
+            alert(title: "Different page",
+                  message: "These values were pinned on \(pinned ?? "an unknown origin"), and this web "
+                         + "view is showing \(current ?? "no web origin"). Nothing was written — the SDK "
+                         + "will not push one site's values into another's storage.")
+        case .failed(let reason):
+            alert(title: "Could not re-apply", message: reason)
+        }
+    }
+
+    // MARK: - Saving (always confirmed by a read-back)
+
+    private func presentEditor(for item: WebViewStorageService.Item, isNew: Bool) {
+        var subtitle: String?
+        if scope == .cookies, let c = item.cookie {
+            subtitle = "Domain \(c.domain) · Path \(c.path)"
+                + (c.isSecure ? " · Secure" : "")
+                + (c.isHTTPOnly ? " · HttpOnly" : "")
+        }
+        // Cookie names identify the cookie, so they're locked once created.
+        let keyEditable = isNew || (scope != .cookies) || item.cookie == nil
+
+        let editor = StorageValueEditorViewController(
+            key: item.key, value: item.value, subtitle: subtitle, isKeyEditable: keyEditable)
+
+        editor.onSave = { [weak self] newKey, newValue in
+            self?.save(original: item, isNew: isNew, newKey: newKey, newValue: newValue)
+        }
+        if !isNew {
+            editor.onDelete = { [weak self] in self?.delete(item) }
+        }
+
+        // Un-pin affordance: a value that keeps reverting to what the SDK set is
+        // confusing unless the reason is visible and switchable from the same
+        // screen that set it.
+        if let webView, !isNew, pins.isPinned(item.key, webView: webView, scope: scope) {
+            let scope = self.scope
+            let pinnedValue = pins.pinSet(for: webView, scope: scope).value(for: item.key) ?? item.value
+            let cookie = item.cookie
+            editor.pinControl = StorageValueEditorViewController.PinControl(
+                isOn: true,
+                title: "Force after page loads",
+                footnote: "This key is re-applied after every page load because you edited it. "
+                        + "Switch off to leave whatever the page sets.",
+                // `[weak webView]`: this closure outlives the push and is owned by
+                // the editor, so capturing the host app's web view strongly would
+                // keep it alive for as long as the screen is open. (See WEBVIEW-LEAK.)
+                onChange: { [weak self, weak webView] on in
+                    guard let self, let webView else { return }
+                    if on {
+                        self.pins.record(webView: webView, scope: scope,
+                                         key: item.key, value: pinnedValue, cookie: cookie)
+                    } else {
+                        self.pins.unpin(webView: webView, scope: scope, key: item.key)
+                    }
+                })
+        }
+
+        navigationController?.pushViewController(editor, animated: true)
+    }
+
+    private func save(original: WebViewStorageService.Item, isNew: Bool, newKey: String, newValue: String) {
+        guard webView != nil else {
+            alert(title: "Web view is gone", message: "It was released, so nothing was written.")
+            return
+        }
+        let scope = self.scope
+
+        if scope == .cookies, let cookie = original.cookie {
+            service.updateCookie(cookie, newValue: newValue) { [weak self] _ in
+                self?.confirmWrite(scope: scope, key: cookie.name, expected: newValue)
+            }
+            return
+        }
+
+        // A renamed web-storage key means remove the old one, then set the new —
+        // strictly sequenced so a failure of the first step is visible in the
+        // read-back instead of racing the second.
+        if !isNew, newKey != original.key, !original.key.isEmpty {
+            service.deleteItem(scope: scope, item: original) { [weak self] _ in
+                guard let self else { return }
+                if let webView = self.webView {
+                    self.pins.unpin(webView: webView, scope: scope, key: original.key)
+                }
+                self.service.setItem(scope: scope, key: newKey, value: newValue) { [weak self] _ in
+                    self?.confirmWrite(scope: scope, key: newKey, expected: newValue)
+                }
+            }
+            return
+        }
+
+        service.setItem(scope: scope, key: newKey, value: newValue) { [weak self] _ in
+            self?.confirmWrite(scope: scope, key: newKey, expected: newValue)
+        }
+    }
+
+    /// Re-reads the store and checks the value actually landed.
+    ///
+    /// The write callbacks are deliberately ignored: the service reports success
+    /// whenever `evaluateJavaScript` returns anything at all, including when the
+    /// script never ran. The read-back is the only honest confirmation, and it
+    /// doubles as detection for the case this screen's force-overwrite toggle
+    /// exists for — the page immediately clobbering the value.
+    private func confirmWrite(scope: WebViewStorageService.Scope, key: String, expected: String) {
+        reload { [weak self] items in
+            guard let self, self.scope == scope else { return }
+            guard let found = items.first(where: { $0.key == key }) else {
+                self.alert(title: "Save did not stick",
+                           message: "“\(key)” is not in \(scope.title) after writing. The page may "
+                                  + "block storage on this origin, or it removed the key immediately.")
+                return
+            }
+            let recorded = self.recordPin(key: key, value: expected, cookie: found.cookie, scope: scope)
+            guard found.value == expected else {
+                self.reportClobbered(key: key, scope: scope, canForce: recorded)
+                return
+            }
+            if !recorded, let webView = self.webView, self.pins.isForcing(webView, scope: scope) {
+                self.reportUnpinnable(scope: scope)
+            }
+        }
+    }
+
+    /// The value came back different from what was written — almost always the
+    /// container app re-injecting on load. This is exactly what force-overwrite
+    /// is for, so offer it here rather than leaving the developer guessing.
+    ///
+    /// `canForce` is false when the value could not be pinned at all; offering
+    /// the toggle then would be offering something that cannot work.
+    private func reportClobbered(key: String, scope: WebViewStorageService.Scope, canForce: Bool) {
+        let a = UIAlertController(
+            title: "Value was overwritten",
+            message: "“\(key)” was written, but reading it back returned something else — something "
+                   + "on the page set it again."
+                   + (canForce
+                      ? " Turn on force overwrite to re-apply your value after every page load."
+                      : " It cannot be force-applied on this page (no web origin)."),
+            preferredStyle: .alert)
+        a.addAction(UIAlertAction(title: canForce ? "Leave it" : "OK", style: .cancel))
+        if canForce {
+            a.addAction(UIAlertAction(title: "Force overwrite", style: .default) { [weak self] _ in
+                guard let self, let webView = self.webView else { return }
+                self.pins.setForcing(true, webView: webView, scope: scope)
+                self.syncForceControls()
+                self.pins.reapply(webView: webView, scope: scope) { [weak self] outcome in
+                    self?.reload()
+                    self?.reportReapply(outcome, silentOnSuccess: true)
+                }
+            })
+        }
+        presentAlert(a)
+    }
+
+    /// Force is on but this key can never be re-applied. Never let that pass as
+    /// if it were working.
+    private func reportUnpinnable(scope: WebViewStorageService.Scope) {
+        alert(title: "Cannot force this key",
+              message: scope == .cookies
+                  ? "The cookie could not be captured, so it will not be re-applied."
+                  : "This page has no web origin (\(service.pageURL?.absoluteString ?? "no URL")), "
+                    + "so the SDK will not re-apply values into it.")
+    }
+
+    /// Remembers a successfully written value so force-overwrite can reinstate
+    /// it. Returns false when it could not be pinned.
+    @discardableResult
+    private func recordPin(key: String,
+                           value: String,
+                           cookie: HTTPCookie?,
+                           scope: WebViewStorageService.Scope) -> Bool {
+        guard let webView else { return false }
+        let recorded = pins.record(webView: webView, scope: scope, key: key, value: value, cookie: cookie)
+        // The FORCED badges were computed before this pin existed — recompute
+        // them from the rows already in memory rather than re-reading the store.
+        rebuildDisplays()
+        syncForceControls()
+        tableView.reloadData()
+        return recorded
+    }
+
+    private func delete(_ item: WebViewStorageService.Item) {
+        let scope = self.scope
+        service.deleteItem(scope: scope, item: item) { [weak self] _ in
+            guard let self else { return }
+            // A deleted key is no longer an edit to reinstate. Deletions are
+            // deliberately NOT forced: re-deleting a key the page re-creates
+            // would be the SDK removing data nobody can see it removing.
+            if let webView = self.webView {
+                self.pins.unpin(webView: webView, scope: scope, key: item.key)
+            }
+            self.reload { [weak self] items in
+                guard let self, self.scope == scope else { return }
+                if items.contains(where: { $0.key == item.key && $0.cookie?.path == item.cookie?.path }) {
+                    self.alert(title: "Delete did not stick",
+                               message: "“\(item.key)” is still in \(scope.title). "
+                                      + (scope == .cookies
+                                         ? "The cookie may be re-set by the page or owned by a parent domain."
+                                         : "Something on the page wrote it again."))
+                }
+            }
+        }
+    }
+
+    private func alert(title: String, message: String) {
+        let a = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        a.addAction(UIAlertAction(title: "OK", style: .default))
+        presentAlert(a)
+    }
+
+    /// Every confirmation here arrives one or two async hops after the user hit
+    /// Save — by which point the value editor may still be mid-pop and `self` may
+    /// no longer be the visible controller. Presenting on `self` in that window
+    /// drops the alert on the floor, which is exactly how a failed write would go
+    /// unreported.
+    private func presentAlert(_ alert: UIAlertController) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let host: UIViewController = self.navigationController ?? self
+            guard host.view.window != nil else { return }
+            var presenter: UIViewController = host
+            while let next = presenter.presentedViewController, !next.isBeingDismissed {
+                presenter = next
+            }
+            presenter.present(alert, animated: true)
         }
     }
 
@@ -378,8 +545,7 @@ final class WebViewStorageViewController: UITableViewController {
             return c
         }
 
-        guard let cell = tableView.dequeueReusableCell(withIdentifier: "Card", for: indexPath) as? StorageRowCell,
-              indexPath.row < displays.count else {
+        guard let cell = tableView.dequeueReusableCell(withIdentifier: "Card", for: indexPath) as? StorageRowCell else {
             // Never dequeue twice for one index path — build a plain cell.
             let fallback = UITableViewCell(style: .default, reuseIdentifier: nil)
             fallback.backgroundColor = .clear
@@ -395,63 +561,73 @@ final class WebViewStorageViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         guard indexPath.row < items.count else { return }
-        let item = items[indexPath.row]
-        presentEditor(for: item, isNew: false)
-    }
-
-    private func presentEditor(for item: WebViewStorageService.Item, isNew: Bool) {
-        var subtitle: String?
-        if scope == .cookies, let c = item.cookie {
-            subtitle = "Domain \(c.domain) · Path \(c.path)" + (c.isSecure ? " · Secure" : "")
-        }
-        // Cookie names identify the cookie, so they're locked once created.
-        let keyEditable = isNew || (scope != .cookies) || item.cookie == nil
-
-        let editor = StorageValueEditorViewController(
-            key: item.key, value: item.value, subtitle: subtitle, isKeyEditable: keyEditable)
-        editor.onSave = { [weak self] newKey, newValue in
-            guard let self else { return }
-            if self.scope == .cookies, let cookie = item.cookie {
-                self.service.updateCookie(cookie, newValue: newValue) { _ in self.reload() }
-            } else {
-                // A renamed web-storage key means remove the old one, set the new.
-                if !isNew, newKey != item.key, !item.key.isEmpty {
-                    self.service.deleteItem(scope: self.scope, item: item) { _ in }
-                }
-                self.service.setItem(scope: self.scope, key: newKey, value: newValue) { _ in self.reload() }
-            }
-        }
-        if !isNew {
-            editor.onDelete = { [weak self] in
-                guard let self else { return }
-                self.service.deleteItem(scope: self.scope, item: item) { _ in self.reload() }
-            }
-        }
-        navigationController?.pushViewController(editor, animated: true)
+        presentEditor(for: items[indexPath.row], isNew: false)
     }
 
     override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
-        !items.isEmpty && indexPath.row < items.count
+        indexPath.row < items.count
     }
 
-    override func tableView(_ tableView: UITableView, commit style: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
+    override func tableView(_ tableView: UITableView,
+                            commit style: UITableViewCell.EditingStyle,
+                            forRowAt indexPath: IndexPath) {
         guard style == .delete, indexPath.row < items.count else { return }
-        let item = items[indexPath.row]
-        // A never-saved draft row just disappears.
-        if item.key.isEmpty {
-            items.remove(at: indexPath.row)
-            tableView.deleteRows(at: [indexPath], with: .automatic)
-            return
-        }
-        service.deleteItem(scope: scope, item: item) { [weak self] _ in self?.reload() }
+        delete(items[indexPath.row])
+    }
+
+    override func tableView(_ tableView: UITableView, willDisplayFooterView view: UIView, forSection section: Int) {
+        // A plain-style table truncates its footer to one line, which cut these
+        // explanations off mid-sentence ("Edits…").
+        guard let footer = view as? UITableViewHeaderFooterView else { return }
+        footer.textLabel?.numberOfLines = 0
+        footer.textLabel?.font = .systemFont(ofSize: 12)
+        footer.textLabel?.textColor = UIColor(white: 0.45, alpha: 1)
+    }
+
+    override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat {
+        UITableView.automaticDimension
+    }
+
+    override func tableView(_ tableView: UITableView, estimatedHeightForFooterInSection section: Int) -> CGFloat {
+        44
     }
 
     override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+        var text: String
         switch scope {
-        case .local:   return "localStorage for the page this web view is showing. Edits apply immediately."
-        case .session: return "sessionStorage is cleared when the page's tab/session ends."
-        case .cookies: return "Cookies from this web view's data store. Editing keeps the original domain & path."
+        case .local:   text = "localStorage for the page this web view is showing. Edits apply immediately."
+        case .session: text = "sessionStorage is cleared when the page's tab/session ends."
+        case .cookies: text = "Cookies from this web view's data store. Editing keeps the original "
+                            + "domain, path, expiry, Secure and HttpOnly flags."
         }
+        text += "\n\nReading this list never writes: values are enumerated and shown as-is."
+
+        guard let webView else { return text }
+        let set = pins.pinSet(for: webView, scope: scope)
+        guard set.isForcing else {
+            if !set.pins.isEmpty {
+                text += "\n\n\(set.pins.count) key\(set.pins.count == 1 ? "" : "s") edited this session. "
+                     + "Turn on force overwrite to re-apply them after each page load."
+            }
+            return text
+        }
+
+        if set.isEmpty {
+            text += "\n\nFORCE OVERWRITE IS ON, but nothing is pinned yet — it starts working from your "
+                 + "next save."
+            return text
+        }
+
+        let current = WebViewStoragePinScript.originKey(for: webView.url)
+        text += "\n\nFORCE OVERWRITE IS ON for \(set.pins.count) key\(set.pins.count == 1 ? "" : "s") "
+             + "(marked FORCED). They are re-written when the document finishes parsing and again when "
+             + "loading completes. A page that writes later than that still wins — use Re-apply now."
+        if set.origin != current {
+            text += "\n\n⚠ Pinned on \(set.origin ?? "an unknown origin"); this web view is on "
+                 + "\(current ?? "no web origin"). Nothing is re-applied until it returns to that origin."
+        }
+        text += "\n\nDeleted keys are never re-deleted, and no key you did not edit is ever touched."
+        return text
     }
 }
 
@@ -477,10 +653,13 @@ struct StorageRowDisplay {
     /// "JSON · 12 keys" when the value is a JSON payload, else nil.
     let jsonBadge: String?
     let isEmptyValue: Bool
+    /// True when force-overwrite will re-apply this key after page loads.
+    let isPinned: Bool
 
-    init(key: String, value: String, detail: String?) {
+    init(key: String, value: String, detail: String?, isPinned: Bool = false) {
         self.key = key
         self.detail = detail
+        self.isPinned = isPinned
 
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         self.isEmptyValue = trimmed.isEmpty
@@ -527,6 +706,7 @@ final class StorageRowCell: UITableViewCell {
     private let valueLabel = UILabel()
     private let detailLabel = UILabel()
     private let jsonBadge = PaddedPill()
+    private let pinBadge = PaddedPill()
     private let chevron = UIImageView()
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
@@ -564,7 +744,7 @@ final class StorageRowCell: UITableViewCell {
         chevron.setContentHuggingPriority(.required, for: .horizontal)
         chevron.translatesAutoresizingMaskIntoConstraints = false
 
-        let keyRow = UIStackView(arrangedSubviews: [keyLabel, jsonBadge, UIView()])
+        let keyRow = UIStackView(arrangedSubviews: [keyLabel, jsonBadge, pinBadge, UIView()])
         keyRow.axis = .horizontal
         keyRow.spacing = 6
         keyRow.alignment = .center
@@ -597,6 +777,19 @@ final class StorageRowCell: UITableViewCell {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Clears every per-row flag. `setHighlighted` changes the card colour
+    /// outside `apply`, so without this a recycled cell can arrive pressed.
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        card.backgroundColor = UIColor(white: 0.13, alpha: 1)
+        keyLabel.text = nil
+        valueLabel.text = nil
+        detailLabel.text = nil
+        detailLabel.isHidden = true
+        jsonBadge.isHidden = true
+        pinBadge.isHidden = true
+    }
+
     override func setHighlighted(_ highlighted: Bool, animated: Bool) {
         super.setHighlighted(highlighted, animated: animated)
         UIView.animate(withDuration: 0.1) {
@@ -617,6 +810,13 @@ final class StorageRowCell: UITableViewCell {
             jsonBadge.set(text: badge, color: .black, background: DebugTheme.accentColor)
         } else {
             jsonBadge.isHidden = true
+        }
+
+        // A value that keeps reverting needs a visible explanation on the row
+        // itself, not only in the footer.
+        pinBadge.isHidden = !display.isPinned
+        if display.isPinned {
+            pinBadge.set(text: "FORCED", color: .black, background: .systemYellow)
         }
 
         detailLabel.text = display.detail

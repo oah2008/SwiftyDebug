@@ -1107,7 +1107,11 @@ class NetworkViewController: UIViewController {
 
     //MARK: - private
     func reloadHttp() {
-        self.models = (NetworkRequestStore.shared.httpModels as NSArray as? [NetworkTransaction])
+        // `snapshot()` copies under the store's lock. Bridging the store's live
+        // NSMutableArray here instead enumerated it on the main thread while the
+        // URLProtocol threads were still adding to it — "Collection was mutated
+        // while being enumerated", in the host app, just for having this screen open.
+        self.models = NetworkRequestStore.shared.snapshot()
         self.cacheModels = self.models
 
         applyFilter()
@@ -1628,7 +1632,7 @@ class NetworkViewController: UIViewController {
         NetworkRequestStore.shared.reset()
 
         // Reload from store so pinned requests remain visible
-        let remaining = (NetworkRequestStore.shared.httpModels as NSArray as? [NetworkTransaction]) ?? []
+        let remaining = NetworkRequestStore.shared.snapshot()
         cacheModels = remaining
         groupedModels = []
         // DO NOT clear filters — they persist across clears

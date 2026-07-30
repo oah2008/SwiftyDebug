@@ -7,6 +7,53 @@
 
 import Foundation
 
+/// Reads one field without ever throwing.
+///
+/// `decodeIfPresent` **throws** on a value it cannot make sense of — most
+/// notably an unknown enum raw value; it does **not** return nil. A single
+/// `try c.decode(...)` in a rule's decoder is therefore enough to destroy the
+/// whole rule (and, before `LenientElement` below, the whole rules file) the
+/// first time an older build reads something a newer one wrote. Every field
+/// that should degrade to a default instead of killing its container reads
+/// through here.
+fileprivate func lenient<T: Decodable, K: CodingKey>(
+    _ c: KeyedDecodingContainer<K>, _ type: T.Type, _ key: K, _ fallback: T
+) -> T {
+    ((try? c.decodeIfPresent(type, forKey: key)) ?? nil) ?? fallback
+}
+
+extension CodingUserInfoKey {
+    /// Set to `true` on a decoder to make `InterceptRule` fill in a default for
+    /// any field it cannot read, instead of throwing.
+    ///
+    /// Off by default, and deliberately so — the two callers want opposite
+    /// things:
+    ///
+    /// * **Our own `rules.json`** (`InterceptRuleStore`) turns it ON. Whatever
+    ///   is in that file is all the user has; refusing to read a field there
+    ///   means silently losing a rule they created.
+    /// * **A teammate's imported file** (`RuleTransfer`) leaves it OFF. There
+    ///   the file is untrusted input the user can go and fix, and the import
+    ///   preview earns its keep by saying `Rule #3: missing "isBlocked"`
+    ///   rather than quietly inventing values.
+    static let swiftyDebugLenientRuleDecoding =
+        CodingUserInfoKey(rawValue: "com.swiftydebug.lenientRuleDecoding")!
+}
+
+/// Wraps a `Decodable` so that decoding an ARRAY of them drops only the
+/// elements this build cannot make sense of, instead of failing the array.
+///
+/// The wrapper's own `init(from:)` never throws, which is the point: an
+/// `UnkeyedDecodingContainer` does not reliably advance past an element whose
+/// decode threw, so "try, catch, continue" spins forever. Succeeding with a
+/// nil payload always advances.
+struct LenientElement<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) throws {
+        value = try? T(from: decoder)
+    }
+}
+
 /// A single key-value pair used for header or query parameter overrides.
 struct KVPair: Codable, Equatable {
     let id: String
@@ -17,6 +64,19 @@ struct KVPair: Codable, Equatable {
         self.id = UUID().uuidString
         self.key = key
         self.value = value
+    }
+
+    /// Lenient decoding, matching `InterceptRule`'s own.
+    ///
+    /// The synthesized decoder makes `id` required, so a hand-written pair —
+    /// or one exported before `id` existed — throws, and that throw used to
+    /// travel all the way up and delete the entire rules file. A pair with no
+    /// id simply gets a fresh one.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = lenient(c, String.self, .id, UUID().uuidString)
+        key = lenient(c, String.self, .key, "")
+        value = lenient(c, String.self, .value, "")
     }
 }
 
@@ -92,11 +152,11 @@ struct MockResponse: Codable, Equatable {
         // Defaults to true, unlike the memberwise init: an absent `mock` key
         // yields no MockResponse at all, so reaching here means a mock object was
         // written deliberately and omitting the flag should not disarm it.
-        isEnabled = try c.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
-        statusCode = try c.decodeIfPresent(Int.self, forKey: .statusCode) ?? 200
-        body = try c.decodeIfPresent(String.self, forKey: .body) ?? ""
-        headers = try c.decodeIfPresent([KVPair].self, forKey: .headers) ?? []
-        delay = try c.decodeIfPresent(Double.self, forKey: .delay) ?? 0
+        isEnabled = lenient(c, Bool.self, .isEnabled, true)
+        statusCode = lenient(c, Int.self, .statusCode, 200)
+        body = lenient(c, String.self, .body, "")
+        headers = lenient(c, [LenientElement<KVPair>].self, .headers, []).compactMap { $0.value }
+        delay = lenient(c, Double.self, .delay, 0)
     }
 
     /// Common scenarios offered as one-tap presets.
@@ -322,37 +382,71 @@ struct InterceptRule: Codable {
         case responseRewrites
     }
 
+    /// Decodes a rule field by field.
+    ///
+    /// Fields that carry no information the user typed — the enums, the
+    /// optional extras — always degrade to a default rather than throwing:
+    /// `decodeIfPresent` THROWS on an unknown enum raw value, so a rule written
+    /// by a newer build used to fail to decode ENTIRELY, and the store then
+    /// discarded every rule on the device.
+    ///
+    /// The fields a rule genuinely needs (`isBlocked`, `isEnabled`, `createdAt`
+    /// and the override lists) are strict unless the decoder opts in via
+    /// `.swiftyDebugLenientRuleDecoding` — see that key for why the local store
+    /// and an import want different answers.
+    ///
+    /// `id` and the endpoint are hard requirements either way: a rule with no
+    /// identity cannot be updated, toggled or deleted, and a rule with no
+    /// endpoint is keyed under nothing and can never match. `LenientElement`
+    /// makes even that survivable at the file level — the one bad rule is
+    /// skipped, the rest load.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        let isLenient = decoder.userInfo[.swiftyDebugLenientRuleDecoding] as? Bool == true
+        /// Strict by default, defaulted when the decoder asked for leniency.
+        func required<T: Decodable>(_ type: T.Type, _ key: CodingKeys, _ fallback: T) throws -> T {
+            isLenient ? lenient(c, type, key, fallback) : try c.decode(type, forKey: key)
+        }
+
         id = try c.decode(String.self, forKey: .id)
-        if let me = try c.decodeIfPresent(String.self, forKey: .matchEndpoint) {
-            matchEndpoint = me
+
+        // No default for the endpoint in either mode: a rule keyed under nothing
+        // can never match, so it is right for it to fail and be skipped. The
+        // legacy key is still the last word, so the thrown error names it.
+        if let modern = ((try? c.decodeIfPresent(String.self, forKey: .matchEndpoint)) ?? nil) {
+            matchEndpoint = modern
         } else {
             matchEndpoint = try c.decode(String.self, forKey: .normalizedEndpoint)
         }
-        matchMode = try c.decodeIfPresent(EndpointMatchMode.self, forKey: .matchMode) ?? .normalized
-        matchHosts = try c.decodeIfPresent([String].self, forKey: .matchHosts) ?? []
-        isBlocked = try c.decode(Bool.self, forKey: .isBlocked)
-        headerOverrides = try c.decode([KVPair].self, forKey: .headerOverrides)
-        queryParamOverrides = try c.decode([KVPair].self, forKey: .queryParamOverrides)
-        removedHeaderKeys = try c.decode(Set<String>.self, forKey: .removedHeaderKeys)
-        removedQueryParamKeys = try c.decode(Set<String>.self, forKey: .removedQueryParamKeys)
-        isEnabled = try c.decode(Bool.self, forKey: .isEnabled)
-        createdAt = try c.decode(Date.self, forKey: .createdAt)
-        order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
-        // `try?` on the enums, not `try`: decodeIfPresent THROWS on an unknown raw
-        // value, so a rule exported by a newer build (a redirect or breakpoint mode
-        // this build has never heard of) would fail to decode entirely instead of
-        // losing just that one setting.
-        redirectMode = (try? c.decodeIfPresent(RedirectMode.self, forKey: .redirectMode)) as? RedirectMode ?? .none
-        redirectTarget = try c.decodeIfPresent(String.self, forKey: .redirectTarget) ?? ""
-        mock = try c.decodeIfPresent(MockResponse.self, forKey: .mock) ?? MockResponse()
-        breakpointMode = (try? c.decodeIfPresent(BreakpointMode.self, forKey: .breakpointMode)) as? BreakpointMode ?? .off
+
+        // Always lenient — an unknown raw value here is the exact throw that
+        // took whole rules (and then whole files) down.
+        matchMode = lenient(c, EndpointMatchMode.self, .matchMode, .normalized)
+        matchHosts = lenient(c, [String].self, .matchHosts, [])
+        isBlocked = try required(Bool.self, .isBlocked, false)
+        // Element by element: one malformed pair loses that pair, not the list.
+        headerOverrides = try required([LenientElement<KVPair>].self, .headerOverrides, [])
+            .compactMap { $0.value }
+        queryParamOverrides = try required([LenientElement<KVPair>].self, .queryParamOverrides, [])
+            .compactMap { $0.value }
+        removedHeaderKeys = try required(Set<String>.self, .removedHeaderKeys, [])
+        removedQueryParamKeys = try required(Set<String>.self, .removedQueryParamKeys, [])
+        // Defaults to enabled, matching `init(matchEndpoint:)` and `MockResponse`
+        // above: an absent flag means hand-written or pre-flag JSON, and someone
+        // who writes a rule out by hand means it to be armed.
+        isEnabled = try required(Bool.self, .isEnabled, true)
+        // A rule with no readable timestamp sorts as if it were just created —
+        // `allRules()` orders by this, so it needs *some* answer.
+        createdAt = try required(Date.self, .createdAt, Date())
+        order = lenient(c, Int.self, .order, 0)
+        redirectMode = lenient(c, RedirectMode.self, .redirectMode, .none)
+        redirectTarget = lenient(c, String.self, .redirectTarget, "")
+        mock = lenient(c, MockResponse.self, .mock, MockResponse())
+        breakpointMode = lenient(c, BreakpointMode.self, .breakpointMode, .off)
         // Decoded element by element: one rewrite written by a newer build is
         // dropped on its own instead of taking the whole rule with it.
-        let decodedRewrites: [ResponseRewrite.Lenient] =
-            ((try? c.decodeIfPresent([ResponseRewrite.Lenient].self, forKey: .responseRewrites)) ?? nil) ?? []
-        responseRewrites = decodedRewrites.compactMap { $0.rewrite }
+        responseRewrites = lenient(c, [ResponseRewrite.Lenient].self, .responseRewrites, [])
+            .compactMap { $0.rewrite }
     }
 
     func encode(to encoder: Encoder) throws {

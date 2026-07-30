@@ -25,6 +25,21 @@ class AppInfoViewController: UITableViewController {
         let title: String
         let subtitle: String
         let keyPath: ReferenceWritableKeyPath<Settings, Bool>
+        /// Runs on the main thread *after* the setting has been written, for rows
+        /// whose new value cannot reach objects the host app already built.
+        ///
+        /// The controller is passed in rather than captured: `toggles` is stored on
+        /// the instance, so a closure capturing `self` would be a retain cycle.
+        let onChange: ((AppInfoViewController, Bool) -> Void)?
+
+        init(title: String, subtitle: String,
+             keyPath: ReferenceWritableKeyPath<Settings, Bool>,
+             onChange: ((AppInfoViewController, Bool) -> Void)? = nil) {
+            self.title = title
+            self.subtitle = subtitle
+            self.keyPath = keyPath
+            self.onChange = onChange
+        }
     }
 
     private let toggles: [ToggleItem] = [
@@ -49,7 +64,26 @@ class AppInfoViewController: UITableViewController {
         ToggleItem(title: "Full Stop on Disable",
                    subtitle: "When on, shaking to disable fully stops all capture (0 CPU). When off, shake only hides the overlay.",
                    keyPath: \.fullStopOnDisable),
+        ToggleItem(title: "Extend Request Timeouts",
+                   subtitle: "A request paused at a breakpoint delivers no bytes, so the app's own idle timeout kills it before you can edit it. "
+                       + "On: raises request timeouts app-wide to ~\(AppInfoViewController.holdBudgetText()) — for EVERY request, not just paused ones.",
+                   keyPath: \.extendTimeoutsForBreakpoints,
+                   onChange: { controller, isOn in
+                       // Prompt in BOTH directions. Turning it OFF matters just as
+                       // much: every session built while it was on keeps the 10-minute
+                       // timeout for the life of the process, so the retry ladders and
+                       // "poor connection" banners the developer just turned it off to
+                       // get back stay suppressed until relaunch.
+                       controller.promptRestartForExtendedTimeouts(turnedOn: isOn)
+                   }),
     ]
+
+    /// The breakpoint hold budget, phrased for humans ("10 minutes").
+    private static func holdBudgetText() -> String {
+        let seconds = Settings.shared.breakpointHoldSeconds
+        if seconds >= 120 { return "\(Int((seconds / 60).rounded())) minutes" }
+        return "\(Int(seconds.rounded())) seconds"
+    }
 
     // MARK: - Inspector rows (ACTIONS section)
 
@@ -107,9 +141,40 @@ class AppInfoViewController: UITableViewController {
         },
     ]
 
+    /// Destructive rows, rendered after the inspectors. Kept as data rather than
+    /// an `else` branch so adding one cannot desynchronize the row count from
+    /// what `didSelectRowAt` runs.
+    private struct DestructiveRow {
+        let title: String
+        /// Live one-liner under the title. Evaluated in `cellForRowAt`, so it
+        /// must stay cheap — in-memory state only, never a disk read.
+        let subtitle: (() -> String)?
+        let run: (AppInfoViewController) -> Void
+    }
+
+    private static let destructiveRows: [DestructiveRow] = [
+        DestructiveRow(title: "Clear Pinned Requests", subtitle: nil) {
+            $0.clearPinnedRequests()
+        },
+        DestructiveRow(
+            title: "Clear Remembered Headers",
+            subtitle: {
+                let n = RequestMetadataStore.shared.rememberedCount
+                return n == 0
+                    ? "Nothing remembered yet"
+                    : "\(n) header/param name\(n == 1 ? "" : "s") kept for suggestions"
+            }
+        ) {
+            $0.clearRequestMetadata()
+        },
+    ]
+
     // MARK: - Data
 
     private var interceptRules: [InterceptRule] = []
+
+    /// Block-based observer tokens, removed in `deinit`. See `viewDidLoad`.
+    private var observerTokens: [NSObjectProtocol] = []
 
     /// Unique captured URLs with tag info
     private var capturedURLs: [URLItem] = []
@@ -151,13 +216,18 @@ class AppInfoViewController: UITableViewController {
         tableView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 16, right: 0)
         tableView.showsVerticalScrollIndicator = false
 
-        // Notification for network updates
-        NotificationCenter.default.addObserver(
+        // Notification for network updates.
+        //
+        // The token is kept: `removeObserver(self)` cannot unregister a
+        // block-based observer — the observer is the returned token object, not
+        // `self` — so without this every open of the debug UI left another live
+        // observer firing `reloadURLs()` on EVERY host-app request, forever.
+        observerTokens.append(NotificationCenter.default.addObserver(
             forName: .networkRequestCompleted,
             object: nil, queue: .main
         ) { [weak self] _ in
             self?.reloadURLs()
-        }
+        })
         view.forceLTR()
     }
 
@@ -166,8 +236,13 @@ class AppInfoViewController: UITableViewController {
         reloadURLs()
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        reportRuleLoadIssueIfNeeded()
+    }
+
     deinit {
-        NotificationCenter.default.removeObserver(self)
+        for token in observerTokens { NotificationCenter.default.removeObserver(token) }
     }
 
     // MARK: - Build Data
@@ -267,38 +342,87 @@ class AppInfoViewController: UITableViewController {
 
     // MARK: - Toggle actions
 
-    @objc private func toggleChanged(_ sender: UISwitch) {
-        let toggle = toggles[sender.tag]
-        Settings.shared[keyPath: toggle.keyPath] = sender.isOn
+    /// Explains, on switch-ON, that "Extend Request Timeouts" only reaches sessions
+    /// the app has not created yet — and offers to quit so it can reach all of them.
+    ///
+    /// Why a restart is genuinely required: the switch is read *live* by
+    /// `CustomHTTPProtocol.effectiveRequestTimeout(_:)`, but that function only runs
+    /// when a `URLSessionConfiguration` is constructed or has its
+    /// `timeoutIntervalForRequest` assigned (the two swizzles in
+    /// `swizzleSessionConfiguration()` / `injectProtocol(into:)`). Those swizzles are
+    /// installed once when SwiftyDebug is enabled and are *not* gated on this setting,
+    /// so nothing needs re-swizzling — but a `URLSession` snapshots its configuration
+    /// at construction, and the typical host app builds its session once at launch.
+    /// That session keeps its short timeout no matter what this switch says. Sessions
+    /// created after the flip pick the new value up immediately.
+    ///
+    /// iOS has no supported API to relaunch an app, so this does not pretend to
+    /// restart. The destructive button is labelled as what it actually does — quit
+    /// now — and the message says the app must be reopened by hand. The alternative
+    /// (calling `exit(0)` behind a "Restart" label) would look exactly like a crash.
+    private func promptRestartForExtendedTimeouts(turnedOn: Bool) {
+        // Ask the SDK whether a restart is actually required rather than assuming.
+        // Prompting for a change that already took full effect is its own small lie.
+        guard SwiftyDebug.extendTimeoutsChangeEffect.requiresRestart else { return }
+
+        let detail = turnedOn
+            ? "Sessions the app created earlier — most apps build theirs once at launch — keep their old, "
+              + "shorter timeout, so a request paused at a breakpoint on those can still time out while you edit it."
+            : "Sessions the app created while this was on keep the ~\(Self.holdBudgetText()) timeout, so any retry, "
+              + "watchdog or \"poor connection\" logic that relies on requests failing stays suppressed until you relaunch."
+
+        let alert = UIAlertController(
+            title: "Restart to Apply Everywhere",
+            message: "Network sessions the app creates from now on already use the new timeout.\n\n"
+                + detail + "\n\n"
+                + "iOS cannot relaunch an app. \"Quit App Now\" closes it immediately; reopen it from the "
+                + "Home screen for the change to apply to every session.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Not Now", style: .cancel))
+        #if DEBUG
+        alert.addAction(UIAlertAction(title: "Quit App Now", style: .destructive) { _ in
+            // exit(0) bypasses the normal termination path, so flush the setting
+            // first — otherwise the toggle is lost on the next launch.
+            // `UserDefaults.synchronize()` is deprecated and does not reliably flush
+            // before an immediate exit; this is the call that actually does.
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
+            exit(0)
+        })
+        #endif
+        present(alert, animated: true)
     }
 
-    /// Presents an action sheet to pick a fixed Network Link Conditioner preset.
+    /// Presents the picker for a fixed Network Link Conditioner preset.
     /// Latency-only simulation, off by default. (See NETWORK-SIM.)
+    ///
+    /// Uses `OptionPickerSheetViewController` rather than a system action sheet:
+    /// the sheet gives every preset a real subtitle and a proper checkmark, instead
+    /// of the "name — latency  ✓" strings an alert row truncates.
     private func presentNetworkSimPicker() {
-        let current = Settings.shared.networkConditionerPreset
-        let alert = UIAlertController(
-            title: "Slow Network Simulation",
-            message: "Adds a fixed latency to every captured request so you can test loader / spinner states. Matches iOS Network Link Conditioner presets.",
-            preferredStyle: .actionSheet
-        )
-        for preset in NetworkConditionerPreset.allCases {
-            let checkmark = (preset == current) ? "  ✓" : ""
-            let title = preset == .off
-                ? "Off\(checkmark)"
-                : "\(preset.displayName) — \(preset.subtitle)\(checkmark)"
-            alert.addAction(UIAlertAction(title: title, style: .default) { [weak self] _ in
+        let presets = NetworkConditionerPreset.allCases
+        let options = presets.map { preset in
+            OptionPickerSheetViewController.Option(
+                title: preset.displayName,
+                subtitle: preset.subtitle,
+                symbol: preset == .off ? "nosign"
+                    : (preset.dropsAllRequests ? "wifi.slash" : "tortoise.fill"),
+                tint: preset == .off ? .white
+                    : (preset.dropsAllRequests ? .systemRed : .systemOrange)
+            ) { [weak self] in
                 Settings.shared.networkConditionerPreset = preset
                 let indexPath = IndexPath(row: 0, section: Section.simulation.rawValue)
                 self?.tableView.reloadRows(at: [indexPath], with: .none)
-            })
+            }
         }
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = view
-            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-            popover.permittedArrowDirections = []
-        }
-        present(alert, animated: true)
+        OptionPickerSheetViewController.present(
+            from: self,
+            title: "Slow Network Simulation",
+            message: "Adds a fixed latency to every captured request so you can test loader / spinner states. "
+                + "Matches iOS Network Link Conditioner presets.",
+            options: options,
+            selectedIndex: presets.firstIndex(of: Settings.shared.networkConditionerPreset)
+        )
     }
 
     /// Presents an inspector **full screen** (these are screens you work in —
@@ -333,6 +457,14 @@ class AppInfoViewController: UITableViewController {
         presentedViewController?.dismiss(animated: true)
     }
 
+    /// The destructive row at an ACTIONS row index, or nil if that index is an
+    /// inspector (or off the end).
+    private static func destructiveRow(at row: Int) -> DestructiveRow? {
+        let idx = row - inspectorRows.count
+        guard destructiveRows.indices.contains(idx) else { return nil }
+        return destructiveRows[idx]
+    }
+
     private func clearPinnedRequests() {
         let alert = UIAlertController(
             title: "Clear Pinned Requests",
@@ -343,6 +475,52 @@ class AppInfoViewController: UITableViewController {
         alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { _ in
             NetworkRequestStore.shared.clearPinned()
         })
+        present(alert, animated: true)
+    }
+
+    /// Wipes `RequestMetadataStore`. That store outlives Clear, `fullStop()` and
+    /// the requests it learned from, so this is the only way to get rid of it.
+    private func clearRequestMetadata() {
+        let alert = UIAlertController(
+            title: "Clear Remembered Headers",
+            message: "SwiftyDebug remembers the header and query-parameter names your app sends, so the "
+                + "intercept and replay editors can suggest them. Clearing forgets all of them and deletes "
+                + "the file from disk. This cannot be undone.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { [weak self] _ in
+            RequestMetadataStore.shared.clear()
+            // The row's own subtitle shows the count.
+            self?.tableView.reloadSections(IndexSet(integer: Section.actions.rawValue), with: .none)
+        })
+        present(alert, animated: true)
+    }
+
+    /// Says so, once, when `rules.json` could not be fully read at launch.
+    ///
+    /// Rules are invisible state that changes how the host app's network
+    /// behaves; losing some of them without a word is how "why is this request
+    /// still being blocked / no longer being blocked" becomes unanswerable.
+    private func reportRuleLoadIssueIfNeeded() {
+        guard let issue = InterceptRuleStore.shared.takeLoadIssue() else { return }
+
+        let what = issue.fileUnreadable
+            ? "The saved intercept rules file could not be read at all, so this session started with none."
+            : "\(issue.skipped) saved intercept rule\(issue.skipped == 1 ? "" : "s") could not be read and "
+              + "\(issue.skipped == 1 ? "was" : "were") skipped. \(issue.recovered) loaded normally."
+        let where_ = issue.backupURL.map {
+            "\n\nThe original file was left untouched at:\n\($0.lastPathComponent)"
+        } ?? "\n\nThe original file could not be copied aside."
+
+        let alert = UIAlertController(title: "Some Rules Could Not Be Read",
+                                      message: what + where_, preferredStyle: .alert)
+        if let url = issue.backupURL {
+            alert.addAction(UIAlertAction(title: "Copy Path", style: .default) { _ in
+                UIPasteboard.general.string = url.path
+            })
+        }
+        alert.addAction(UIAlertAction(title: "OK", style: .cancel))
         present(alert, animated: true)
     }
 
@@ -357,7 +535,7 @@ class AppInfoViewController: UITableViewController {
         case .settings:       return toggles.count
         case .simulation:     return 1 // network conditioner preset row
         case .interceptRules: return interceptRules.count + 1 // rules + "Add Rule" button
-        case .actions:        return Self.inspectorRows.count + 1 // inspectors + Clear Pinned
+        case .actions:        return Self.inspectorRows.count + Self.destructiveRows.count
         case .urls:           return capturedURLs.count
         }
     }
@@ -375,13 +553,21 @@ class AppInfoViewController: UITableViewController {
             cell.detailTextLabel?.text = toggle.subtitle
             cell.detailTextLabel?.font = .systemFont(ofSize: 11)
             cell.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
-            cell.detailTextLabel?.numberOfLines = 2
+            // 4, not 0: a bounded line count self-sizes reliably in a stock
+            // subtitle cell, and the honest explanations here need the room.
+            cell.detailTextLabel?.numberOfLines = 4
 
             let sw = UISwitch()
             sw.isOn = Settings.shared[keyPath: toggle.keyPath]
             sw.onTintColor = DebugTheme.accentColor
-            sw.tag = indexPath.row
-            sw.addTarget(self, action: #selector(toggleChanged(_:)), for: .valueChanged)
+            // The action carries the toggle it belongs to, not a row number.
+            // These rows never move, but nothing about a switch should depend
+            // on that staying true.
+            sw.addAction(UIAction { [weak self] action in
+                guard let self, let sw = action.sender as? UISwitch else { return }
+                Settings.shared[keyPath: toggle.keyPath] = sw.isOn
+                toggle.onChange?(self, sw.isOn)
+            }, for: .valueChanged)
             cell.accessoryView = sw
             cell.forceLTR()
             return cell
@@ -483,12 +669,22 @@ class AppInfoViewController: UITableViewController {
             cell.detailTextLabel?.font = .systemFont(ofSize: 11)
             cell.detailTextLabel?.textColor = rule.isBlocked ? .systemRed : UIColor(white: 0.55, alpha: 1)
 
-            // Enable/disable switch
+            // Enable/disable switch.
+            //
+            // Keyed on the rule's IDENTITY, never on `indexPath.row`. A
+            // swipe-delete calls `deleteRows`, which shifts the surviving cells
+            // up WITHOUT re-running this method, so a row-numbered switch would
+            // then toggle whichever rule inherited its old index — silently
+            // blocking requests, overriding headers or rewriting responses in
+            // somebody's app.
+            let ruleId = rule.id
             let sw = UISwitch()
             sw.isOn = rule.isEnabled
             sw.onTintColor = DebugTheme.accentColor
-            sw.tag = indexPath.row
-            sw.addTarget(self, action: #selector(ruleToggleChanged(_:)), for: .valueChanged)
+            sw.addAction(UIAction { [weak self] action in
+                guard let sw = action.sender as? UISwitch else { return }
+                self?.setRule(id: ruleId, enabled: sw.isOn)
+            }, for: .valueChanged)
             cell.accessoryView = sw
             cell.contentView.alpha = rule.isEnabled ? 1 : 0.5
             cell.forceLTR()
@@ -497,8 +693,11 @@ class AppInfoViewController: UITableViewController {
         case .actions:
             // Subtitle style only where a row actually has one — a `.subtitle` cell with
             // an empty detail label lays its title out differently.
-            let inspector = indexPath.row < Self.inspectorRows.count ? Self.inspectorRows[indexPath.row] : nil
-            let hasSubtitle = inspector?.subtitle != nil
+            let inspector = Self.inspectorRows.indices.contains(indexPath.row)
+                ? Self.inspectorRows[indexPath.row] : nil
+            let destructive = inspector == nil
+                ? Self.destructiveRow(at: indexPath.row) : nil
+            let hasSubtitle = inspector?.subtitle != nil || destructive?.subtitle != nil
             let cell = UITableViewCell(style: hasSubtitle ? .subtitle : .default,
                                        reuseIdentifier: hasSubtitle ? "ActionSubtitleCell" : "ActionCell")
             cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
@@ -518,13 +717,17 @@ class AppInfoViewController: UITableViewController {
                 cell.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
                 cell.detailTextLabel?.numberOfLines = 2
                 cell.accessoryType = .disclosureIndicator
-            } else {
-                // Clear Pinned Requests (always last)
+            } else if let row = destructive {
                 cell.imageView?.image = nil
-                cell.textLabel?.text = "Clear Pinned Requests"
+                cell.textLabel?.text = row.title
                 cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
                 cell.textLabel?.textColor = .systemRed
                 cell.textLabel?.textAlignment = .center
+                cell.detailTextLabel?.text = row.subtitle?()
+                cell.detailTextLabel?.font = .systemFont(ofSize: 11)
+                cell.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
+                cell.detailTextLabel?.textAlignment = .center
+                cell.detailTextLabel?.numberOfLines = 2
                 cell.accessoryType = .none
             }
             return cell
@@ -612,10 +815,10 @@ class AppInfoViewController: UITableViewController {
                 editRuleFromAppTab(interceptRules[indexPath.row])
             }
         case .actions:
-            if indexPath.row < Self.inspectorRows.count {
+            if Self.inspectorRows.indices.contains(indexPath.row) {
                 presentInspector(Self.inspectorRows[indexPath.row].make())
-            } else {
-                clearPinnedRequests()
+            } else if let row = Self.destructiveRow(at: indexPath.row) {
+                row.run(self)
             }
         case .urls:
             guard indexPath.row < capturedURLs.count else { return }
@@ -644,19 +847,31 @@ class AppInfoViewController: UITableViewController {
         let rule = interceptRules[indexPath.row]
         interceptRules.remove(at: indexPath.row)
         InterceptRuleStore.shared.remove(id: rule.id)
-        tableView.deleteRows(at: [indexPath], with: .automatic)
+        tableView.performBatchUpdates {
+            tableView.deleteRows(at: [indexPath], with: .automatic)
+        } completion: { [weak tableView] _ in
+            // The section header carries a live rule count and `deleteRows`
+            // does not rebuild headers. Reloading the section afterwards also
+            // re-runs `cellForRowAt` for the survivors, so nothing in this
+            // section is left describing a row it no longer sits on.
+            tableView?.reloadSections(IndexSet(integer: Section.interceptRules.rawValue), with: .none)
+        }
     }
 
     // MARK: - Intercept Rule actions
 
-    @objc private func ruleToggleChanged(_ sender: UISwitch) {
-        guard sender.tag < interceptRules.count else { return }
-        interceptRules[sender.tag].isEnabled = sender.isOn
-        InterceptRuleStore.shared.update(interceptRules[sender.tag])
-        // Update opacity
-        let indexPath = IndexPath(row: sender.tag, section: Section.interceptRules.rawValue)
+    /// Arms or disarms one rule, found by id.
+    ///
+    /// NO-OP when the id is gone: the rule was deleted between the cell being
+    /// rendered and the switch being tapped, and there is nothing to write.
+    private func setRule(id: String, enabled: Bool) {
+        guard let idx = interceptRules.firstIndex(where: { $0.id == id }) else { return }
+        interceptRules[idx].isEnabled = enabled
+        InterceptRuleStore.shared.update(interceptRules[idx])
+        // Update opacity on whichever row the rule currently occupies.
+        let indexPath = IndexPath(row: idx, section: Section.interceptRules.rawValue)
         if let cell = tableView.cellForRow(at: indexPath) {
-            cell.contentView.alpha = sender.isOn ? 1 : 0.5
+            cell.contentView.alpha = enabled ? 1 : 0.5
         }
     }
 
@@ -672,31 +887,35 @@ class AppInfoViewController: UITableViewController {
         present(nav, animated: true)
     }
 
+    /// Scope chooser for a brand-new rule. Uses `OptionPickerSheetViewController`,
+    /// not a system action sheet, so each scope can carry a subtitle saying what it
+    /// actually matches. (See INTERCEPT-UX.)
+    ///
+    /// There is no request in context here (the App tab isn't attached to one), so
+    /// only the request-independent scopes are offered — endpoint rules are created
+    /// from a captured request.
     private func addRuleTapped() {
-        let alert = UIAlertController(title: "New Rule", message: nil, preferredStyle: .actionSheet)
-
-        alert.addAction(UIAlertAction(title: "Host Rule", style: .default) { [weak self] _ in
+        let openEditor: (EndpointMatchMode) -> Void = { [weak self] mode in
+            guard let self = self else { return }
             let editor = InterceptRuleEditorViewController()
-            editor.initialMatchMode = .host
+            editor.initialMatchMode = mode
             let nav = SwiftyDebugNavigationController(rootViewController: editor)
-            self?.present(nav, animated: true)
-        })
-
-        alert.addAction(UIAlertAction(title: "Global Rule", style: .default) { [weak self] _ in
-            let editor = InterceptRuleEditorViewController()
-            editor.initialMatchMode = .global
-            let nav = SwiftyDebugNavigationController(rootViewController: editor)
-            self?.present(nav, animated: true)
-        })
-
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = view
-            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-            popover.permittedArrowDirections = []
+            self.present(nav, animated: true)
         }
-        present(alert, animated: true)
+
+        OptionPickerSheetViewController.present(
+            from: self,
+            title: "New Rule",
+            message: "Choose what the new rule should apply to.",
+            options: [
+                .init(title: "Host Rule",
+                      subtitle: "Every request to the hosts you pick",
+                      symbol: "network", tint: .systemPurple) { openEditor(.host) },
+                .init(title: "Global Rule",
+                      subtitle: "Every request in the app and web views",
+                      symbol: "globe", tint: .systemPink) { openEditor(.global) },
+            ]
+        )
     }
 }
 
