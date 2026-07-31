@@ -142,26 +142,313 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         }
     }
 
+    /// The transport settings on the demux session that are, in effect, the
+    /// HOST APP's settings — because every request the app makes is re-issued
+    /// through this one session. Captured so tests can prove SwiftyDebug left
+    /// them exactly as `URLSessionConfiguration.default` produced them.
+    ///
+    /// The same type also carries the settings read back off a HOST session's
+    /// configuration (see `hostTransportSettings(for:)`), because the fix for
+    /// "one shared session speaks for every app session" is to MIRROR the
+    /// originating configuration rather than impose either SwiftyDebug's tuning
+    /// or Foundation's defaults. Same fields, read from the other direction.
+    struct DemuxTransportSettings: Equatable {
+        var httpShouldSetCookies: Bool
+        var httpMaximumConnectionsPerHost: Int
+        var requestCachePolicy: URLRequest.CachePolicy
+        var allowsCellularAccess: Bool
+        var httpShouldUsePipelining: Bool
+        var httpCookieAcceptPolicy: HTTPCookie.AcceptPolicy
+        /// Reference, not value: two configurations pointing at the SAME jar are
+        /// interchangeable, two pointing at different jars never are. `nil` means
+        /// the app turned cookie storage off entirely.
+        var httpCookieStorage: HTTPCookieStorage?
+        var urlCredentialStorage: URLCredentialStorage?
+
+        init(_ config: URLSessionConfiguration) {
+            httpShouldSetCookies = config.httpShouldSetCookies
+            httpMaximumConnectionsPerHost = config.httpMaximumConnectionsPerHost
+            requestCachePolicy = config.requestCachePolicy
+            allowsCellularAccess = config.allowsCellularAccess
+            httpShouldUsePipelining = config.httpShouldUsePipelining
+            httpCookieAcceptPolicy = config.httpCookieAcceptPolicy
+            httpCookieStorage = config.httpCookieStorage
+            urlCredentialStorage = config.urlCredentialStorage
+        }
+
+        static func == (lhs: DemuxTransportSettings, rhs: DemuxTransportSettings) -> Bool {
+            lhs.httpShouldSetCookies == rhs.httpShouldSetCookies
+                && lhs.httpMaximumConnectionsPerHost == rhs.httpMaximumConnectionsPerHost
+                && lhs.requestCachePolicy == rhs.requestCachePolicy
+                && lhs.allowsCellularAccess == rhs.allowsCellularAccess
+                && lhs.httpShouldUsePipelining == rhs.httpShouldUsePipelining
+                && lhs.httpCookieAcceptPolicy == rhs.httpCookieAcceptPolicy
+                && lhs.httpCookieStorage === rhs.httpCookieStorage
+                && lhs.urlCredentialStorage === rhs.urlCredentialStorage
+        }
+
+        /// The subset that CANNOT be expressed on a `URLRequest`, and therefore
+        /// decides WHICH session a request has to be issued on. See
+        /// `DemuxSessionSignature`.
+        var sessionSignature: DemuxSessionSignature {
+            DemuxSessionSignature(
+                httpMaximumConnectionsPerHost: httpMaximumConnectionsPerHost,
+                httpCookieAcceptPolicy: httpCookieAcceptPolicy,
+                cookieStorage: httpCookieStorage.map(ObjectIdentifier.init),
+                credentialStorage: urlCredentialStorage.map(ObjectIdentifier.init))
+        }
+    }
+
+    /// Identity of a demux session.
+    ///
+    /// `URLRequest` can express a cache policy, a cookie opt-out, cellular access
+    /// and pipelining, so those four ride along on each forwarded request. It
+    /// **cannot** express a connection cap, a cookie jar, a credential store or a
+    /// cookie accept policy — those are properties of the connection pool and of
+    /// the session, so the only way to honour the host app's is to issue its
+    /// requests on a session that was built with them. One session per distinct
+    /// signature, created on demand and cached.
+    struct DemuxSessionSignature: Hashable {
+        var httpMaximumConnectionsPerHost: Int
+        var httpCookieAcceptPolicy: HTTPCookie.AcceptPolicy
+        var cookieStorage: ObjectIdentifier?
+        var credentialStorage: ObjectIdentifier?
+    }
+
+    /// What `URLSessionConfiguration.default` handed us, before SwiftyDebug
+    /// touched the configuration at all. nil until `demuxOnce` has run.
+    private(set) static var systemDefaultTransportSettings: DemuxTransportSettings?
+    /// What the demux session was actually built with. Must equal
+    /// `systemDefaultTransportSettings` — see the comment in `demuxOnce`.
+    private(set) static var demuxTransportSettings: DemuxTransportSettings?
+
     private static let demuxOnce: Void = {
         isBuildingOwnConfiguration = true
         defer { isBuildingOwnConfiguration = false }
         let config = URLSessionConfiguration.default
-        config.httpShouldSetCookies = false
-        // Disable cache on the demux session - caching is already handled by the original
-        // request's session. Without this, every response gets cached TWICE (doubling memory).
+        systemDefaultTransportSettings = DemuxTransportSettings(config)
+
+        // DO NOT TUNE THIS SESSION.
+        //
+        // Every request the host app makes is re-issued through this one shared
+        // session, so a transport setting here is not SwiftyDebug's setting —
+        // it silently becomes the host app's. Three used to be set here, and all
+        // three were measured regressions in any app that merely LINKS the SDK:
+        //
+        //  • `httpShouldSetCookies = false` stripped Cookie from every request
+        //    and left `HTTPCookieStorage.shared.cookies` empty, so cookie-session
+        //    logins stopped working outright. Its only conceivable purpose was to
+        //    avoid double-applying cookies, but nothing double-applies them: the
+        //    request reaches `startLoading` BEFORE CFNetwork's HTTP protocol has
+        //    attached any, so this session is the only place they can be added.
+        //  • `httpMaximumConnectionsPerHost = 1` serialised all traffic to a host.
+        //    Its comment claimed it "reduced connection overhead"; measured, six
+        //    concurrent 300 ms GETs took 1.87 s instead of 0.31 s.
+        //  • `requestCachePolicy = .reloadIgnoringLocalCacheData` overrode the
+        //    policy the app chose per request, so URLCache was never consulted:
+        //    3x the requests, 3x the data, and `.returnCacheDataDontLoad` (the
+        //    offline read) could not succeed. The app's own policy travels on the
+        //    forwarded request and is now left to govern; cache READS happen
+        //    through `cachedResponseDisposition` before we ever come here.
+        //
+        // Their absence is the fix, so absence is what `SharedDemuxConfigurationTests`
+        // pins — via the two snapshots above, which diverge the moment anyone
+        // assigns one of them again.
+
+        // `urlCache` IS still cleared, and unlike the three above it is
+        // load-bearing rather than a tuning knob. The response is handed to the
+        // host app's loading system through
+        // `client?.urlProtocol(_:didReceive:cacheStoragePolicy:)`, which stores it
+        // in the app's URLCache; a cache on this session would store a second
+        // copy of every response. Clearing it costs no cache reads, because this
+        // session never performs them — see `cachedResponseDisposition`.
         config.urlCache = nil
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        // Limit concurrent connections to reduce connection overhead.
-        config.httpMaximumConnectionsPerHost = 1
+
         // You have to explicitly configure the session to use your own protocol subclass here
         // otherwise you don't see redirects <rdar://problem/17384498>.
         config.protocolClasses = [CustomHTTPProtocol.self]
+        demuxTransportSettings = DemuxTransportSettings(config)
         sharedDemuxInstance = QNSURLSessionDemux(configuration: config)
     }()
 
     @objc class func sharedDemux() -> QNSURLSessionDemux {
         _ = demuxOnce
         return sharedDemuxInstance!
+    }
+
+    // MARK: - Mirroring the ORIGINATING session (see HOST-TRANSPORT)
+
+    /// Reads the transport settings off the session that actually issued this
+    /// request.
+    ///
+    /// Why this is needed at all: `startLoading` re-issues the request on a
+    /// SwiftyDebug session, so every session-level setting on the app's own
+    /// session is dropped on the floor unless it is deliberately carried over.
+    /// Measured on the simulator, NOTHING travels from a configuration onto the
+    /// `URLRequest` a `URLProtocol` is handed — a session with
+    /// `httpShouldSetCookies = false`, `allowsCellularAccess = false`,
+    /// `httpMaximumConnectionsPerHost = 2` and
+    /// `requestCachePolicy = .returnCacheDataElseLoad` produces a request that
+    /// reports `httpShouldHandleCookies == true`, `allowsCellularAccess == true`
+    /// and `cachePolicy == .useProtocolCachePolicy`. So the request cannot be
+    /// asked; the session has to be.
+    ///
+    /// `URLProtocol.task` is public API and is the task the app created. Its
+    /// `session` accessor is not in the headers, so it is called only after
+    /// `responds(to:)` says it exists and only through KVC, and every caller
+    /// treats `nil` as "unknown" and degrades safely (see
+    /// `resolveDemux(for:)` and `upstreamRequest(_:hostSettings:...)`).
+    /// Nothing here is required for correctness of the capture — it exists so
+    /// the host app's own settings are not silently replaced by ours.
+    private static let originatingSessionSelector = NSSelectorFromString("session")
+
+    static func originatingSession(of task: URLSessionTask?) -> URLSession? {
+        guard let task else { return nil }
+        let object = task as AnyObject
+        guard object.responds(to: originatingSessionSelector) else { return nil }
+        return object.value(forKey: "session") as? URLSession
+    }
+
+    /// The originating configuration's transport settings, or nil when the
+    /// session could not be reached (an `NSURLConnection`-era load, or an OS
+    /// where the accessor is gone).
+    static func hostTransportSettings(for task: URLSessionTask?) -> DemuxTransportSettings? {
+        guard let session = originatingSession(of: task) else { return nil }
+        return DemuxTransportSettings(session.configuration)
+    }
+
+    /// Demux sessions built to mirror a host configuration, one per distinct
+    /// `DemuxSessionSignature`.
+    ///
+    /// The signature keys on the ADDRESS of the cookie/credential stores, which
+    /// is only sound because the cached session's configuration holds a strong
+    /// reference to them: a store that is still a key can never be deallocated,
+    /// so its address can never be handed to a different store and collide.
+    private static var dedicatedDemuxes: [DemuxSessionSignature: QNSURLSessionDemux] = [:]
+    private static let dedicatedDemuxLock = NSLock()
+
+    /// A ceiling on how many extra sessions the SDK will stand up. An app with a
+    /// handful of networking stacks has a handful of signatures; a pathological
+    /// one that builds a fresh cookie jar per request would otherwise leak a
+    /// session per request. Past the cap we fall back to the shared session and
+    /// the fallback is the SAFE direction (cookies are switched off rather than
+    /// taken from the wrong jar).
+    static let maxDedicatedDemuxSessions = 8
+
+    /// Where a request carrying `settings` must be issued, and whether that
+    /// session's cookie jar really is the host's.
+    ///
+    /// The `Bool` is not cosmetic: if we hand the request to the shared session
+    /// while the app uses a private per-account jar, automatic cookie handling
+    /// puts the SHARED jar's cookie on the wire — account A's credential on
+    /// account B's session. In that case the caller must switch cookie handling
+    /// off for the request instead.
+    static func resolveDemux(for settings: DemuxTransportSettings?)
+        -> (demux: QNSURLSessionDemux, sessionSharesHostCookieStorage: Bool) {
+        let shared = sharedDemux()
+        guard let settings else {
+            // Unknown originating session: keep today's behaviour exactly.
+            return (shared, true)
+        }
+        guard let sharedSettings = demuxTransportSettings else { return (shared, true) }
+        if settings.sessionSignature == sharedSettings.sessionSignature {
+            return (shared, true)
+        }
+
+        dedicatedDemuxLock.lock()
+        defer { dedicatedDemuxLock.unlock() }
+        let signature = settings.sessionSignature
+        if let existing = dedicatedDemuxes[signature] {
+            return (existing, true)
+        }
+        guard dedicatedDemuxes.count < maxDedicatedDemuxSessions else {
+            return (shared, settings.httpCookieStorage === sharedSettings.httpCookieStorage)
+        }
+        let created = makeDedicatedDemux(mirroring: settings)
+        dedicatedDemuxes[signature] = created
+        return (created, true)
+    }
+
+    /// Builds a demux session that mirrors the host configuration's
+    /// session-only settings. Everything a `URLRequest` can express is
+    /// deliberately NOT set here — it travels per request, so one session can
+    /// still serve many requests that differ only in those.
+    private static func makeDedicatedDemux(mirroring settings: DemuxTransportSettings)
+        -> QNSURLSessionDemux {
+        isBuildingOwnConfiguration = true
+        defer { isBuildingOwnConfiguration = false }
+        let config = URLSessionConfiguration.default
+        // Same two load-bearing lines as `demuxOnce`, for the same reasons.
+        config.urlCache = nil
+        config.protocolClasses = [CustomHTTPProtocol.self]
+        // The host app's, not ours.
+        config.httpMaximumConnectionsPerHost = settings.httpMaximumConnectionsPerHost
+        config.httpCookieStorage = settings.httpCookieStorage
+        config.httpCookieAcceptPolicy = settings.httpCookieAcceptPolicy
+        config.urlCredentialStorage = settings.urlCredentialStorage
+        return QNSURLSessionDemux(configuration: config)
+    }
+
+    /// Applies the originating configuration's transport settings to the request
+    /// SwiftyDebug is about to issue.
+    ///
+    /// Pure, so the whole table is testable without CFNetwork. Each line answers
+    /// a setting the host app chose and the demux session would otherwise
+    /// silently replace:
+    ///
+    ///  • cookies — an app that sets `httpShouldSetCookies = false`, or that uses
+    ///    a private per-account jar we could not give the request a session for,
+    ///    must not have the SHARED jar's `Cookie` put on the wire. Both collapse
+    ///    to "switch cookie handling off for this request".
+    ///  • cellular — `allowsCellularAccess = false` is usually a user-visible
+    ///    "Wi-Fi only" setting. AND-ed, so neither side can turn it back on.
+    ///  • pipelining — OR-ed, matching CFNetwork's own rule that either the
+    ///    session or the request can ask for it.
+    ///  • cache policy — a request that inherits its policy from the session
+    ///    reports `.useProtocolCachePolicy`, so the session's real policy has to
+    ///    be written onto the request or the app's choice is lost. See
+    ///    `effectiveCachePolicy(request:session:)`.
+    static func upstreamRequest(_ request: URLRequest,
+                                hostSettings: DemuxTransportSettings?,
+                                sessionSharesHostCookieStorage: Bool) -> URLRequest {
+        guard let hostSettings else { return request }
+        var result = request
+        let cookieJarIsUsable = sessionSharesHostCookieStorage && hostSettings.httpCookieStorage != nil
+        result.httpShouldHandleCookies =
+            request.httpShouldHandleCookies && hostSettings.httpShouldSetCookies && cookieJarIsUsable
+        result.allowsCellularAccess = request.allowsCellularAccess && hostSettings.allowsCellularAccess
+        result.httpShouldUsePipelining =
+            request.httpShouldUsePipelining || hostSettings.httpShouldUsePipelining
+        result.cachePolicy = effectiveCachePolicy(request: request.cachePolicy,
+                                                  session: hostSettings.requestCachePolicy)
+        return result
+    }
+
+    /// The cache policy that actually governs a request.
+    ///
+    /// `.useProtocolCachePolicy` on a `URLRequest` means "I did not choose one" —
+    /// it is the value a request reports when its policy comes from the session.
+    /// Reading only the request therefore misses `URLSessionConfiguration
+    /// .requestCachePolicy` entirely, which is how most apps set it, and the
+    /// `URLCache` read in `startLoading` never fired for them.
+    static func effectiveCachePolicy(request: URLRequest.CachePolicy,
+                                     session: URLRequest.CachePolicy?) -> URLRequest.CachePolicy {
+        guard request == .useProtocolCachePolicy, let session else { return request }
+        return session
+    }
+
+    /// Test hook: drops the per-signature sessions so one test's host
+    /// configuration cannot decide another test's routing.
+    static func resetDedicatedDemuxesForTesting() {
+        dedicatedDemuxLock.lock()
+        defer { dedicatedDemuxLock.unlock() }
+        dedicatedDemuxes.removeAll()
+    }
+
+    static var dedicatedDemuxCountForTesting: Int {
+        dedicatedDemuxLock.lock()
+        defer { dedicatedDemuxLock.unlock() }
+        return dedicatedDemuxes.count
     }
 
     // MARK: Session configuration swizzling
@@ -233,12 +520,11 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                     let original = unsafeBitCast(orig_protocolClassesGetter!, to: ProtocolClassesGetterFunc.self)
                     let result = original(configObj, protocolClassesSel)
                     let classes = (result as? [AnyClass]) ?? []
-                    let protoCls: AnyClass = CustomHTTPProtocol.self
-                    if classes.contains(where: { $0 == protoCls }) {
+                    // Behind the host app's own protocols, ahead of the system's.
+                    // See `protocolClassesInserting(_:into:)`.
+                    guard let mutable = protocolClassesInserting(CustomHTTPProtocol.self, into: classes) else {
                         return result
                     }
-                    var mutable = classes
-                    mutable.insert(protoCls, at: 0)
                     return mutable as NSArray
                 }
 
@@ -355,19 +641,67 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         timeoutDecisionLock.unlock()
     }
 
-    /// Injects `CustomHTTPProtocol` at the front of the given configuration's `protocolClasses`.
+    // MARK: - Where SwiftyDebug sits in `protocolClasses`
+
+    /// True for a `URLProtocol` subclass that ships with the system — CFNetwork's
+    /// `_NSURLHTTPProtocol` and friends — as opposed to one the host app
+    /// registered itself.
+    ///
+    /// The test has to be made at runtime against the defining bundle: the class
+    /// names are private and undocumented, but `com.apple.CFNetwork` is stable.
+    /// A class defined in the main bundle is the app's own by definition, so it
+    /// is checked first and never counts as the system's.
+    static func isSystemProvidedProtocolClass(_ cls: AnyClass) -> Bool {
+        let bundle = Bundle(for: cls)
+        guard bundle != Bundle.main else { return false }
+        return bundle.bundleIdentifier?.hasPrefix("com.apple.") == true
+    }
+
+    /// `classes` with SwiftyDebug inserted at the one position that is both
+    /// correct and polite — or nil when it is already present, meaning "leave
+    /// the array alone".
+    ///
+    /// NOT index 0, and NOT the end.
+    ///
+    /// **Index 0** — what this used to do — pre-empts the host app's OWN
+    /// `URLProtocol`s. OHHTTPStubs, Mocker and hand-rolled offline layers all
+    /// register at index 0 expecting to win, so jumping ahead of them meant
+    /// their stubs never fired and a request the test believed was stubbed
+    /// silently went to the live network, with no opt-out.
+    ///
+    /// **The end** is not the answer either, and this is the trap in "just
+    /// append": a stock `URLSessionConfiguration.default` already lists
+    /// CFNetwork's `_NSURLHTTPProtocol` FIRST, and it claims every http/https
+    /// request. Appending parks SwiftyDebug behind it, where `canInit` is never
+    /// called and the SDK captures nothing at all.
+    ///
+    /// So: after every protocol the host app registered, immediately before the
+    /// first system-provided one.
+    static func protocolClassesInserting(_ protoCls: AnyClass,
+                                         into classes: [AnyClass]) -> [AnyClass]? {
+        guard !classes.contains(where: { $0 == protoCls }) else { return nil }
+        var result = classes
+        let index = classes.firstIndex(where: { isSystemProvidedProtocolClass($0) }) ?? classes.count
+        result.insert(protoCls, at: index)
+        return result
+    }
+
+    /// Injects `CustomHTTPProtocol` into the given configuration's
+    /// `protocolClasses`, behind the host app's own protocols and ahead of the
+    /// system's — see `protocolClassesInserting(_:into:)`.
     ///
     /// `internal` rather than `private` only so the timeout bookkeeping below can
     /// be unit-tested without standing up CFNetwork.
     class func injectProtocol(into config: URLSessionConfiguration) {
         if config.responds(to: #selector(getter: URLSessionConfiguration.protocolClasses)),
            config.responds(to: #selector(setter: URLSessionConfiguration.protocolClasses)) {
-            var urlProtocolClasses = config.protocolClasses ?? []
-            let protoCls: AnyClass = CustomHTTPProtocol.self
-            if !urlProtocolClasses.contains(where: { $0 == protoCls }) {
-                urlProtocolClasses.insert(protoCls, at: 0)
-            }
-            config.protocolClasses = urlProtocolClasses
+            let current = config.protocolClasses ?? []
+            // Written back even when SwiftyDebug is already listed: with the
+            // `protocolClasses` getter swizzled, a read can include us while the
+            // config's own storage does not, and URLSession copies the storage.
+            // That unconditional write is pre-existing behaviour — only the
+            // insertion POSITION changed here.
+            config.protocolClasses = protocolClassesInserting(CustomHTTPProtocol.self, into: current) ?? current
         }
         // Covers configs the app never assigns a timeout to (the setter swizzle
         // covers the ones it does).
@@ -402,6 +736,11 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     @objc var pendingChallenge: URLAuthenticationChallenge?
     private var pendingChallengeCompletionHandler: ((URLSession.AuthChallengeDisposition, URLCredential?) -> Void)?
     private var response: URLResponse?
+    /// The transport settings of the session the HOST APP issued this request on,
+    /// read once in `startLoading` and mirrored onto the request SwiftyDebug
+    /// re-issues. nil when the originating session could not be reached — every
+    /// use degrades to today's behaviour. See `hostTransportSettings(for:)`.
+    private var hostTransportSettings: DemuxTransportSettings?
     private var data: NSMutableData?
     private var error: Error?
     private var responseTruncated: Bool = false
@@ -604,6 +943,53 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         return components.url
     }
 
+    // MARK: - The host app's URLCache (see MAJOR 3)
+
+    /// What to do with the cached entry the URL loading system handed this
+    /// protocol.
+    enum CachedResponseDisposition: Equatable {
+        /// Go upstream, as always.
+        case load
+        /// Answer from `cachedResponse` without touching the network.
+        case serveFromCache
+        /// The app asked for cache-only and there is nothing cached. Fail,
+        /// rather than quietly doing the one thing the policy forbids.
+        case failCacheOnlyMiss
+    }
+
+    /// Decides whether a request can be answered from the host app's cache.
+    /// Pure, so the policy table is testable without CFNetwork or a URLCache.
+    ///
+    /// Only the two policies that name the cache *explicitly* are honoured here.
+    /// `.useProtocolCachePolicy` deliberately still loads: deciding whether a
+    /// stored entry is fresh is HTTP revalidation, which CFNetwork does on the
+    /// upstream leg and SwiftyDebug must not attempt to re-implement. Serving a
+    /// stale body because the SDK guessed wrong would be a worse bug than the
+    /// extra request.
+    ///
+    /// An armed breakpoint also forces `.load`. The developer asked to intervene
+    /// in a network exchange; silently short-circuiting to cache would mean the
+    /// pause they armed never fires and nothing anywhere says why.
+    /// `ruleChangesTheRequest` covers every rule that alters WHAT would be
+    /// fetched — a redirect, or a query-param edit. Serving the cache short-
+    /// circuits the network, so an armed redirect silently never happens and the
+    /// list still shows the redirect target as though it had. Only a rule that
+    /// merely observes (or edits the response) can safely be served from cache.
+    static func cachedResponseDisposition(policy: URLRequest.CachePolicy,
+                                          hasCachedResponse: Bool,
+                                          breakpointMode: BreakpointMode,
+                                          ruleChangesTheRequest: Bool = false) -> CachedResponseDisposition {
+        guard breakpointMode == .off, !ruleChangesTheRequest else { return .load }
+        switch policy {
+        case .returnCacheDataDontLoad:
+            return hasCachedResponse ? .serveFromCache : .failCacheOnlyMiss
+        case .returnCacheDataElseLoad:
+            return hasCachedResponse ? .serveFromCache : .load
+        default:
+            return .load
+        }
+    }
+
     override func startLoading() {
         // At this point we kick off the process of loading the URL via NSURLSession.
         // The thread that calls this method becomes the client thread.
@@ -628,6 +1014,12 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         self.data = NSMutableData()
         // Latch the thread we were called on, primarily for debugging purposes.
         self.clientThread = Thread.current
+
+        // Read the ORIGINATING session's transport settings before anything else
+        // touches the request. Everything downstream — the URLCache decision, the
+        // session the request is re-issued on, the request itself — has to mirror
+        // the app's own configuration rather than impose the demux session's.
+        self.hostTransportSettings = Self.hostTransportSettings(for: self.task)
 
         // Create new request that's a clone of the request we were initialised with,
         // except that it has our 'recursive request flag' property set on it.
@@ -749,6 +1141,51 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             return
         }
 
+        // --- The host app's URLCache. ---
+        // The loading system already looked the request up and handed us the
+        // entry as `self.cachedResponse`; using it is the protocol's job, and
+        // this protocol used to ignore it completely while ALSO forcing
+        // `.reloadIgnoringLocalCacheData` on the demux session. Between them,
+        // linking SwiftyDebug turned every cache hit into a network round trip
+        // and made `.returnCacheDataDontLoad` — the offline read — impossible to
+        // satisfy. The forced policy is gone (see `demuxOnce`); this restores
+        // the read.
+        let rule = self.resolvedRule
+        let ruleChangesTheRequest = (rule?.redirectMode ?? .none) != .none
+            || !(rule?.queryParamOverrides.isEmpty ?? true)
+            || !(rule?.removedQueryParamKeys.isEmpty ?? true)
+        //
+        // The policy is read through `effectiveCachePolicy`, NOT straight off the
+        // request: a request whose policy comes from the session reports
+        // `.useProtocolCachePolicy`, so reading only the request meant the cache
+        // was never consulted for the most common way of configuring one —
+        // `URLSessionConfiguration.requestCachePolicy`.
+        let effectivePolicy = Self.effectiveCachePolicy(
+            request: (recursiveRequest as URLRequest).cachePolicy,
+            session: self.hostTransportSettings?.requestCachePolicy)
+        switch Self.cachedResponseDisposition(policy: effectivePolicy,
+                                              hasCachedResponse: self.cachedResponse != nil,
+                                              breakpointMode: rule?.breakpointMode ?? .off,
+                                              ruleChangesTheRequest: ruleChangesTheRequest) {
+        case .load:
+            break
+        case .serveFromCache:
+            if let cached = self.cachedResponse {
+                deliverCachedResponse(cached)
+                return
+            }
+        case .failCacheOnlyMiss:
+            // What CFNetwork itself returns for a `.returnCacheDataDontLoad`
+            // miss. Going to the network instead would defeat the whole point
+            // of the policy.
+            self.client?.urlProtocol(self, didFailWithError: NSError(
+                domain: NSURLErrorDomain,
+                code: NSURLErrorResourceUnavailable,
+                userInfo: [NSLocalizedDescriptionKey:
+                            "The request requires cached data, which is not available."]))
+            return
+        }
+
         // --- Breakpoint (before send): park the request for editing. ---
         if self.resolvedRule?.breakpointMode == .beforeSend {
             let paused = BreakpointCenter.PausedRequest(
@@ -757,7 +1194,16 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                 resume: { [weak self] edited in
                     // Continue with whatever the developer changed.
                     self?.performOnThread(self?.clientThread, modes: self?.modes) {
-                        self?.sendUpstream(edited.request)
+                        guard let self else { return }
+                        // The captured transaction has to describe what actually
+                        // went on the wire. Both of these were latched in
+                        // `startLoading`, BEFORE the developer edited the parked
+                        // request, so leaving them would show the Network list —
+                        // and the cURL command copied from it — a method, URL,
+                        // headers and body that were never sent.
+                        self.interceptedRequest = edited.request
+                        self.capturedRequestBody = edited.request.httpBody
+                        self.sendUpstream(edited.request)
                     }
                 },
                 abort: { [weak self] in
@@ -780,8 +1226,19 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     /// Actually issues the (possibly breakpoint-edited) request upstream,
     /// honoring the network-conditioner latency.
     private func sendUpstream(_ request: URLRequest) {
-        self._dataTask = type(of: self).sharedDemux().dataTask(
-            with: request,
+        // MIRROR, do not impose. The session below is SwiftyDebug's, but the
+        // request is the host app's, so the app's transport settings have to be
+        // carried across the hand-off: the ones a URLRequest can express travel
+        // on the request, the ones only a session can express decide WHICH demux
+        // session it goes to. See `resolveDemux(for:)`.
+        let routing = Self.resolveDemux(for: self.hostTransportSettings)
+        let outbound = Self.upstreamRequest(
+            request,
+            hostSettings: self.hostTransportSettings,
+            sessionSharesHostCookieStorage: routing.sessionSharesHostCookieStorage)
+
+        self._dataTask = routing.demux.dataTask(
+            with: outbound,
             delegate: self,
             modes: self.modes
         )
@@ -798,6 +1255,16 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             self._dataTask?.resume()
         }
     }
+
+    /// Test hook: the task SwiftyDebug actually handed to a demux session.
+    ///
+    /// Tests assert against THIS rather than against the pure functions that
+    /// build it, so that reverting the wiring in `sendUpstream` — not just the
+    /// table in `upstreamRequest` — is what makes them fail. `originatingSession`
+    /// turns it back into the session it was issued on, which is the only place
+    /// the settings a `URLRequest` cannot express (the connection cap, the cookie
+    /// jar) are observable.
+    var upstreamTaskForTesting: URLSessionDataTask? { _dataTask }
 
     /// Synthesizes a response from a mock rule and hands it to the client without
     /// any network access. (See MOCK.)
@@ -821,6 +1288,17 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                              + "Edit the mock body instead.")
         }
 
+        // Same conflict, one step earlier: a mock answers without touching the
+        // network, so an armed breakpoint on the same rule can never pause
+        // anything — `startLoading` returns here before it parks, and the
+        // `.afterResponse` stage has no server exchange to hold at all. That was
+        // silent: the developer armed a breakpoint, triggered the request, and
+        // the inbox stayed empty with nothing anywhere saying why. Say it in the
+        // DIDN'T PAUSE section of the inbox they are staring at.
+        if let mode = resolvedRule?.breakpointMode, mode != .off {
+            BreakpointCenter.shared.note(Self.mockPreemptedBreakpointMessage(mode), for: request.url)
+        }
+
         let deliver = { [weak self] in
             guard let self, let response else { return }
             self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -837,6 +1315,51 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         } else {
             deliver()
         }
+    }
+
+    /// Why an armed breakpoint never paused a request a mock answered. Pure and
+    /// `static` so the wording is pinned by tests — this sentence IS the fix, so
+    /// it has to survive refactoring.
+    ///
+    /// Worded for a mock from either source (the rule's own or an active mock
+    /// profile), because both short-circuit the same way.
+    static func mockPreemptedBreakpointMessage(_ mode: BreakpointMode) -> String {
+        switch mode {
+        case .off:
+            return ""
+        case .beforeSend:
+            return "A mock answered this request without touching the network, so the "
+                 + "\u{201C}before send\u{201D} breakpoint never paused it. "
+                 + "Switch the mock off to pause the real request."
+        case .afterResponse:
+            return "A mock answered this request without touching the network, so there was no "
+                 + "server response to pause and the \u{201C}after response\u{201D} breakpoint "
+                 + "was skipped. Edit the mock body instead."
+        }
+    }
+
+    /// Answers the request from the entry the URL loading system found in the
+    /// host app's `URLCache`, with no network access.
+    ///
+    /// The cached response is replayed byte-for-byte, and `.notAllowed` is used
+    /// for the storage policy because it is already stored — re-storing what we
+    /// just read is how a cached entry gets its lifetime silently extended.
+    private func deliverCachedResponse(_ cached: CachedURLResponse) {
+        self.response = cached.response
+        self.data = NSMutableData(data: cached.data)
+
+        // A rewrite armed on a URL that answers from cache would otherwise do
+        // nothing at all, with nothing to read anywhere — the same silent no-op
+        // the mock path reports, for the same reason.
+        if resolvedRule?.hasActiveResponseRewrites == true {
+            self.rewriteReport = RewriteReport(
+                skippedReason: "This response was served from the app's URLCache without a "
+                             + "network request, so response rewrites were skipped.")
+        }
+
+        client?.urlProtocol(self, didReceive: cached.response, cacheStoragePolicy: .notAllowed)
+        if !cached.data.isEmpty { client?.urlProtocol(self, didLoad: cached.data) }
+        client?.urlProtocolDidFinishLoading(self)
     }
 
     override func stopLoading() {

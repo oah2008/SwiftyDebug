@@ -47,16 +47,37 @@ final class JSONEditorViewController: UIViewController {
     private let document: JSONDocument
     private let editorTitle: String
 
-    init(document: JSONDocument, title: String = "Edit JSON") {
+    /// Set when this editor was opened on text that is **not** JSON — a paused
+    /// HTML response, a form body, a stack trace. `JSONDocument` cannot hold it,
+    /// so the editor opens in Raw showing these exact bytes.
+    ///
+    /// The old fallback to `JSONDocument.empty()` meant opening such a body
+    /// replaced it with `{}` before a single key was touched, and Save then
+    /// handed the host app `{}` in place of the real payload. An empty object is
+    /// never a safe stand-in for someone's data.
+    private let unparsedText: String?
+
+    private init(document: JSONDocument, unparsedText: String?, title: String) {
         self.document = document
+        self.unparsedText = unparsedText
         self.editorTitle = title
         super.init(nibName: nil, bundle: nil)
     }
 
-    /// Convenience: start from text (invalid/empty text starts an empty object).
+    convenience init(document: JSONDocument, title: String = "Edit JSON") {
+        self.init(document: document, unparsedText: nil, title: title)
+    }
+
+    /// Convenience: start from text. Empty or absent text starts an empty object
+    /// ("type my own"); text that is real but isn't JSON is kept verbatim and
+    /// opened in Raw.
     convenience init(text: String?, title: String = "Edit JSON") {
-        let doc = text.flatMap { JSONDocument(text: $0) } ?? JSONDocument.empty()
-        self.init(document: doc, title: title)
+        if let text, let parsed = JSONDocument(text: text) {
+            self.init(document: parsed, unparsedText: nil, title: title)
+            return
+        }
+        let isBlank = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        self.init(document: .empty(), unparsedText: isBlank ? nil : text, title: title)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -139,6 +160,7 @@ final class JSONEditorViewController: UIViewController {
         setupStatusBar()
         setupToolbar()
         layout()
+        showUnparsedTextIfAny()
 
         document.onChange = { [weak self] in
             self?.documentChanged()
@@ -157,6 +179,19 @@ final class JSONEditorViewController: UIViewController {
     }
 
     // MARK: - Setup
+
+    /// A body the tree cannot represent opens in Raw, holding the original text.
+    /// Tree stays reachable but `modeChanged` refuses it (with the parse error)
+    /// until the text is valid, and `saveTapped` refuses for the same reason —
+    /// so the app is never handed a document that isn't what's on screen.
+    private func showUnparsedTextIfAny() {
+        guard let unparsedText else { return }
+        mode = .raw
+        modeControl.selectedSegmentIndex = Mode.raw.rawValue
+        rawTextView.text = unparsedText
+        tableView.isHidden = true
+        rawTextView.isHidden = false
+    }
 
     private func setupModeControl() {
         modeControl.selectedSegmentIndex = 0
@@ -453,7 +488,9 @@ final class JSONEditorViewController: UIViewController {
         // backspace, tap elsewhere" silently destroy a value — discard instead.
         if kind == .number {
             let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard Int(trimmed) != nil || Double(trimmed) != nil else { return false }
+            // Same hole as the rewrite engine: Double("inf") succeeds and then
+            // coerces to 0. The coder returns nil for every non-finite spelling.
+            guard JSONInlineValueCoder.number(from: trimmed) != nil else { return false }
         }
         // A no-op write would still push an undo entry.
         guard !JSONInlineValueCoder.isUnchanged(draft: draft, current: document.value(at: path)) else {
@@ -552,12 +589,53 @@ final class JSONEditorViewController: UIViewController {
         }
     }
 
+    // MARK: - Raw text ↔ document
+
+    /// What happened when an action tried to fold the Raw text view into the
+    /// document.
+    private enum RawCommit { case notNeeded, committed, doesNotParse }
+
+    /// In Raw mode the text view is the truth on screen and `document` is one
+    /// step behind — nothing writes the text back until you switch mode or Save.
+    /// Every toolbar action works on `document` and then re-renders it into the
+    /// text view, so without this each of them silently destroyed everything
+    /// typed since the last sync.
+    @discardableResult
+    private func commitRawText() -> RawCommit {
+        guard mode == .raw, rawTextView.text != document.prettyText() else { return .notNeeded }
+        guard let parsed = JSONDocument(text: rawTextView.text) else { return .doesNotParse }
+        // Goes through the document, so it lands on the undo stack: the typing is
+        // recoverable rather than replaced.
+        document.setValue(parsed.root, at: [])
+        return .committed
+    }
+
+    /// Refusing is the only alternative to throwing text away that cannot be
+    /// folded in. Say which action stopped and why.
+    private func refuseRawAction(_ action: String) {
+        let reason = JSONDocument.validate(rawTextView.text).error ?? "The text isn't valid JSON."
+        showAlert("Invalid JSON",
+                  "\(reason)\n\n\(action) works on the document, so running it would replace what you typed. Your text is untouched — fix the JSON first.")
+    }
+
     // MARK: - Toolbar actions
 
     // Every mutating action commits the inline draft first: each of these
-    // reloads or replaces the tree, which would otherwise strand the edit.
-    @objc private func undoTapped() { commitInlineEdit(); document.undo() }
-    @objc private func redoTapped() { commitInlineEdit(); document.redo() }
+    // reloads or replaces the tree, which would otherwise strand the edit. In
+    // Raw mode the text view is committed for the same reason.
+    @objc private func undoTapped() {
+        commitInlineEdit()
+        guard commitRawText() != .doesNotParse else { refuseRawAction("Undo"); return }
+        document.undo()
+    }
+
+    @objc private func redoTapped() {
+        commitInlineEdit()
+        // Committing clears the redo stack, exactly as typing does in any editor:
+        // the typed text becomes the newest state instead of being discarded.
+        guard commitRawText() != .doesNotParse else { refuseRawAction("Redo"); return }
+        document.redo()
+    }
 
     @objc private func formatTapped() {
         commitInlineEdit()
@@ -586,9 +664,15 @@ final class JSONEditorViewController: UIViewController {
             showAlert("Clipboard isn't JSON", JSONDocument.validate(text).error ?? "Could not parse the clipboard.")
             return
         }
+        // Fold the Raw text in first, so "you can undo" is true of what is on
+        // screen. Text that doesn't parse can't go on the undo stack — say it
+        // will be lost rather than dropping it without a word.
+        let losesTypedText = (commitRawText() == .doesNotParse)
         let confirm = UIAlertController(
             title: "Replace with clipboard?",
-            message: "This replaces the whole document with the JSON on your clipboard. You can undo.",
+            message: losesTypedText
+                ? "This replaces the whole document with the JSON on your clipboard.\n\nThe text you typed isn't valid JSON, so it can't go on the undo stack — it will be lost."
+                : "This replaces the whole document with the JSON on your clipboard. You can undo.",
             preferredStyle: .alert)
         confirm.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         confirm.addAction(UIAlertAction(title: "Replace", style: .destructive) { [weak self] _ in
@@ -602,6 +686,9 @@ final class JSONEditorViewController: UIViewController {
     /// Adds a child to the root container.
     @objc private func addRootChildTapped() {
         commitInlineEdit()
+        // Without this the new key lands in the document you can't see, and the
+        // moment the prompt is answered everything typed in Raw is gone.
+        guard commitRawText() != .doesNotParse else { refuseRawAction("Add"); return }
         addChild(toContainerAt: [])
     }
 

@@ -240,14 +240,37 @@ enum EndpointMatchMode: String, Codable {
 /// with later rules overriding earlier ones for the same keys.
 struct InterceptRule: Codable {
     let id: String
-    /// The key used for storage lookup.
+    /// What this rule matches against.
     /// For `.normalized` / `.exact` modes: the endpoint path.
     /// For `.host` mode: a canonical key like `host:a.com,b.com`.
-    let matchEndpoint: String
+    /// For `.global`: the literal `"global"`.
+    ///
+    /// **`var`, deliberately.** It used to be `let`, and that single word was the
+    /// root of "exact rules override each other": the editor does
+    /// `rule = existingRule ?? InterceptRule(...)`, so editing a rule and
+    /// switching its scope from Pattern to Exact changed `matchMode` but left
+    /// `matchEndpoint` holding the *normalized* pattern. The rule was then filed
+    /// as exact under `/product/{id}/{id}`, which no real request path ever
+    /// equals — every such rule landed in the same bucket and none of them
+    /// matched anything. See `storageKey` for the other half of the fix.
+    var matchEndpoint: String
     /// How the rule matches incoming requests.
     var matchMode: EndpointMatchMode
     /// Hosts this rule applies to (only used when `matchMode == .host`).
     var matchHosts: [String]
+    /// Host an **endpoint** rule (`.exact` / `.normalized`) is pinned to, e.g.
+    /// `"api.example.com"`. Empty means *any host*.
+    ///
+    /// Empty is the backward-compatible default on purpose: `.exact` and
+    /// `.normalized` have always matched on path alone, so every rule already on
+    /// a device decodes with no pin and keeps behaving exactly as it did. Only a
+    /// rule the user explicitly pins to a host gains the host check.
+    ///
+    /// Unused by `.host` (which has `matchHosts`) and `.global`; `canonicalized()`
+    /// clears it for those modes so it can never quietly change their key.
+    var matchHost: String
+    /// User-given name. Empty means "describe yourself" — see `displayName`.
+    var name: String
     var isBlocked: Bool
     var headerOverrides: [KVPair]
     var queryParamOverrides: [KVPair]
@@ -282,6 +305,8 @@ struct InterceptRule: Codable {
         self.matchEndpoint = matchEndpoint
         self.matchMode = matchMode
         self.matchHosts = []
+        self.matchHost = ""
+        self.name = ""
         self.isBlocked = false
         self.headerOverrides = []
         self.queryParamOverrides = []
@@ -365,16 +390,179 @@ struct InterceptRule: Codable {
 
     /// Convenience initializer for host-based rules.
     static func hostRule(hosts: [String]) -> InterceptRule {
-        let sorted = hosts.map { $0.lowercased() }.sorted()
-        let key = "host:" + sorted.joined(separator: ",")
-        var rule = InterceptRule(matchEndpoint: key, matchMode: .host)
+        let sorted = Self.canonicalHosts(hosts)
+        var rule = InterceptRule(matchEndpoint: Self.hostKey(for: sorted), matchMode: .host)
         rule.matchHosts = sorted
         return rule
     }
 
+    /// The one way to build an endpoint-scoped (`.exact` / `.normalized`) rule.
+    ///
+    /// Use this rather than `init(matchEndpoint:matchMode:)` when a host pin is
+    /// involved: it lowercases and trims the host and guarantees the rule's
+    /// `storageKey` agrees with its scope.
+    ///
+    /// - Parameters:
+    ///   - path: the request path — the FULL path for `.exact`
+    ///     (`/product/10289032912/20920220`), the normalizer's output for
+    ///     `.normalized` (`/product/{id}/{id}`).
+    ///   - mode: `.exact` or `.normalized`. Anything else is a programmer error
+    ///     and is coerced to `.normalized`.
+    ///   - host: the host to pin to, or `nil` / `""` for **any host** (the
+    ///     behaviour every pre-existing rule has).
+    static func endpointRule(path: String,
+                             mode: EndpointMatchMode = .normalized,
+                             host: String? = nil) -> InterceptRule {
+        let safeMode: EndpointMatchMode = (mode == .exact) ? .exact : .normalized
+        var rule = InterceptRule(matchEndpoint: path, matchMode: safeMode)
+        rule.matchHost = Self.canonicalHost(host ?? "")
+        return rule
+    }
+
+    // MARK: - Storage key
+
+    /// Stands in for a host pin of "any host" inside `storageKey`.
+    /// `*` is not a legal host, so it can never collide with a real one.
+    static let anyHostToken = "*"
+
+    /// A separator no URL path, host or pattern can contain, so a key can never
+    /// be forged by ordinary content.
+    private static let keySeparator = "\u{1}"
+
+    /// The key `InterceptRuleStore` files this rule under.
+    ///
+    /// DERIVED, never persisted — `rules.json` is a flat array of rules, so the
+    /// store's bucketing is pure in-memory state and changing this scheme needs
+    /// no on-disk migration at all.
+    ///
+    /// Two things this fixes, both reported as "exact rules override each other":
+    ///
+    /// 1. The mode is part of the key, so an `.exact` rule and a `.normalized`
+    ///    rule can never share a bucket. They used to: a path with no ids
+    ///    normalizes to itself, so `/api/users` exact and `/api/users` pattern
+    ///    were the same dictionary key, and `rules(for:).first { $0.matchMode == mode }`
+    ///    could hand back the wrong one.
+    /// 2. The host pin is part of the key, so `/cart` on `a.com` and `/cart` on
+    ///    `b.com` are separate rules that each apply only to their own host.
+    ///
+    /// Distinct full paths were already distinct keys and still are:
+    /// `/product/1/2` and `/product/3/4` coexist and never see each other's edits.
+    var storageKey: String {
+        switch matchMode {
+        case .global:
+            return "global"
+        case .host:
+            return Self.hostKey(for: Self.canonicalHosts(matchHosts))
+        case .exact, .normalized:
+            return Self.endpointKey(mode: matchMode, host: matchHost, endpoint: matchEndpoint)
+        }
+    }
+
+    /// Builds the storage key for an endpoint rule without needing a rule.
+    /// The store probes with this, so lookup and storage can never disagree.
+    static func endpointKey(mode: EndpointMatchMode, host: String, endpoint: String) -> String {
+        let pin = canonicalHost(host)
+        let hostPart = pin.isEmpty ? anyHostToken : pin
+        return mode.rawValue + keySeparator + hostPart + keySeparator + endpoint
+    }
+
+    /// Builds the storage key for a host rule. Hosts must already be canonical.
+    static func hostKey(for hosts: [String]) -> String {
+        return "host:" + hosts.joined(separator: ",")
+    }
+
+    static func canonicalHost(_ host: String) -> String {
+        host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    static func canonicalHosts(_ hosts: [String]) -> [String] {
+        var seen = Set<String>()
+        return hosts.map { canonicalHost($0) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+            .sorted()
+    }
+
+    /// True when this rule's host pin lets `url` through.
+    ///
+    /// Always true for a rule with no pin — that is every rule written before
+    /// `matchHost` existed — and for `.host` / `.global`, whose host handling
+    /// lives in `matchHosts` and "everything" respectively.
+    ///
+    /// The store does not need this (the pin is baked into `storageKey`), but the
+    /// WKWebView JS bridge matches rules by hand and does, so it lives here where
+    /// both can see the same definition.
+    func hostPinAllows(_ url: URL) -> Bool {
+        guard matchMode == .exact || matchMode == .normalized else { return true }
+        let pin = Self.canonicalHost(matchHost)
+        guard !pin.isEmpty else { return true }
+        return Self.canonicalHost(url.host ?? "") == pin
+    }
+
+    /// True when this endpoint rule applies to every host (the legacy behaviour).
+    var appliesToAnyHost: Bool {
+        switch matchMode {
+        case .exact, .normalized: return Self.canonicalHost(matchHost).isEmpty
+        case .host, .global:      return false
+        }
+    }
+
+    // MARK: - Canonicalization / migration
+
+    /// A copy whose `matchEndpoint`, `matchHosts` and `matchHost` agree with its
+    /// `matchMode`, so its `storageKey` is the one lookup will probe.
+    ///
+    /// Applied on the way into the store — both on load and on every write — so a
+    /// rule that arrives mis-keyed (hand-edited export, an older build's editor
+    /// bug, an import) is repaired instead of being stored somewhere lookup never
+    /// looks. A rule filed under a key nothing probes is invisible AND inert,
+    /// which is the worst failure this file can have.
+    ///
+    /// The one behaviour change it makes is deliberate and narrow: an `.exact`
+    /// rule whose endpoint is literally a normalizer *output* (`/product/{id}/{id}`)
+    /// is re-filed as `.normalized`. Such a rule can never match — no real
+    /// `url.path` contains `{id}` — so it is provably doing nothing today, and
+    /// "pattern" is the only reading under which the user's rule works at all.
+    /// It is exactly what the old editor produced when you opened a pattern rule
+    /// and tapped Exact.
+    func canonicalized() -> InterceptRule {
+        var copy = self
+        switch matchMode {
+        case .global:
+            copy.matchEndpoint = "global"
+            copy.matchHosts = []
+            copy.matchHost = ""
+        case .host:
+            var hosts = Self.canonicalHosts(matchHosts)
+            if hosts.isEmpty, matchEndpoint.hasPrefix("host:") {
+                // Recover the hosts from the key when only the key survived.
+                hosts = Self.canonicalHosts(
+                    String(matchEndpoint.dropFirst("host:".count)).components(separatedBy: ",")
+                )
+            }
+            copy.matchHosts = hosts
+            copy.matchEndpoint = Self.hostKey(for: hosts)
+            copy.matchHost = ""
+        case .exact:
+            copy.matchHost = Self.canonicalHost(matchHost)
+            copy.matchHosts = []
+            if Self.looksLikeNormalizerOutput(matchEndpoint) { copy.matchMode = .normalized }
+        case .normalized:
+            copy.matchHost = Self.canonicalHost(matchHost)
+            copy.matchHosts = []
+        }
+        return copy
+    }
+
+    /// True for a path that the normalizer produced and that therefore cannot be
+    /// a literal request path: it contains `{id}` and normalizing it is a no-op.
+    static func looksLikeNormalizerOutput(_ endpoint: String) -> Bool {
+        guard endpoint.contains("{id}") else { return false }
+        return EndpointNormalizer.normalize(endpoint) == endpoint
+    }
+
     // Backward-compatible decoding.
     enum CodingKeys: String, CodingKey {
-        case id, normalizedEndpoint, matchEndpoint, matchMode, matchHosts, isBlocked
+        case id, normalizedEndpoint, matchEndpoint, matchMode, matchHosts, matchHost, name, isBlocked
         case headerOverrides, queryParamOverrides, removedHeaderKeys, removedQueryParamKeys
         case isEnabled, createdAt, order
         case redirectMode, redirectTarget
@@ -423,6 +611,14 @@ struct InterceptRule: Codable {
         // took whole rules (and then whole files) down.
         matchMode = lenient(c, EndpointMatchMode.self, .matchMode, .normalized)
         matchHosts = lenient(c, [String].self, .matchHosts, [])
+        // Absent on every rule already on a device. Empty = any host, which is
+        // what `.exact` / `.normalized` have always done, so an old rule decodes
+        // to exactly the behaviour it had. Lenient for the usual reason: a field
+        // nobody typed must never be able to take a whole rule down.
+        matchHost = lenient(c, String.self, .matchHost, "")
+        // Also absent on every existing rule; `displayName` derives one from what
+        // the rule does, so an unnamed rule is still identifiable in a list.
+        name = lenient(c, String.self, .name, "")
         isBlocked = try required(Bool.self, .isBlocked, false)
         // Element by element: one malformed pair loses that pair, not the list.
         headerOverrides = try required([LenientElement<KVPair>].self, .headerOverrides, [])
@@ -455,6 +651,8 @@ struct InterceptRule: Codable {
         try c.encode(matchEndpoint, forKey: .matchEndpoint)
         try c.encode(matchMode, forKey: .matchMode)
         try c.encode(matchHosts, forKey: .matchHosts)
+        try c.encode(matchHost, forKey: .matchHost)
+        try c.encode(name, forKey: .name)
         try c.encode(isBlocked, forKey: .isBlocked)
         try c.encode(headerOverrides, forKey: .headerOverrides)
         try c.encode(queryParamOverrides, forKey: .queryParamOverrides)
@@ -468,5 +666,122 @@ struct InterceptRule: Codable {
         try c.encode(mock, forKey: .mock)
         try c.encode(breakpointMode, forKey: .breakpointMode)
         try c.encode(responseRewrites, forKey: .responseRewrites)
+    }
+}
+
+// MARK: - Naming
+
+extension InterceptRule {
+
+    /// What to call this rule anywhere it is listed.
+    ///
+    /// The user's `name` when they gave one, otherwise `derivedName` — a
+    /// description built from what the rule actually does.
+    ///
+    /// This exists because the rule rows only ever counted headers and query
+    /// parameters, so a rule that ONLY mocked, ONLY held a breakpoint, ONLY
+    /// rewrote a response or ONLY redirected all displayed as "Empty rule" and
+    /// were indistinguishable from each other in a list.
+    var displayName: String {
+        let typed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return typed.isEmpty ? derivedName : typed
+    }
+
+    /// A name derived purely from this rule's own configuration.
+    ///
+    /// PURE — no store, no singletons, no I/O, no dates, no locale-dependent
+    /// formatting. Same rule in, same string out, so it is safe to call from
+    /// `cellForRowAt` and can be unit-tested exhaustively.
+    ///
+    ///     "Mock 404 · /product/{id}"
+    ///     "Breakpoint after response · api.example.com"
+    ///     "Rewrite data.url · /cart"
+    ///     "Blocked · /analytics"
+    ///     "3 headers · /product/{id}"
+    var derivedName: String {
+        let scope = scopeSummary
+        return scope.isEmpty ? armedSummary : armedSummary + " · " + scope
+    }
+
+    /// Everything this rule has actually ARMED, most decisive first, joined with
+    /// " + ". `"Empty rule"` when nothing is armed — that is the honest answer
+    /// and the editor refuses to save one.
+    ///
+    /// "Armed" means *would do something on the wire*: a redirect with a blank
+    /// target and a mock that is switched off are both left out, because naming
+    /// a rule after something it silently will not do is how a feature ships
+    /// inert without anyone noticing.
+    var armedSummary: String {
+        var parts: [String] = []
+
+        if isBlocked { parts.append("Blocked") }
+        if mock.isEnabled { parts.append("Mock \(mock.statusCode)") }
+
+        switch breakpointMode {
+        case .off:            break
+        case .beforeSend:     parts.append("Breakpoint before send")
+        case .afterResponse:  parts.append("Breakpoint after response")
+        }
+
+        let target = redirectTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        if redirectMode != .none, !target.isEmpty {
+            parts.append("Redirect \u{2192} " + target)
+        }
+
+        parts.append(contentsOf: rewriteSummaryParts)
+
+        let headerCount = headerOverrides.count + removedHeaderKeys.count
+        if headerCount > 0 {
+            parts.append("\(headerCount) header" + (headerCount == 1 ? "" : "s"))
+        }
+        let paramCount = queryParamOverrides.count + removedQueryParamKeys.count
+        if paramCount > 0 {
+            parts.append("\(paramCount) param" + (paramCount == 1 ? "" : "s"))
+        }
+
+        return parts.isEmpty ? "Empty rule" : parts.joined(separator: " + ")
+    }
+
+    /// One rewrite is named after itself ("Rewrite data.url"); several are
+    /// counted. Rewrites that are all switched OFF still get a part — with
+    /// "(off)" on it — because the alternative is a rule that visibly carries
+    /// rewrites being called "Empty rule".
+    private var rewriteSummaryParts: [String] {
+        guard !responseRewrites.isEmpty else { return [] }
+        let live = responseRewrites.filter { $0.isEnabled }
+        guard !live.isEmpty else {
+            let n = responseRewrites.count
+            return ["\(n) rewrite" + (n == 1 ? "" : "s") + " (off)"]
+        }
+        if live.count == 1 {
+            let label = Self.rewriteLabel(live[0])
+            return [label.isEmpty ? "1 rewrite" : "Rewrite " + label]
+        }
+        return ["\(live.count) rewrites"]
+    }
+
+    private static func rewriteLabel(_ rewrite: ResponseRewrite) -> String {
+        let named = rewrite.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !named.isEmpty { return named }
+        return rewrite.pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Where the rule applies, in the shortest form that is still unambiguous.
+    /// Empty when there is nothing worth saying, in which case `derivedName`
+    /// drops the separator rather than trailing a lonely " · ".
+    var scopeSummary: String {
+        switch matchMode {
+        case .global:
+            return "All requests"
+        case .host:
+            let hosts = Self.canonicalHosts(matchHosts)
+            return hosts.isEmpty ? "" : hosts.joined(separator: ", ")
+        case .exact, .normalized:
+            let pin = Self.canonicalHost(matchHost)
+            if pin.isEmpty { return matchEndpoint }
+            // Host-pinned: "api.example.com/cart" reads as one address, which is
+            // exactly what the rule now matches.
+            return matchEndpoint.isEmpty ? pin : pin + matchEndpoint
+        }
     }
 }

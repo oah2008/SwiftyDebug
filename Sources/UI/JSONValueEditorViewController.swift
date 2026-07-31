@@ -30,16 +30,34 @@ enum JSONInlineValueCoder {
         }
     }
 
+    /// The JSON number `text` spells, or nil when it does not spell one.
+    ///
+    /// `Double("inf")`, `Double("infinity")` and `Double("nan")` all succeed,
+    /// and JSON has no way to write any of them: handing one to a JSON writer
+    /// raises an **ObjC** exception that `try?` cannot catch, which terminates
+    /// the host app. Every caller that turns typed text into a number goes
+    /// through here so that cannot happen.
+    static func number(from text: String) -> NSNumber? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Keep integers as integers so they don't render as "1.0".
+        if let i = Int(trimmed) { return NSNumber(value: i) }
+        guard let d = Double(trimmed), d.isFinite else { return nil }
+        return NSNumber(value: d)
+    }
+
     /// Turns editor text back into a JSON value of `kind`.
+    ///
+    /// For `.number` this keeps the long-standing "unparseable becomes 0"
+    /// fallback, which is only reachable by a caller that skipped its own
+    /// check. Anything that must not substitute a number — the editors, the
+    /// rewrite engine — should call `number(from:)` and refuse on nil.
     static func value(from text: String, kind: JSONValueKind) -> Any {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         switch kind {
         case .string:
             return text
         case .number:
-            // Keep integers as integers so they don't render as "1.0".
-            if let i = Int(trimmed) { return NSNumber(value: i) }
-            return NSNumber(value: Double(trimmed) ?? 0)
+            return number(from: text) ?? NSNumber(value: 0)
         case .bool:
             return ["true", "1", "yes", "on"].contains(trimmed.lowercased())
         case .null:
@@ -286,7 +304,7 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
         case .number:
             textView.isHidden = false; boolRow.isHidden = true
             textView.keyboardType = .numbersAndPunctuation
-            hintLabel.text = "Saved as a JSON number. Non-numeric text is discarded."
+            hintLabel.text = "Saved as a JSON number. Text that isn't a finite number is refused, not saved as 0."
         case .bool:
             textView.isHidden = true; boolRow.isHidden = false
             view.endEditing(true)
@@ -311,14 +329,66 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
         view.layoutIfNeeded()
     }
 
-    @objc private func saveTapped() {
-        let value: Any
-        switch kind {
-        case .bool: value = boolSwitch.isOn
-        case .null: value = NSNull()
-        default:    value = JSONInlineValueCoder.value(from: textView.text ?? "", kind: kind)
+    /// What a Done tap should do, split out from the tap so it can be tested
+    /// without a screen — and so the refusal is a value, not a silent fallback.
+    enum SaveOutcome {
+        case write(Any)
+        case refuse(String)
+
+        var writtenValue: Any? {
+            if case .write(let value) = self { return value }
+            return nil
         }
-        onSave?(value)
-        navigationController?.popViewController(animated: true)
+        var refusalReason: String? {
+            if case .refuse(let reason) = self { return reason }
+            return nil
+        }
+    }
+
+    /// A number field is the one place a user can type a value JSON cannot
+    /// hold. "inf"/"nan" parse as Doubles, reach `JSONSerialization`, and take
+    /// the host app down with an uncatchable ObjC exception — so they are
+    /// refused here, out loud, rather than quietly saved as 0.
+    static func saveOutcome(kind: JSONValueKind, text: String, boolIsOn: Bool) -> SaveOutcome {
+        switch kind {
+        case .bool:
+            return .write(boolIsOn)
+        case .null:
+            return .write(NSNull())
+        case .number:
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                return .refuse("Type a number, or switch the type to Null to clear the value.")
+            }
+            guard let number = JSONInlineValueCoder.number(from: trimmed) else {
+                let reason = Double(trimmed).map { $0.isFinite } == false
+                    ? "JSON has no way to write infinity or NaN."
+                    : "\"\(trimmed)\" isn't a number."
+                return .refuse(reason + " Fix it, or switch the type to String to keep the text.")
+            }
+            return .write(number)
+        default:
+            return .write(JSONInlineValueCoder.value(from: text, kind: kind))
+        }
+    }
+
+    @objc private func saveTapped() {
+        switch Self.saveOutcome(kind: kind, text: textView.text ?? "", boolIsOn: boolSwitch.isOn) {
+        case .refuse(let reason):
+            showRefusal(reason)
+        case .write(let value):
+            onSave?(value)
+            navigationController?.popViewController(animated: true)
+        }
+    }
+
+    private func showRefusal(_ message: String) {
+        let alert = UIAlertController(title: "Can't save this value",
+                                      message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default) { [weak self] _ in
+            self?.textView.becomeFirstResponder()
+        })
+        alert.view.forceLTR()
+        present(alert, animated: true)
     }
 }

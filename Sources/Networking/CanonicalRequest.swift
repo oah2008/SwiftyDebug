@@ -145,7 +145,11 @@ private func FixEmptyPath(_ url: URL, _ urlData: NSMutableData, _ bytesInserted:
 /// Canonicalize the request headers.
 ///
 /// Historically this force-added default `Content-Type`, `Accept`,
-/// `Accept-Encoding` and `Accept-Language` headers. That defeats intercept
+/// `Accept-Encoding` and `Accept-Language` headers. `Accept-Language` is no
+/// longer among them at all — see the note at the bottom of this function; the
+/// hardwired `en-us` overrode the device language for the whole host app.
+///
+/// Force-adding the rest defeats intercept
 /// rules that try to *remove* one of those headers: canonicalization runs first
 /// and re-adds the default, so the removal has nothing to remove and the header
 /// still goes out. To make header removal reliable (see WEBVIEW-HEADERS), we
@@ -187,17 +191,22 @@ private func CanonicaliseHeaders(_ request: NSMutableURLRequest) {
         request.setValue("gzip, deflate", forHTTPHeaderField: "Accept-Encoding")
     }
 
-    // If there's no "Accept-Language" header, add a default. This is quite bogus; ideally we
-    // should derive the correct "Accept-Language" value from the language that the app is running
-    // in. However, that's quite difficult to get right, so rather than show some general purpose
-    // code that might fail in some circumstances, I've decided to just hardwire US English.
-    // If you use this code in your own app you can customise it as you see fit. One option might be
-    // to base this value on -[NSBundle preferredLocalizations], so that the web page comes back in
-    // the language that the app is running in.
-
-    if request.value(forHTTPHeaderField: "Accept-Language") == nil && shouldAddDefault("Accept-Language") {
-        request.setValue("en-us", forHTTPHeaderField: "Accept-Language")
-    }
+    // NO DEFAULT "Accept-Language" IS ADDED HERE, DELIBERATELY.
+    //
+    // This used to hardwire `en-us` onto every request that did not already
+    // carry the header — sample code whose own comment conceded it was "quite
+    // bogus" and that deriving the real value was "difficult to get right".
+    // Inside an SDK embedded in someone else's app it is worse than bogus: a
+    // Japanese or Arabic device asks the server for US English, the server
+    // answers in US English, and the host app's localisation looks broken to
+    // everyone who installed the build. The header is not something the app
+    // ever set, so nothing in the app can be adjusted to fix it.
+    //
+    // Getting it right is not our job either. CFNetwork fills in
+    // `Accept-Language` from the device's preferred languages on any request
+    // that reaches the wire without one, which is exactly the value the app
+    // would have sent with SwiftyDebug absent. Leaving the header off is what
+    // makes the two identical.
 }
 
 // MARK: - API
@@ -211,8 +220,9 @@ private func CanonicaliseHeaders(_ request: NSMutableURLRequest) {
 /// it all ourselves. This is split off into a separate file to emphasise that this
 /// is standard boilerplate that you probably don't need to look at.
 ///
-/// IMPORTANT: While you can take most of this code as read, you might want to tweak
-/// the handling of the "Accept-Language" in the CanonicaliseHeaders routine.
+/// IMPORTANT: this must produce the request the host app WOULD have sent. Any
+/// header added here is added to someone else's app, so `CanonicaliseHeaders`
+/// adds only the ones CFNetwork cannot supply for itself.
 ///
 /// - Parameter request: The request to canonicalize; must not be nil.
 /// - Returns: The canonical request; should never be nil.

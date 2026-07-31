@@ -282,10 +282,21 @@ private final class JSONTypeBadgeStyle: UILabel {
 
 // MARK: - Detail
 
-/// Inspect one paused request and release it. For an `.afterResponse` pause the
-/// body opens in the full JSON editor, so you can reshape the payload — including
-/// arrays of objects — before the app ever sees it.
-private final class BreakpointDetailViewController: UITableViewController {
+/// Inspect one paused request and release it.
+///
+/// The two stages hold DIFFERENT things, and this screen has to offer what the
+/// breakpoint picker promised for each:
+///
+///  * `.beforeSend` — "Pause before the request leaves the app so you can edit
+///    it." Nothing has gone out yet, so the method, the URL, the headers and the
+///    body are all editable here and what you leave is what goes on the wire.
+///    This screen used to be read-only for a before-send pause, which made the
+///    picker's promise false and the stage useless: the only two things you
+///    could do were send the request unchanged or abort it.
+///  * `.afterResponse` — the exchange is over, so the RESPONSE body opens in the
+///    full JSON editor and you reshape the payload — including arrays of
+///    objects — before the app ever sees it.
+final class BreakpointDetailViewController: UITableViewController {
 
     private let paused: BreakpointCenter.PausedRequest
     private var editedBody: String
@@ -294,12 +305,61 @@ private final class BreakpointDetailViewController: UITableViewController {
     /// binary payloads and for anything the pretty-printer can't round-trip.
     private var bodyWasEdited = false
 
-    private enum Row: Int, CaseIterable { case summary, requestHeaders, body, resume, abort }
+    // MARK: Editable request state (`.beforeSend` only)
 
-    /// A body can only be edited after the response arrived, and only when it's
-    /// text — binary payloads are passed through byte-for-byte.
+    private var editedMethod: String
+    private var editedURLString: String
+    /// Ordered so a rename or a delete does not reshuffle the rows under the
+    /// developer's finger. Seeded from the parked request, sorted by name.
+    private var headers: [(name: String, value: String)]
+    private var editedRequestBody: String
+    private var requestBodyWasEdited = false
+
+    /// The parked request's body as text, decided ONCE in `init` — parsing a
+    /// 512 KB payload from `cellForRowAt` would re-parse it on every scroll.
+    private let requestBodyText: String
+    /// True when the body isn't text at all (an image upload, protobuf…). Such a
+    /// body is shown read-only and delivered byte-for-byte, exactly as the
+    /// response side treats a binary payload.
+    private let isRequestBodyBinary: Bool
+    /// True when the body is something the JSON editor can round-trip: empty, or
+    /// valid JSON. Form-encoded and other text bodies are read-only rather than
+    /// silently rewritten into `{}` by the editor.
+    private let isRequestBodyJSONEditable: Bool
+
+    private enum Row {
+        /// Method + status + URL, read-only (`.afterResponse`).
+        case summary
+        case method
+        case url
+        case header(Int)
+        case addHeader
+        /// The read-only header dump shown for an `.afterResponse` pause.
+        case requestHeaders
+        case body
+        case resume
+        case abort
+    }
+
+    private struct SectionModel {
+        let title: String?
+        let rows: [Row]
+    }
+
+    private var sections: [SectionModel] = []
+
+    /// A response body can only be edited after the response arrived, and only
+    /// when it's text — binary payloads are passed through byte-for-byte.
     private var isBodyEditable: Bool {
         paused.stage == .afterResponse && !paused.isResponseBodyBinary
+    }
+
+    /// GET and HEAD carry no body, so the section is hidden for them — unless
+    /// the parked request actually has one, in which case hiding it would hide
+    /// bytes that are still going to be sent.
+    private var showsRequestBodySection: Bool {
+        let methodCarriesBody = !["GET", "HEAD"].contains(editedMethod.uppercased())
+        return methodCarriesBody || !requestBodyText.isEmpty || isRequestBodyBinary
     }
 
     /// The app abandoned the request while it was held, so there is nothing left
@@ -320,6 +380,21 @@ private final class BreakpointDetailViewController: UITableViewController {
     init(paused: BreakpointCenter.PausedRequest) {
         self.paused = paused
         self.editedBody = paused.responseBodyText
+        self.editedMethod = paused.method
+        self.editedURLString = paused.request.url?.absoluteString ?? ""
+        self.headers = (paused.request.allHTTPHeaderFields ?? [:])
+            .sorted { $0.key.lowercased() < $1.key.lowercased() }
+            .map { (name: $0.key, value: $0.value) }
+
+        // Decoded and parsed ONCE — `cellForRowAt` only reads the results.
+        let bodyData = paused.request.httpBody ?? Data()
+        let decoded = bodyData.isEmpty ? "" : (String(data: bodyData, encoding: .utf8) ?? "")
+        let document = decoded.isEmpty ? nil : JSONDocument(text: decoded)
+        self.isRequestBodyBinary = !bodyData.isEmpty && decoded.isEmpty
+        self.isRequestBodyJSONEditable = bodyData.isEmpty || document != nil
+        // Pretty-print JSON so it is legible — and editable — on a phone.
+        self.requestBodyText = document?.prettyText() ?? decoded
+        self.editedRequestBody = self.requestBodyText
         super.init(style: .grouped)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -339,16 +414,54 @@ private final class BreakpointDetailViewController: UITableViewController {
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 60
         tableView.register(JSONEditorCardCell.self, forCellReuseIdentifier: JSONEditorCardCell.reuseIdentifier)
+        rebuildSections()
         view.forceLTR()
     }
 
-    override func numberOfSections(in tableView: UITableView) -> Int { 1 }
-    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        Row.allCases.count
+    /// The row layout for this stage. Rebuilt after every edit, because adding a
+    /// header — or switching to a method that carries no body — changes it.
+    private func rebuildSections() {
+        var models: [SectionModel] = []
+        if paused.stage == .beforeSend {
+            models.append(SectionModel(title: "REQUEST", rows: [.method, .url]))
+            var headerRows: [Row] = headers.indices.map { Row.header($0) }
+            headerRows.append(.addHeader)
+            models.append(SectionModel(title: "HEADERS (\(headers.count))", rows: headerRows))
+            if showsRequestBodySection {
+                models.append(SectionModel(title: "BODY", rows: [.body]))
+            }
+            models.append(SectionModel(title: nil, rows: [.resume, .abort]))
+        } else {
+            models.append(SectionModel(
+                title: nil, rows: [.summary, .requestHeaders, .body, .resume, .abort]))
+        }
+        sections = models
     }
 
-    /// The editable response body uses the shared JSON card — the same control,
-    /// wording and gesture as the replay editor and the mock editor.
+    /// Rebuild + redraw. Every edit path ends here.
+    private func reloadAfterEdit() {
+        rebuildSections()
+        tableView.reloadData()
+    }
+
+    private func row(at ip: IndexPath) -> Row? {
+        guard sections.indices.contains(ip.section),
+              sections[ip.section].rows.indices.contains(ip.row) else { return nil }
+        return sections[ip.section].rows[ip.row]
+    }
+
+    override func numberOfSections(in tableView: UITableView) -> Int { sections.count }
+
+    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        sections.indices.contains(section) ? sections[section].rows.count : 0
+    }
+
+    override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
+        sections.indices.contains(section) ? sections[section].title : nil
+    }
+
+    /// The editable body uses the shared JSON card — the same control, wording
+    /// and gesture as the replay editor and the mock editor.
     private func bodyCardCell(_ ip: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(
             withIdentifier: JSONEditorCardCell.reuseIdentifier, for: ip) as! JSONEditorCardCell
@@ -356,16 +469,20 @@ private final class BreakpointDetailViewController: UITableViewController {
         // the held payload isn't (yet) valid JSON.
         cell.cardView.alwaysVisible = true
         cell.cardView.showsPreview = true
-        cell.cardView.cardTitle = "Edit response body"
-        cell.cardView.detailText = "Reshape the payload before the app ever sees it — add, rename, retype or reorder fields."
-        cell.cardView.configure(text: editedBody)
+        if paused.stage == .beforeSend {
+            cell.cardView.cardTitle = "Edit request body"
+            cell.cardView.detailText = "Change the payload before the request leaves the app — add, rename, retype or reorder fields."
+            cell.cardView.configure(text: editedRequestBody)
+        } else {
+            cell.cardView.cardTitle = "Edit response body"
+            cell.cardView.detailText = "Reshape the payload before the app ever sees it — add, rename, retype or reorder fields."
+            cell.cardView.configure(text: editedBody)
+        }
         cell.cardView.onTap = { [weak self] in self?.editBody() }
         return cell
     }
 
-    override func tableView(_ tableView: UITableView, cellForRowAt ip: IndexPath) -> UITableViewCell {
-        if Row(rawValue: ip.row) == .body, isBodyEditable { return bodyCardCell(ip) }
-
+    private func plainCell() -> UITableViewCell {
         let c = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
         c.backgroundColor = UIColor(white: 0.11, alpha: 1)
         c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
@@ -374,35 +491,79 @@ private final class BreakpointDetailViewController: UITableViewController {
         c.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
         c.detailTextLabel?.numberOfLines = 0
         c.forceLTR()
+        return c
+    }
 
-        switch Row(rawValue: ip.row)! {
+    override func tableView(_ tableView: UITableView, cellForRowAt ip: IndexPath) -> UITableViewCell {
+        guard let row = row(at: ip) else { return plainCell() }
+        if case .body = row, isBodyEditable || (paused.stage == .beforeSend && isRequestBodyJSONEditable) {
+            return bodyCardCell(ip)
+        }
+
+        let c = plainCell()
+        switch row {
         case .summary:
             c.selectionStyle = .none
             c.textLabel?.text = "\(paused.method)  \(paused.statusCode.map(String.init) ?? "—")"
             c.detailTextLabel?.text = paused.displayURL
+        case .method:
+            c.textLabel?.text = "Method"
+            c.detailTextLabel?.text = editedMethod
+            c.detailTextLabel?.textColor = DebugTheme.accentColor
+            c.accessoryType = .disclosureIndicator
+        case .url:
+            c.textLabel?.text = "URL"
+            c.detailTextLabel?.text = editedURLString.isEmpty ? "(none)" : editedURLString
+            c.accessoryType = .disclosureIndicator
+        case .header(let index):
+            guard headers.indices.contains(index) else { return c }
+            c.textLabel?.text = headers[index].name
+            c.textLabel?.textColor = DebugTheme.accentColor
+            c.detailTextLabel?.text = headers[index].value.isEmpty ? "(empty)" : headers[index].value
+            c.accessoryType = .disclosureIndicator
+        case .addHeader:
+            c.textLabel?.text = "Add header"
+            c.textLabel?.textColor = DebugTheme.accentColor
+            c.detailTextLabel?.text = "Swipe a header to delete it."
         case .requestHeaders:
             c.selectionStyle = .none
-            let headers = paused.request.allHTTPHeaderFields ?? [:]
-            c.textLabel?.text = "Request headers (\(headers.count))"
-            c.detailTextLabel?.text = headers.keys.sorted()
-                .map { "\($0): \(headers[$0] ?? "")" }.joined(separator: "\n")
+            let fields = paused.request.allHTTPHeaderFields ?? [:]
+            c.textLabel?.text = "Request headers (\(fields.count))"
+            c.detailTextLabel?.text = fields.keys.sorted()
+                .map { "\($0): \(fields[$0] ?? "")" }.joined(separator: "\n")
         case .body:
             // Editable bodies are handled above by the shared JSON card; this is
-            // the read-only case (binary payload, or paused before the response).
-            c.textLabel?.text = "Response body"
-            if paused.isResponseBodyBinary {
-                let bytes = paused.responseBody?.count ?? 0
-                c.detailTextLabel?.text = "Binary payload — \(bytes) bytes, delivered unchanged"
-            } else {
-                let preview = editedBody.trimmingCharacters(in: .whitespacesAndNewlines)
-                c.detailTextLabel?.text = preview.isEmpty ? "(empty)" : String(preview.prefix(300))
-            }
+            // the read-only case — a binary payload, or text the JSON editor
+            // cannot round-trip.
             c.selectionStyle = .none
+            if paused.stage == .beforeSend {
+                c.textLabel?.text = "Request body"
+                let bytes = paused.request.httpBody?.count ?? 0
+                if isRequestBodyBinary {
+                    c.detailTextLabel?.text = "Binary payload — \(bytes) bytes, sent unchanged"
+                } else {
+                    c.detailTextLabel?.text = "Not JSON — \(bytes) bytes, sent unchanged\n"
+                        + String(requestBodyText.prefix(300))
+                }
+            } else {
+                c.textLabel?.text = "Response body"
+                if paused.isResponseBodyBinary {
+                    let bytes = paused.responseBody?.count ?? 0
+                    c.detailTextLabel?.text = "Binary payload — \(bytes) bytes, delivered unchanged"
+                } else {
+                    let preview = editedBody.trimmingCharacters(in: .whitespacesAndNewlines)
+                    c.detailTextLabel?.text = preview.isEmpty ? "(empty)" : String(preview.prefix(300))
+                }
+            }
         case .resume:
             c.textLabel?.text = paused.stage == .afterResponse ? "Deliver to app" : "Send request"
             c.textLabel?.textColor = DebugTheme.accentColor
             c.textLabel?.textAlignment = .center
-            c.detailTextLabel?.text = nil
+            // Says out loud that the edits above are what goes out — the whole
+            // point of the stage, and the thing the read-only screen denied.
+            c.detailTextLabel?.text = paused.stage == .beforeSend
+                ? "Sends the request exactly as edited above." : nil
+            c.detailTextLabel?.textAlignment = .center
         case .abort:
             c.textLabel?.text = "Abort request"
             c.textLabel?.textColor = .systemRed
@@ -414,24 +575,244 @@ private final class BreakpointDetailViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, didSelectRowAt ip: IndexPath) {
         tableView.deselectRow(at: ip, animated: true)
-        switch Row(rawValue: ip.row)! {
+        guard let row = row(at: ip) else { return }
+        switch row {
+        case .method:
+            pickMethod()
+        case .url:
+            editURL()
+        case .header(let index):
+            editHeader(at: index)
+        case .addHeader:
+            editHeader(at: nil)
         case .body:
             editBody()
         case .resume:
-            if bodyWasEdited, let data = editedBody.data(using: .utf8) {
-                paused.responseBody = data
-            }
-            guard BreakpointCenter.shared.resume(paused) else { showGaveUpAlert(); return }
-            navigationController?.popViewController(animated: true)
+            releaseTapped()
         case .abort:
             guard BreakpointCenter.shared.abort(paused) else { showGaveUpAlert(); return }
             navigationController?.popViewController(animated: true)
-        default:
+        case .summary, .requestHeaders:
             break
         }
     }
 
+    // MARK: - Deleting a header
+
+    override func tableView(_ tableView: UITableView, canEditRowAt ip: IndexPath) -> Bool {
+        if case .header = row(at: ip) { return true }
+        return false
+    }
+
+    override func tableView(_ tableView: UITableView,
+                            trailingSwipeActionsConfigurationForRowAt ip: IndexPath)
+        -> UISwipeActionsConfiguration? {
+        guard case .header(let index) = row(at: ip) else { return nil }
+        let delete = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, done in
+            self?.removeHeader(at: index)
+            done(true)
+        }
+        return UISwipeActionsConfiguration(actions: [delete])
+    }
+
+    // MARK: - Editing the outgoing request (`.beforeSend`)
+
+    /// The request as edited on this screen.
+    ///
+    /// Built by mutating the PARKED request rather than a fresh one, so
+    /// everything this screen does not show survives: the recursion flag
+    /// `URLProtocol` stamped on it (without which the re-issued request would be
+    /// captured again, forever), the cache policy, the timeout, the cookie and
+    /// cellular flags.
+    func editedRequest() -> URLRequest {
+        var request = paused.request
+        request.httpMethod = editedMethod
+        if let url = URL(string: editedURLString) { request.url = url }
+
+        var fields: [String: String] = [:]
+        for pair in headers {
+            let name = pair.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { continue }
+            fields[name] = pair.value
+        }
+        if requestBodyWasEdited {
+            let data = editedRequestBody.data(using: .utf8) ?? Data()
+            request.httpBody = data.isEmpty ? nil : data
+            // A stale Content-Length makes the server read the wrong number of
+            // bytes — the request-side twin of the response bug that
+            // `headersForEditedBody` exists to prevent.
+            if let existing = fields.keys.first(where: { $0.lowercased() == "content-length" }) {
+                fields[existing] = "\(data.count)"
+            }
+        }
+
+        // ASSIGNING `allHTTPHeaderFields` DOES NOT REPLACE THE SET — Foundation
+        // merges the dictionary in, so a header the developer deleted on this
+        // screen survives and still goes out. Measured: assigning `[:]` to a
+        // request with two headers leaves both in place. Each existing name has
+        // to be cleared explicitly first.
+        for name in (request.allHTTPHeaderFields ?? [:]).keys {
+            request.setValue(nil, forHTTPHeaderField: name)
+        }
+        for (name, value) in fields {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        return request
+    }
+
+    /// Sets the method. `internal` so a test can drive the same entry point the
+    /// picker does, rather than a parallel one that could pass while the UI is
+    /// broken.
+    func applyMethod(_ method: String) {
+        editedMethod = method.uppercased()
+        reloadAfterEdit()
+    }
+
+    /// Returns false — and changes nothing — for something that isn't a usable
+    /// http(s) URL. Silently keeping the old URL would send the request
+    /// somewhere the screen no longer shows.
+    @discardableResult
+    func applyURLString(_ string: String) -> Bool {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host?.isEmpty == false else { return false }
+        editedURLString = url.absoluteString
+        reloadAfterEdit()
+        return true
+    }
+
+    /// Adds a header (`index == nil`) or replaces one. An empty name is refused
+    /// rather than stored as a header that can never be sent.
+    @discardableResult
+    func applyHeader(name: String, value: String, at index: Int?) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if let index, headers.indices.contains(index) {
+            headers[index] = (name: trimmed, value: value)
+        } else if let existing = headers.firstIndex(where: { $0.name.lowercased() == trimmed.lowercased() }) {
+            // HTTP header names are case-insensitive, so a second "accept" would
+            // be dropped when the dictionary is rebuilt. Overwrite in place
+            // instead of listing a row that silently does nothing.
+            headers[existing] = (name: trimmed, value: value)
+        } else {
+            headers.append((name: trimmed, value: value))
+        }
+        reloadAfterEdit()
+        return true
+    }
+
+    func removeHeader(at index: Int) {
+        guard headers.indices.contains(index) else { return }
+        headers.remove(at: index)
+        reloadAfterEdit()
+    }
+
+    func applyRequestBody(_ text: String) {
+        editedRequestBody = text
+        requestBodyWasEdited = true
+        reloadAfterEdit()
+    }
+
+    private func pickMethod() {
+        var methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
+        // An app using an unusual verb must not lose it just by opening the picker.
+        if !methods.contains(editedMethod.uppercased()) { methods.insert(editedMethod.uppercased(), at: 0) }
+        let options = methods.map { verb in
+            OptionPickerSheetViewController.Option(title: verb) { [weak self] in
+                self?.applyMethod(verb)
+            }
+        }
+        OptionPickerSheetViewController.present(
+            from: self, title: "Method",
+            message: "The verb this request goes out with.",
+            options: options, selectedIndex: methods.firstIndex(of: editedMethod.uppercased()))
+    }
+
+    private func editURL() {
+        let alert = UIAlertController(title: "URL",
+                                      message: "Where this request is about to be sent.",
+                                      preferredStyle: .alert)
+        alert.addTextField { [weak self] field in
+            field.text = self?.editedURLString
+            field.placeholder = "https://example.com/path?a=1"
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+            field.keyboardType = .URL
+            field.clearButtonMode = .whileEditing
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Set", style: .default) { [weak self, weak alert] _ in
+            let text = alert?.textFields?.first?.text ?? ""
+            guard self?.applyURLString(text) == true else {
+                self?.showInvalidURLAlert()
+                return
+            }
+        })
+        present(alert, animated: true)
+    }
+
+    private func showInvalidURLAlert() {
+        let a = UIAlertController(
+            title: "Not a Usable URL",
+            message: "The request still goes to the URL shown on the screen. A breakpoint URL needs a scheme and a host, e.g. https://example.com/path.",
+            preferredStyle: .alert)
+        a.addAction(UIAlertAction(title: "OK", style: .default))
+        present(a, animated: true)
+    }
+
+    private func editHeader(at index: Int?) {
+        let existing = index.flatMap { headers.indices.contains($0) ? headers[$0] : nil }
+        let alert = UIAlertController(title: existing == nil ? "Add Header" : "Header",
+                                      message: nil, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = existing?.name
+            field.placeholder = "Name"
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+        }
+        alert.addTextField { field in
+            field.text = existing?.value
+            field.placeholder = "Value"
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Set", style: .default) { [weak self, weak alert] _ in
+            let fields = alert?.textFields ?? []
+            self?.applyHeader(name: fields.first?.text ?? "",
+                              value: fields.count > 1 ? (fields[1].text ?? "") : "",
+                              at: index)
+        })
+        present(alert, animated: true)
+    }
+
+    // MARK: - Releasing
+
+    private func releaseTapped() {
+        if paused.stage == .beforeSend {
+            // `PausedRequest.request` is what the protocol's resume handler
+            // sends, so this is the hand-off: everything edited above rides on it.
+            paused.request = editedRequest()
+        } else if bodyWasEdited, let data = editedBody.data(using: .utf8) {
+            paused.responseBody = data
+        }
+        guard BreakpointCenter.shared.resume(paused) else { showGaveUpAlert(); return }
+        navigationController?.popViewController(animated: true)
+    }
+
     private func editBody() {
+        if paused.stage == .beforeSend {
+            guard isRequestBodyJSONEditable else { return }
+            let editor = JSONEditorViewController(text: editedRequestBody, title: "Request Body")
+            editor.saveButtonTitle = "Use Body"
+            editor.onSave = { [weak self] doc in
+                self?.applyRequestBody(doc.prettyText())
+            }
+            navigationController?.pushViewController(editor, animated: true)
+            return
+        }
         guard isBodyEditable else { return }
         let editor = JSONEditorViewController(text: editedBody, title: "Response Body")
         editor.saveButtonTitle = "Use Body"

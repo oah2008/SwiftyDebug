@@ -159,7 +159,11 @@ class AppInfoViewController: UITableViewController {
         DestructiveRow(
             title: "Clear Remembered Headers",
             subtitle: {
+                // BOTH stores, because the button clears both. Counting only
+                // `RequestMetadataStore` is how "0 remembered" sat above a
+                // `HeaderSuggestionStore` full of learned names.
                 let n = RequestMetadataStore.shared.rememberedCount
+                    + HeaderSuggestionStore.shared.rememberedCount
                 return n == 0
                     ? "Nothing remembered yet"
                     : "\(n) header/param name\(n == 1 ? "" : "s") kept for suggestions"
@@ -228,6 +232,19 @@ class AppInfoViewController: UITableViewController {
         ) { [weak self] _ in
             self?.reloadURLs()
         })
+
+        // Rules change from screens this one does not own — the rule editor it
+        // presents, the rule list tab, an import. Without this the section kept
+        // rendering the copy it loaded on appear: an edited rule showed its old
+        // title, a rule created from this very tab showed no row at all (so
+        // people created it again), and the enable switch wrote the stale copy
+        // back to the store, silently reverting the edit.
+        observerTokens.append(NotificationCenter.default.addObserver(
+            forName: .interceptRulesDidChange,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.reloadInterceptRules()
+        })
         view.forceLTR()
     }
 
@@ -246,6 +263,43 @@ class AppInfoViewController: UITableViewController {
     }
 
     // MARK: - Build Data
+
+    /// Re-reads the rules from the store and redraws the section when what the
+    /// rows *say* has changed.
+    ///
+    /// The cached array is refreshed unconditionally — it is what
+    /// `editRuleFromAppTab` hands to the editor, so a stale entry there opens an
+    /// editor on old content. Only the redraw is conditional, so flipping an
+    /// enable switch (which posts this notification too) does not yank the
+    /// switch out from under the finger that just moved it.
+    private func reloadInterceptRules() {
+        let fresh = InterceptRuleStore.shared.allRules()
+        let changed = Self.rowFingerprint(fresh) != Self.rowFingerprint(interceptRules)
+        interceptRules = fresh
+        guard changed, isViewLoaded else { return }
+        // reloadSections, not deleteRows/insertRows: it re-queries the row count
+        // and the header (which carries a live rule count), so no arithmetic here
+        // can disagree with the store.
+        guard tableView.numberOfSections > Section.interceptRules.rawValue else {
+            // The table has not loaded its sections yet; asking it to reload one
+            // it does not believe in throws.
+            tableView.reloadData()
+            return
+        }
+        tableView.reloadSections(IndexSet(integer: Section.interceptRules.rawValue), with: .none)
+    }
+
+    /// Everything a rule row draws, flattened. Two arrays with the same
+    /// fingerprint render identically, so there is nothing to redraw.
+    static func rowFingerprint(_ rules: [InterceptRule]) -> String {
+        rules.map { rule in
+            [rule.id,
+             rule.isEnabled ? "1" : "0",
+             rule.isBlocked ? "1" : "0",
+             InterceptRuleRowFormatter.attributedTitle(for: rule).string,
+             InterceptRuleRowFormatter.detailText(for: rule)].joined(separator: "\u{1F}")
+        }.joined(separator: "\u{1E}")
+    }
 
     private func reloadURLs() {
         interceptRules = InterceptRuleStore.shared.allRules()
@@ -478,19 +532,29 @@ class AppInfoViewController: UITableViewController {
         present(alert, animated: true)
     }
 
-    /// Wipes `RequestMetadataStore`. That store outlives Clear, `fullStop()` and
-    /// the requests it learned from, so this is the only way to get rid of it.
+    /// Wipes **both** remembered-name stores. They outlive Clear, `fullStop()`
+    /// and the requests they learned from, so this is the only way to get rid of
+    /// them.
+    ///
+    /// `HeaderSuggestionStore` used to be missed here entirely: the alert
+    /// promised to forget every remembered header and delete the file, and one
+    /// of the two files — the one that held every header VALUE the app had ever
+    /// sent, `Authorization` and `Cookie` included — was left untouched on disk.
+    /// Both are cleared now, and both are cleared before the row's count is
+    /// re-read, so the subtitle cannot claim a wipe that did not happen.
     private func clearRequestMetadata() {
         let alert = UIAlertController(
             title: "Clear Remembered Headers",
             message: "SwiftyDebug remembers the header and query-parameter names your app sends, so the "
                 + "intercept and replay editors can suggest them. Clearing forgets all of them and deletes "
-                + "the file from disk. This cannot be undone.",
+                + "the files from disk. Well-known HTTP header names still get suggested — those ship with "
+                + "the SDK and were never learned from your app. This cannot be undone.",
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { [weak self] _ in
             RequestMetadataStore.shared.clear()
+            HeaderSuggestionStore.shared.clear()
             // The row's own subtitle shows the count.
             self?.tableView.reloadSections(IndexSet(integer: Section.actions.rawValue), with: .none)
         })
@@ -619,54 +683,21 @@ class AppInfoViewController: UITableViewController {
             cell.selectionStyle = .default
             cell.backgroundColor = UIColor(white: 0.11, alpha: 1)
 
-            // Mode badge color
-            let modeColor: UIColor
-            let modeText: String
-            switch rule.matchMode {
-            case .exact:      modeColor = .systemOrange;  modeText = "EXACT"
-            case .normalized: modeColor = DebugTheme.accentColor; modeText = "PATTERN"
-            case .host:       modeColor = .systemPurple;  modeText = "HOST"
-            case .global:     modeColor = .systemPink;    modeText = "GLOBAL"
-            }
-
-            // Summary
-            var summary: String
-            if rule.isBlocked {
-                summary = "Block"
-            } else {
-                var parts: [String] = []
-                let hc = rule.headerOverrides.count + rule.removedHeaderKeys.count
-                let pc = rule.queryParamOverrides.count + rule.removedQueryParamKeys.count
-                if hc > 0 { parts.append("\(hc) header\(hc == 1 ? "" : "s")") }
-                if pc > 0 { parts.append("\(pc) param\(pc == 1 ? "" : "s")") }
-                summary = parts.isEmpty ? "Empty rule" : parts.joined(separator: ", ")
-            }
-
-            // Title: [MODE] endpoint/hosts
-            let endpoint: String
-            if rule.matchMode == .host {
-                endpoint = rule.matchHosts.joined(separator: ", ")
-            } else if rule.matchMode == .global {
-                endpoint = "All Requests"
-            } else {
-                endpoint = rule.matchEndpoint
-            }
-
-            let titleAttr = NSMutableAttributedString()
-            let badgeAttr: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 9, weight: .bold),
-                .foregroundColor: modeColor,
-            ]
-            titleAttr.append(NSAttributedString(string: "\(modeText)  ", attributes: badgeAttr))
-            titleAttr.append(NSAttributedString(string: endpoint, attributes: [
-                .font: UIFont(name: "Menlo", size: 12) ?? .monospacedSystemFont(ofSize: 12, weight: .medium),
-                .foregroundColor: UIColor.white,
-            ]))
-            cell.textLabel?.attributedText = titleAttr
+            // Title: [MODE] name. The title used to be the raw `matchEndpoint`
+            // and the subtitle a count of header/param overrides, so every rule
+            // that mocked, blocked, breakpointed, redirected or rewrote read
+            // "Empty rule" and rules on the same path were indistinguishable.
+            // `InterceptRuleRowFormatter` is the one definition of a rule row,
+            // shared with the rule list and the transfer screens.
+            cell.textLabel?.attributedText = InterceptRuleRowFormatter.attributedTitle(for: rule)
             cell.textLabel?.numberOfLines = 2
 
-            cell.detailTextLabel?.text = summary
-            cell.detailTextLabel?.font = .systemFont(ofSize: 11)
+            // Scope on its own line, always: an endpoint rule can now be pinned
+            // to one host or apply to any host, and two rules that differ only
+            // in that must not render identically.
+            cell.detailTextLabel?.text = InterceptRuleRowFormatter.detailText(for: rule)
+            cell.detailTextLabel?.font = InterceptRuleRowFormatter.detailFont
+            cell.detailTextLabel?.numberOfLines = 2
             cell.detailTextLabel?.textColor = rule.isBlocked ? .systemRed : UIColor(white: 0.55, alpha: 1)
 
             // Enable/disable switch.
@@ -862,28 +893,84 @@ class AppInfoViewController: UITableViewController {
 
     /// Arms or disarms one rule, found by id.
     ///
+    /// Re-reads the rule from the STORE before writing, and writes back only the
+    /// one field this switch owns. Writing `interceptRules[idx]` — the copy the
+    /// cell was built from — pushed every other field of that snapshot back to
+    /// the store too, so flipping the switch on a row that had been edited
+    /// elsewhere silently reverted the edit (old mock body, old headers, old
+    /// scope) while looking like it had only toggled a switch.
+    ///
     /// NO-OP when the id is gone: the rule was deleted between the cell being
-    /// rendered and the switch being tapped, and there is nothing to write.
+    /// rendered and the switch being tapped, and there is nothing to write. The
+    /// section is reloaded so the row that no longer has a rule disappears
+    /// instead of sitting there accepting taps.
     private func setRule(id: String, enabled: Bool) {
-        guard let idx = interceptRules.firstIndex(where: { $0.id == id }) else { return }
-        interceptRules[idx].isEnabled = enabled
-        InterceptRuleStore.shared.update(interceptRules[idx])
-        // Update opacity on whichever row the rule currently occupies.
-        let indexPath = IndexPath(row: idx, section: Section.interceptRules.rawValue)
-        if let cell = tableView.cellForRow(at: indexPath) {
-            cell.contentView.alpha = enabled ? 1 : 0.5
+        guard let rule = Self.ruleForEnableToggle(id: id,
+                                                  enabled: enabled,
+                                                  storeRules: InterceptRuleStore.shared.allRules()) else {
+            reloadInterceptRules()
+            return
+        }
+        InterceptRuleStore.shared.update(rule)
+        if let idx = interceptRules.firstIndex(where: { $0.id == id }) {
+            interceptRules[idx] = rule
+            // Update opacity on whichever row the rule currently occupies.
+            let indexPath = IndexPath(row: idx, section: Section.interceptRules.rawValue)
+            if let cell = tableView.cellForRow(at: indexPath) {
+                cell.contentView.alpha = enabled ? 1 : 0.5
+            }
         }
     }
 
+    /// The rule an enable switch should write back: **the store's current copy**
+    /// with only `isEnabled` replaced.
+    ///
+    /// Never the row's cached copy. `update(_:)` writes the whole struct, so
+    /// handing it a snapshot taken before the rule was edited elsewhere pushed
+    /// the old name, mock body, headers, redirect and scope back over the new
+    /// ones — a switch tap silently undoing an edit.
+    ///
+    /// Returns nil when the id is gone (deleted between render and tap) — there
+    /// is nothing to write, and re-adding the cached copy would resurrect a
+    /// deleted rule.
+    static func ruleForEnableToggle(id: String,
+                                    enabled: Bool,
+                                    storeRules: [InterceptRule]) -> InterceptRule? {
+        guard var rule = storeRules.first(where: { $0.id == id }) else { return nil }
+        rule.isEnabled = enabled
+        return rule
+    }
+
+    /// Opens the editor on the rule as the STORE has it right now, not as this
+    /// row remembers it.
     private func editRuleFromAppTab(_ rule: InterceptRule) {
+        guard let current = InterceptRuleStore.shared.allRules().first(where: { $0.id == rule.id }) else {
+            reloadInterceptRules()
+            let alert = UIAlertController(
+                title: "Rule Is Gone",
+                message: "It was deleted somewhere else, so there is nothing to edit. The list has been refreshed.",
+                preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .cancel))
+            present(alert, animated: true)
+            return
+        }
+
         let editor = InterceptRuleEditorViewController()
-        editor.existingRuleId = rule.id
+        editor.existingRuleId = current.id
 
         // Create a minimal model so the editor can look up the rule
         // For host rules we don't need a real request model — set httpModel to nil
         // and look up the rule from the store directly
-        editor.ruleToEdit = rule
+        editor.ruleToEdit = current
+        presentRuleEditor(editor)
+    }
+
+    /// Presents a rule editor the way the inspectors are presented: full screen.
+    /// A sheet here can be swiped away mid-edit, and it leaves this list visible
+    /// behind it showing the pre-edit text.
+    private func presentRuleEditor(_ editor: InterceptRuleEditorViewController) {
         let nav = SwiftyDebugNavigationController(rootViewController: editor)
+        nav.modalPresentationStyle = .fullScreen
         present(nav, animated: true)
     }
 
@@ -899,8 +986,7 @@ class AppInfoViewController: UITableViewController {
             guard let self = self else { return }
             let editor = InterceptRuleEditorViewController()
             editor.initialMatchMode = mode
-            let nav = SwiftyDebugNavigationController(rootViewController: editor)
-            self.present(nav, animated: true)
+            self.presentRuleEditor(editor)
         }
 
         OptionPickerSheetViewController.present(

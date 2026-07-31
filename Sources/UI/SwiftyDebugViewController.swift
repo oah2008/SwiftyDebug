@@ -26,7 +26,12 @@ class SwiftyDebugViewController: UIViewController {
     }
 
     func shouldReceive(point: CGPoint) -> Bool {
-        if DebugWindowPresenter.shared.displayedList {
+        // The flag alone is NOT enough. It was set before `present`, so a
+        // presentation that never happened (no window yet) left it stuck true —
+        // and this method then claimed every touch on the screen, leaving the
+        // host app completely dead except for a 25x25 bubble, with no escape but
+        // a relaunch. Require something to actually BE presented.
+        if DebugWindowPresenter.shared.displayedList, presentedViewController != nil {
             return true
         }
         return bubble.frame.contains(point)
@@ -37,10 +42,15 @@ class SwiftyDebugViewController: UIViewController {
 extension SwiftyDebugViewController: BubbleDelegate {
 
     func didTapBubble() {
-        DebugWindowPresenter.shared.displayedList = true
+        // Only claim the screen for a presentation that can actually succeed, and
+        // only once it is under way. Setting the flag first and presenting into
+        // nothing is what soft-locked the host app.
+        guard view.window != nil, presentedViewController == nil else { return }
         let vc = SwiftyDebugTabBarController()
         vc.view.backgroundColor = .white
         vc.modalPresentationStyle = .fullScreen
-        self.present(vc, animated: true, completion: nil)
+        present(vc, animated: true) {
+            DebugWindowPresenter.shared.displayedList = true
+        }
     }
 }

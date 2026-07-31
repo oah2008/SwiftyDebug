@@ -114,19 +114,68 @@ final class BreakpointOverlay {
     }
 
     /// Opens the debug UI straight on the paused-requests inbox.
-    private func openInbox() {
+    ///
+    /// `DebugWindowPresenter.displayedList` is not a display flag — it is what
+    /// opens `SwiftyDebugWindow.point(inside:)` to *every* point on screen. Set
+    /// it for a presentation that then silently fails (a host view controller
+    /// with no window: UIKit logs and does nothing) and the debug window eats
+    /// every touch in the host app forever, with only the 25x25 bubble left to
+    /// tap. So: never set it before the host is known to be presentable, and
+    /// always take it back when the presentation did not actually happen.
+    func openInbox() {
         let presenter = DebugWindowPresenter.shared
-        // If the debug UI isn't up yet, bring it up first.
-        if !Settings.shared.debugUIVisible {
-            presenter.displayedList = true
-            let tabs = SwiftyDebugTabBarController()
-            tabs.modalPresentationStyle = .fullScreen
-            tabs.pendingInitialScreen = .breakpointInbox
-            presenter.vc.present(tabs, animated: true)
-        } else if let tabs = presenter.vc.presentedViewController as? SwiftyDebugTabBarController {
+
+        // Already up — just switch to the inbox tab; the flag is already true
+        // and there is genuinely something presented to justify it.
+        if let tabs = presenter.vc.presentedViewController as? SwiftyDebugTabBarController {
             tabs.showBreakpointInbox()
+            hide()
+            return
+        }
+
+        guard Self.canPresentInbox(from: presenter.vc) else {
+            // Nothing was presented, so nothing may be swallowing touches:
+            // if an earlier attempt left the flag set, this takes it back.
+            // The banner stays on screen — tapping again once the app has a
+            // live window is the whole recovery path.
+            releaseTouchesIfNothingPresented()
+            return
+        }
+
+        let tabs = SwiftyDebugTabBarController()
+        tabs.modalPresentationStyle = .fullScreen
+        tabs.pendingInitialScreen = .breakpointInbox
+
+        presenter.displayedList = true
+        presenter.vc.present(tabs, animated: true) { [weak self] in
+            self?.releaseTouchesIfNothingPresented()
+        }
+        // Belt and braces: `present`'s completion is not guaranteed to run if
+        // the transition never starts, so the flag is re-checked out of band.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.releaseTouchesIfNothingPresented()
         }
         hide()
+    }
+
+    /// Clears the touch-swallowing flag whenever nothing is actually presented,
+    /// so it can never be left stuck by a presentation that did not take.
+    private func releaseTouchesIfNothingPresented() {
+        let presenter = DebugWindowPresenter.shared
+        guard presenter.displayedList,
+              presenter.vc.presentedViewController == nil else { return }
+        presenter.displayedList = false
+        Settings.shared.debugUIVisible = false
+        refresh()
+    }
+
+    /// `true` only when `vc` can actually put a modal on screen: it has to be in
+    /// a visible window and not already busy presenting or being dismissed.
+    static func canPresentInbox(from vc: UIViewController) -> Bool {
+        guard vc.isViewLoaded, let window = vc.view.window, !window.isHidden else { return false }
+        guard vc.presentedViewController == nil else { return false }
+        guard !vc.isBeingPresented, !vc.isBeingDismissed else { return false }
+        return true
     }
 }
 

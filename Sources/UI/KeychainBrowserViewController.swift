@@ -549,58 +549,99 @@ enum KeychainInspector {
     }
 
     /// Friendly name for a short keychain attribute key (`acct` → `Account`).
-    static func attributeName(_ key: String) -> String {
+    ///
+    /// `itemClass` is what disambiguates the keys that **collide**: several
+    /// `kSecAttr*` constants share one short string, so the lookup table can
+    /// only carry one name for them and the item's class decides which name is
+    /// the truthful one (see `collidingAttributeKeys`). Passing `nil` keeps the
+    /// password-class wording.
+    static func attributeName(_ key: String, itemClass: KeychainItemClass? = nil) -> String {
+        // kSecAttrType and kSecAttrKeyType are both the literal string "type".
+        // On a key/identity that byte is the key algorithm, not a password's
+        // four-character type code.
+        if key == kSecAttrKeyType as String, let itemClass,
+           itemClass == .key || itemClass == .identity {
+            return "Key Type"
+        }
         if let known = knownAttributeNames[key] { return known }
         return key
     }
 
-    private static let knownAttributeNames: [String: String] = [
-        kSecAttrAccount as String: "Account",
-        kSecAttrService as String: "Service",
-        kSecAttrLabel as String: "Label",
-        kSecAttrAccessGroup as String: "Access Group",
-        kSecAttrAccessible as String: "Accessible",
-        kSecAttrCreationDate as String: "Created",
-        kSecAttrModificationDate as String: "Modified",
-        kSecAttrDescription as String: "Description",
-        kSecAttrComment as String: "Comment",
-        kSecAttrCreator as String: "Creator",
-        kSecAttrType as String: "Type",
-        kSecAttrIsInvisible as String: "Invisible",
-        kSecAttrIsNegative as String: "Negative",
-        kSecAttrGeneric as String: "Generic",
-        kSecAttrSynchronizable as String: "Synchronizable",
-        kSecAttrServer as String: "Server",
-        kSecAttrPort as String: "Port",
-        kSecAttrPath as String: "Path",
-        kSecAttrProtocol as String: "Protocol",
-        kSecAttrAuthenticationType as String: "Authentication Type",
-        kSecAttrSecurityDomain as String: "Security Domain",
-        kSecAttrCertificateType as String: "Certificate Type",
-        kSecAttrCertificateEncoding as String: "Certificate Encoding",
-        kSecAttrSubject as String: "Subject",
-        kSecAttrIssuer as String: "Issuer",
-        kSecAttrSerialNumber as String: "Serial Number",
-        kSecAttrSubjectKeyID as String: "Subject Key ID",
-        kSecAttrPublicKeyHash as String: "Public Key Hash",
-        kSecAttrKeyClass as String: "Key Class",
-        kSecAttrKeyType as String: "Key Type",
-        kSecAttrKeySizeInBits as String: "Key Size (bits)",
-        kSecAttrEffectiveKeySize as String: "Effective Key Size",
-        kSecAttrApplicationLabel as String: "Application Label",
-        kSecAttrApplicationTag as String: "Application Tag",
-        kSecAttrTokenID as String: "Token ID",
-        kSecAttrCanEncrypt as String: "Can Encrypt",
-        kSecAttrCanDecrypt as String: "Can Decrypt",
-        kSecAttrCanDerive as String: "Can Derive",
-        kSecAttrCanSign as String: "Can Sign",
-        kSecAttrCanVerify as String: "Can Verify",
-        kSecAttrCanWrap as String: "Can Wrap",
-        kSecAttrCanUnwrap as String: "Can Unwrap",
-        kSecAttrIsPermanent as String: "Permanent",
-        kSecValueData as String: "Value Data",
-        kSecValuePersistentRef as String: "Persistent Ref",
+    /// The readable names, as **pairs** rather than a dictionary literal.
+    ///
+    /// This list is deliberately not `[String: String]([...])` literal syntax:
+    /// `kSecAttrType` and `kSecAttrKeyType` are both `"type"`, and a dictionary
+    /// literal containing the same key twice traps at runtime — "Fatal error:
+    /// Dictionary literal contains duplicate keys" — the first time the lazy
+    /// static is touched, which was every single open of the keychain detail
+    /// screen. Built through `uniquingKeysWith:` instead, first entry wins, and
+    /// `attributeName(_:itemClass:)` recovers the losing name from the class.
+    static let knownAttributeNamePairs: [(key: String, name: String)] = [
+        (kSecAttrAccount as String, "Account"),
+        (kSecAttrService as String, "Service"),
+        (kSecAttrLabel as String, "Label"),
+        (kSecAttrAccessGroup as String, "Access Group"),
+        (kSecAttrAccessible as String, "Accessible"),
+        (kSecAttrCreationDate as String, "Created"),
+        (kSecAttrModificationDate as String, "Modified"),
+        (kSecAttrDescription as String, "Description"),
+        (kSecAttrComment as String, "Comment"),
+        (kSecAttrCreator as String, "Creator"),
+        (kSecAttrType as String, "Type"),
+        (kSecAttrIsInvisible as String, "Invisible"),
+        (kSecAttrIsNegative as String, "Negative"),
+        (kSecAttrGeneric as String, "Generic"),
+        (kSecAttrSynchronizable as String, "Synchronizable"),
+        (kSecAttrServer as String, "Server"),
+        (kSecAttrPort as String, "Port"),
+        (kSecAttrPath as String, "Path"),
+        (kSecAttrProtocol as String, "Protocol"),
+        (kSecAttrAuthenticationType as String, "Authentication Type"),
+        (kSecAttrSecurityDomain as String, "Security Domain"),
+        (kSecAttrCertificateType as String, "Certificate Type"),
+        (kSecAttrCertificateEncoding as String, "Certificate Encoding"),
+        (kSecAttrSubject as String, "Subject"),
+        (kSecAttrIssuer as String, "Issuer"),
+        (kSecAttrSerialNumber as String, "Serial Number"),
+        (kSecAttrSubjectKeyID as String, "Subject Key ID"),
+        (kSecAttrPublicKeyHash as String, "Public Key Hash"),
+        (kSecAttrKeyClass as String, "Key Class"),
+        (kSecAttrKeyType as String, "Key Type"),
+        (kSecAttrKeySizeInBits as String, "Key Size (bits)"),
+        (kSecAttrEffectiveKeySize as String, "Effective Key Size"),
+        (kSecAttrApplicationLabel as String, "Application Label"),
+        (kSecAttrApplicationTag as String, "Application Tag"),
+        (kSecAttrTokenID as String, "Token ID"),
+        (kSecAttrCanEncrypt as String, "Can Encrypt"),
+        (kSecAttrCanDecrypt as String, "Can Decrypt"),
+        (kSecAttrCanDerive as String, "Can Derive"),
+        (kSecAttrCanSign as String, "Can Sign"),
+        (kSecAttrCanVerify as String, "Can Verify"),
+        (kSecAttrCanWrap as String, "Can Wrap"),
+        (kSecAttrCanUnwrap as String, "Can Unwrap"),
+        (kSecAttrIsPermanent as String, "Permanent"),
+        (kSecValueData as String, "Value Data"),
+        (kSecValuePersistentRef as String, "Persistent Ref"),
     ]
+
+    /// `knownAttributeNamePairs` collapsed into a lookup. `uniquingKeysWith:`
+    /// is load-bearing, not defensive style: with a literal this static traps.
+    private static let knownAttributeNames: [String: String] = Dictionary(
+        knownAttributeNamePairs.map { ($0.key, $0.name) },
+        uniquingKeysWith: { first, _ in first }
+    )
+
+    /// The short keys that more than one `kSecAttr*` constant resolves to.
+    /// Non-empty on every SDK shipped so far (`"type"`), and the reason the
+    /// table above cannot be a dictionary literal.
+    static var collidingAttributeKeys: Set<String> {
+        var seen: Set<String> = []
+        var collisions: Set<String> = []
+        for pair in knownAttributeNamePairs where !seen.insert(pair.key).inserted {
+            collisions.insert(pair.key)
+        }
+        return collisions
+    }
 }
 
 // MARK: - Browser
@@ -1521,12 +1562,14 @@ final class KeychainItemDetailViewController: UITableViewController {
         }
 
         // Every raw attribute, alphabetical by readable name.
+        let itemClass = item.itemClass
         let attributes = item.attributes.sorted {
-            KeychainInspector.attributeName($0.key).localizedCaseInsensitiveCompare(
-                KeychainInspector.attributeName($1.key)) == .orderedAscending
+            KeychainInspector.attributeName($0.key, itemClass: itemClass)
+                .localizedCaseInsensitiveCompare(
+                    KeychainInspector.attributeName($1.key, itemClass: itemClass)) == .orderedAscending
         }
         for (key, value) in attributes {
-            let caption = "\(KeychainInspector.attributeName(key))  ·  \(key)"
+            let caption = "\(KeychainInspector.attributeName(key, itemClass: itemClass))  ·  \(key)"
             if key == kSecValueData as String {
                 result.append((caption, revealed ? item.revealedSecretDisplay : item.maskedSecretDisplay))
             } else {

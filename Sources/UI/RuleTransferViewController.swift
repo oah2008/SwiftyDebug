@@ -179,6 +179,8 @@ class RuleTransferViewController: UITableViewController {
                 color: .white
             )
             cell.textLabel?.attributedText = RuleTransferFormatter.attributedTitle(for: rule)
+            // Paths and hosts, so monospaced — see `detailFont`.
+            cell.detailTextLabel?.font = InterceptRuleRowFormatter.detailFont
             cell.selectionStyle = .default
             let isSelected = selectedIds.contains(rule.id)
             cell.accessoryType = isSelected ? .checkmark : .none
@@ -412,54 +414,32 @@ private class RulePasteViewController: UIViewController {
 
 // MARK: - Shared formatting
 
+/// Rule rows on the export picker and the import preview.
+///
+/// A thin pass-through to `InterceptRuleRowFormatter` so a rule reads the same
+/// here as it does in the rule list and the App tab. It used to build its own
+/// summary out of header and query-parameter counts, which meant a rule you were
+/// about to export — a mock, a breakpoint, a rewrite — was listed as
+/// "Empty rule" and gave you no way to tell one exported rule from another.
 enum RuleTransferFormatter {
 
-    /// "PATTERN  /api/users/{id}" with the mode badge tinted, matching the App tab's rule rows.
+    /// "PATTERN  Mock 404" with the mode badge tinted, matching the App tab's rule rows.
     static func attributedTitle(for rule: InterceptRule) -> NSAttributedString {
-        let scope: String
-        switch rule.matchMode {
-        case .global: scope = "All Requests"
-        case .host:   scope = rule.matchHosts.joined(separator: ", ")
-        default:      scope = rule.matchEndpoint
-        }
-
-        let title = NSMutableAttributedString(string: "\(badge(for: rule.matchMode))  ", attributes: [
-            .font: UIFont.systemFont(ofSize: 9, weight: .bold),
-            .foregroundColor: color(for: rule.matchMode),
-        ])
-        title.append(NSAttributedString(string: scope, attributes: [
-            .font: UIFont(name: "Menlo", size: 12) ?? .monospacedSystemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: UIColor.white,
-        ]))
-        return title
+        InterceptRuleRowFormatter.attributedTitle(for: rule)
     }
 
+    /// Scope plus anything that would stop the rule firing. These screens have no
+    /// enable switch of their own, so a disabled rule has to say so here or the
+    /// user exports something inert without noticing.
     static func subtitle(for rule: InterceptRule) -> String {
-        if rule.isBlocked { return "Blocks the request" }
-        var parts: [String] = []
-        let headers = rule.headerOverrides.count + rule.removedHeaderKeys.count
-        let params = rule.queryParamOverrides.count + rule.removedQueryParamKeys.count
-        if headers > 0 { parts.append("\(headers) header\(headers == 1 ? "" : "s")") }
-        if params > 0 { parts.append("\(params) param\(params == 1 ? "" : "s")") }
-        if !rule.isEnabled { parts.append("disabled") }
-        return parts.isEmpty ? "Empty rule" : parts.joined(separator: ", ")
+        InterceptRuleRowFormatter.detailText(for: rule, includeEnabledState: true)
     }
 
     static func badge(for mode: EndpointMatchMode) -> String {
-        switch mode {
-        case .exact:      return "EXACT"
-        case .normalized: return "PATTERN"
-        case .host:       return "HOST"
-        case .global:     return "GLOBAL"
-        }
+        InterceptRuleRowFormatter.badge(for: mode)
     }
 
     static func color(for mode: EndpointMatchMode) -> UIColor {
-        switch mode {
-        case .exact:      return .systemOrange
-        case .normalized: return DebugTheme.accentColor
-        case .host:       return .systemPurple
-        case .global:     return .systemPink
-        }
+        InterceptRuleRowFormatter.color(for: mode)
     }
 }

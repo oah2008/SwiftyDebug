@@ -84,6 +84,10 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
     /// The response parsed once. Every match count and every preview runs
     /// against this, so the numbers on screen are about the body in hand.
+    /// The sample body as text, used as `JSONDocument`'s source so key order and
+    /// number spelling match what the server actually sent.
+    private lazy var sampleBodyText: String? = sampleBody.flatMap { String(data: $0, encoding: .utf8) }
+
     private lazy var sampleRoot: Any? = {
         guard let body = sampleBody, !body.isEmpty,
               body.count <= ResponseRewriteEngine.maxBodyBytes else { return nil }
@@ -286,7 +290,7 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
     private func valueInSample(at path: JSONPath) -> Any? {
         guard let root = sampleRoot else { return nil }
-        return JSONDocument(root: root).value(at: path)
+        return JSONDocument(root: root, sourceText: sampleBodyText).value(at: path)
     }
 
     /// Leads with the action that fits what the value looks like: a URL becomes
@@ -877,7 +881,8 @@ final class ResponseRewriteEditorViewController: UITableViewController {
                       "There is no JSON response captured for this rule yet. Type the path below instead.")
             return
         }
-        let document = JSONDocument(root: root)
+        // Carry the source bytes so the picker shows the server's own key order.
+        let document = JSONDocument(root: root, sourceText: sampleBodyText)
         let picker = JSONEditorViewController(document: document, title: "Choose a value")
         picker.onPickPath = { [weak self] path in
             guard let self else { return }
@@ -1055,14 +1060,21 @@ final class ResponseRewriteEditorViewController: UITableViewController {
         let mode = destinationMode
         let key = Self.ruleKey(for: mode, url: url)
         var rule: InterceptRule
-        if let existing = InterceptRuleStore.shared.rules(for: key).first(where: { $0.matchMode == mode }) {
+        // `rules(for:)` deliberately returns EVERY host-pinned variant of an
+        // endpoint, so `.first` would happily attach this rewrite to a rule
+        // pinned to a different host. Prefer this host's rule, then a legacy
+        // any-host one, and only then create a new pinned rule.
+        let host = InterceptRule.canonicalHost(url.host ?? "")
+        let candidates = InterceptRuleStore.shared.rules(for: key).filter { $0.matchMode == mode }
+        if let existing = candidates.first(where: { $0.matchHost == host })
+            ?? candidates.first(where: { $0.matchHost.isEmpty }) {
             rule = existing
         } else if mode == .host {
             rule = InterceptRule.hostRule(hosts: [(url.host ?? "").lowercased()])
         } else if mode == .global {
             rule = InterceptRule.globalRule()
         } else {
-            rule = InterceptRule(matchEndpoint: key, matchMode: mode)
+            rule = InterceptRule.endpointRule(path: key, mode: mode, host: url.host)
         }
 
         if let index = rule.responseRewrites.firstIndex(where: { $0.id == rewrite.id }) {

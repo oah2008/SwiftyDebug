@@ -102,9 +102,9 @@ struct ParsedCurlRequest: Equatable {
         case .host:
             rule = InterceptRule.hostRule(hosts: [url.host ?? ""])
         case .exact:
-            rule = InterceptRule(matchEndpoint: url.path, matchMode: .exact)
+            rule = InterceptRule.endpointRule(path: url.path, mode: .exact, host: url.host)
         case .normalized:
-            rule = InterceptRule(matchEndpoint: EndpointNormalizer.normalize(url.path), matchMode: .normalized)
+            rule = InterceptRule.endpointRule(path: EndpointNormalizer.normalize(url.path), mode: .normalized, host: url.host)
         }
 
         // A rule holds one value per key: keep the last occurrence, original order.

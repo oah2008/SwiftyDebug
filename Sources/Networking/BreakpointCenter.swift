@@ -135,8 +135,16 @@ final class BreakpointCenter {
     /// Records why an armed breakpoint never paused, so it shows up in the inbox
     /// the developer is actually looking at.
     func note(_ message: String, for url: URL?, at date: Date = Date()) {
+        let key = url?.absoluteString ?? "\u{2014}"
         lock.lock()
-        noticeLog.insert(Notice(url: url?.absoluteString ?? "\u{2014}", message: message, at: date), at: 0)
+        // De-duplicate on (url, message). An app polling a mocked endpoint that
+        // also has a breakpoint armed produces one of these per request, which
+        // filled all 20 slots with the same sentence and evicted every other
+        // notice. The newest occurrence wins its place at the top.
+        if let existing = noticeLog.firstIndex(where: { $0.url == key && $0.message == message }) {
+            noticeLog.remove(at: existing)
+        }
+        noticeLog.insert(Notice(url: key, message: message, at: date), at: 0)
         if noticeLog.count > Self.maxNotices { noticeLog.removeLast(noticeLog.count - Self.maxNotices) }
         lock.unlock()
         notifyChanged()

@@ -269,6 +269,18 @@ private let sdkHandlerNamesKey = UnsafeRawPointer(
 private let sdkInstrumentedKey = UnsafeRawPointer(
     UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1))
 
+/// Marks a web view whose `customUserAgent` **this SDK** set, so it can be given
+/// back when the rule goes away.
+///
+/// An address, not a `String`. A Swift string literal used as an associated
+/// object key is not a stable pointer: at `-Onone` — which is how this debug-only
+/// SDK ships — each reference can bridge to a fresh `NSString`, so the write and
+/// the read use different keys, the read-back returns nil, and the override is
+/// never reverted. It happens to work at `-O` through constant folding, which is
+/// why a Release build will not show it. (See WEBVIEW-UA-REVERT.)
+private let sdkSetUserAgentKey = UnsafeRawPointer(
+    UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1))
+
 extension WKUserContentController {
 
     /// The channels **this SDK** registered on this content controller. Anything
@@ -389,19 +401,31 @@ extension WKUserContentController {
         // Apply the User-Agent override only when a rule provides one. Never
         // clobber an app-set customUserAgent: only overwrite/clear the UA if
         // SwiftyDebug was the one that set it (tracked via associated object).
-        let sdkSetUAKey = "com.swiftydebug.sdkSetUserAgent"
-        let previouslySDKSet = objc_getAssociatedObject(webView, sdkSetUAKey) as? Bool ?? false
         if let userAgent {
             webView.customUserAgent = userAgent
-            objc_setAssociatedObject(webView, sdkSetUAKey, true, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-        } else if previouslySDKSet {
+            setUserAgentOwnedBySDK(webView, true)
+        } else if isUserAgentOwnedBySDK(webView) {
             // A rule that used to set the UA was removed — restore the default.
             webView.customUserAgent = nil
-            objc_setAssociatedObject(webView, sdkSetUAKey, false, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            setUserAgentOwnedBySDK(webView, false)
         }
         // else: no UA rule and we never set one — leave the app's UA untouched.
 
         applyCookieOverrides(to: webView.configuration.websiteDataStore.httpCookieStore)
+    }
+
+    /// True while `webView.customUserAgent` is a value **this SDK** wrote.
+    ///
+    /// The whole revert path hangs off this read: if it comes back false when it
+    /// should be true, the host app is left running with a debugger's User-Agent
+    /// forever, and nothing says so. Internal rather than private so a test can
+    /// prove the flag survives the round trip.
+    static func isUserAgentOwnedBySDK(_ webView: WKWebView) -> Bool {
+        objc_getAssociatedObject(webView, sdkSetUserAgentKey) as? Bool ?? false
+    }
+
+    private static func setUserAgentOwnedBySDK(_ webView: WKWebView, _ owned: Bool) {
+        objc_setAssociatedObject(webView, sdkSetUserAgentKey, owned, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
     }
 
     /// Reconciles the Cookie header overrides into `store`: writes exactly the
@@ -530,6 +554,14 @@ extension WKUserContentController {
     /// registered are removed; the injected user scripts stay, because WebKit
     /// offers no API to remove one script, and every `postMessage` they make is
     /// wrapped in `try/catch` so posting to a detached channel is inert.
+    ///
+    /// - Important: the handler removal is not only tidiness — it is what makes
+    ///   the kill-switch survive a navigation. The `__cd_setEnabled(false)` push
+    ///   below only reaches documents that exist right now; the user scripts
+    ///   re-run on the next page load and re-arm the flag. The injected engine
+    ///   therefore also asks, per request, whether the SDK's channel is still
+    ///   registered, and WebKit answers that live. Removing the handlers is the
+    ///   half a page load cannot undo, so it must keep happening here.
     static func pushEnabledStateToWebViews(enabled: Bool) {
         let js = "if(window.__cd_setEnabled)window.__cd_setEnabled(\(enabled ? "true" : "false"));"
         let run = {
@@ -887,8 +919,27 @@ enum WebViewInjectedScript {
         /* ── Master enable flag (kill-switch). When disabled, hooks pass through. ── */
         if(typeof window.__cd_enabled==='undefined')window.__cd_enabled=true;
         window.__cd_setEnabled=function(v){window.__cd_enabled=!!v;};
+        /* …and the half of the kill-switch a page load cannot undo. A full stop
+           pushes `__cd_setEnabled(false)` into the documents that exist *now*,
+           but `window` dies with the document and WebKit offers no API to remove
+           an installed user script: the next navigation re-ran this file, took
+           the `undefined` branch above, and re-armed itself. A stopped SDK went
+           back to blocking and rewriting the host app's own traffic on the next
+           tap, forever.
+           So enablement is also derived from the one thing only native grants
+           and a re-injection cannot forge: the SDK's own message channel, which
+           a full stop unregisters. WebKit reflects that removal live — in the
+           document already loaded, in every later one, and in sub-frames — so a
+           stopped SDK is inert everywhere until native registers the channel
+           again. Asked per request, never cached.
+           `resolveRules` stays a pure matcher — "which rules match this URL" —
+           and every hook asks `cdOn()` before it is allowed to act on the
+           answer, so there is exactly one gate per entry point. */
+        function chanUp(){try{return !!(window.webkit&&window.webkit.messageHandlers
+        &&window.webkit.messageHandlers.\(WebViewMessageChannel.networkCapture));}catch(e){return false;}}
+        function cdOn(){return window.__cd_enabled!==false&&chanUp();}
         function trunc(s){if(typeof s==='string'&&s.length>MAX_BODY)return s.substring(0,MAX_BODY);return s;}
-        function post(d){if(!window.__cd_enabled)return;try{window.webkit.messageHandlers.\(WebViewMessageChannel.networkCapture).postMessage(JSON.stringify(d));}catch(e){}}
+        function post(d){if(!cdOn())return;try{window.webkit.messageHandlers.\(WebViewMessageChannel.networkCapture).postMessage(JSON.stringify(d));}catch(e){}}
         function parseH(raw){var h={};if(!raw)return h;var lines=raw.trim().split('\\r\\n');
         for(var i=0;i<lines.length;i++){var idx=lines[i].indexOf(':');
         if(idx>0)h[lines[i].substring(0,idx).trim()]=lines[i].substring(idx+1).trim();}return h;}
@@ -919,6 +970,14 @@ enum WebViewInjectedScript {
         if(p.charAt(p.length-1)==='/')p=p.substring(0,p.length-1);
         return stripped===p||stripped.indexOf(p+'/')===0;}
 
+        /* An endpoint rule may be PINNED to one host (`matchHost`). Empty means
+           any host, which is what every rule written before host pinning has.
+           Without this check a rule pinned to api.example.com fired on every
+           host inside a web view while behaving correctly on native traffic. */
+        function hostOf(u){try{return new URL(u,document.baseURI).hostname.toLowerCase();}catch(e){return '';}}
+        function pinAllows(r,u){if(!r.matchHost)return true;
+        return hostOf(u)===String(r.matchHost).toLowerCase();}
+
         function resolveRules(urlStr){
         if(!window.__cd_enabled)return null;
         var rules=window.__cd_intercept_rules;if(!rules||!rules.length)return null;
@@ -926,8 +985,8 @@ enum WebViewInjectedScript {
         var matched=[];
         for(var i=0;i<rules.length;i++){var r=rules[i];
         if(r.matchMode==='global'){matched.push(r);}
-        else if(r.matchMode==='exact'&&r.matchEndpoint===path){matched.push(r);}
-        else if(r.matchMode==='normalized'&&r.matchEndpoint===norm){matched.push(r);}
+        else if(r.matchMode==='exact'&&r.matchEndpoint===path&&pinAllows(r,urlStr)){matched.push(r);}
+        else if(r.matchMode==='normalized'&&r.matchEndpoint===norm&&pinAllows(r,urlStr)){matched.push(r);}
         else if(r.matchMode==='host'&&r.matchHosts){
         for(var j=0;j<r.matchHosts.length;j++){if(hostMatch(stripped,r.matchHosts[j])){matched.push(r);break;}}}}
         if(!matched.length)return null;
@@ -982,21 +1041,73 @@ enum WebViewInjectedScript {
         var origOpen=XMLHttpRequest.prototype.open;
         var origSend=XMLHttpRequest.prototype.send;
         var origSetH=XMLHttpRequest.prototype.setRequestHeader;
+        /* The page's own `readyState` getter, kept so a blocked request can
+           report DONE without lying to a page that re-opens the same object. */
+        var rsDesc=Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype,'readyState');
+        var rsGet=rsDesc&&rsDesc.get;
+        var rsSet=rsDesc&&rsDesc.set;
+
+        /* A blocked request has to fail the way an unreachable server does.
+           `abort()` before `send()` is observably NOTHING — the spec only errors
+           a request that is already in flight — so a blocked XHR fired no error,
+           no abort, no loadend and no readystatechange, `readyState` sat at
+           OPENED, and the page's completion path simply never ran: its callback
+           waited for a response that could not arrive.
+           Nothing is sent. The *terminal state* of a network error is
+           synthesised instead, and only `readyState` has to be faked for it:
+           with no response, `status`, `statusText`, `responseText`,
+           `responseURL` and `getAllResponseHeaders()` already read exactly as
+           they do after a real failure (0, '', '', '', ''). */
+        function cdEvent(type){try{return new ProgressEvent(type);}catch(e){}
+        try{return new Event(type);}catch(e2){}return{type:type};}
+        function failBlocked(x){
+        if(x._cd)x._cd.blocked=true;
+        /* configurable AND with a setter: without one, an implementation whose
+           readyState is a writable own property throws on the next x.open(), so
+           reusing a blocked XHR object broke the page. The setter is a no-op
+           while blocked and forwards otherwise. */
+        try{Object.defineProperty(x,'readyState',{configurable:true,
+        get:function(){return(this._cd&&this._cd.blocked)?4:(rsGet?rsGet.call(this):0);},
+        set:function(v){if(rsSet)try{rsSet.call(this,v);}catch(e){}}});}catch(e){}
+        var fire=function(){
+        try{x.dispatchEvent(cdEvent('loadstart'));}catch(e){}
+        try{x.dispatchEvent(cdEvent('readystatechange'));}catch(e){}
+        try{x.dispatchEvent(cdEvent('error'));}catch(e){}
+        try{x.dispatchEvent(cdEvent('loadend'));}catch(e){}};
+        /* Asynchronously, like a real failure: handlers a page attaches after
+           calling send() still have to run, and no page expects its error path
+           to re-enter it from inside send(). */
+        if(typeof setTimeout==='function')setTimeout(fire,0);else fire();}
 
         XMLHttpRequest.prototype.open=function(method,url){
         var urlStr=String(url);
         var fullUrl=resolveUrl(urlStr);
-        var rule=resolveRules(fullUrl);
+        /* `cdOn()` first: a stopped SDK must not intercept, even in a document
+           that re-injected this file after the stop. (See the kill-switch note.) */
+        var rule=cdOn()?resolveRules(fullUrl):null;
         this._cd={method:method,url:fullUrl,headers:{},startTime:Date.now(),rule:rule};
         if(rule){var effectiveUrl=applyRedirect(applyQueryParams(fullUrl,rule),rule);this._cd.url=effectiveUrl;
         var args=Array.prototype.slice.call(arguments);args[1]=effectiveUrl;
         return origOpen.apply(this,args);}
+        if(this._cd)this._cd.blocked=false;   /* a reused object is not still blocked */
         return origOpen.apply(this,arguments);};
 
         XMLHttpRequest.prototype.setRequestHeader=function(k,v){
-        if(this._cd){
-        if(this._cd.rule){for(var i=0;i<this._cd.rule.removedHeaderKeys.length;i++){
-        if(this._cd.rule.removedHeaderKeys[i].toLowerCase()===k.toLowerCase()){this._cd.headers[k]=v;return;}}}
+        if(this._cd){var r=this._cd.rule,lk=String(k).toLowerCase();
+        if(r){
+        for(var i=0;i<r.removedHeaderKeys.length;i++){
+        if(String(r.removedHeaderKeys[i]).toLowerCase()===lk){this._cd.headers[k]=v;return;}}
+        /* An override has to REPLACE. `setRequestHeader` *combines* repeated
+           values for one name — "a" then "b" is sent as "a, b", case-insensitively
+           — so forwarding the page's own call and then setting the override in
+           send() put BOTH on the wire: the page's original Authorization
+           travelled to the server alongside the one the rule specified. The
+           page's value is dropped here; the override is applied once, in send().
+           Every other name is forwarded untouched, so repeated calls the page
+           makes for a name no rule overrides still combine exactly as the XHR
+           spec requires. */
+        for(var i=0;i<r.headerOverrides.length;i++){
+        if(String(r.headerOverrides[i].key).toLowerCase()===lk)return;}}
         this._cd.headers[k]=v;}
         return origSetH.apply(this,arguments);};
 
@@ -1006,7 +1117,7 @@ enum WebViewInjectedScript {
         if(rule){
         if(rule.isBlocked){var d=this._cd;d.body=(typeof body==='string')?trunc(body):null;
         d.requestHeaders=d.headers;d.status=0;d.statusText='Blocked by SwiftyDebug';d.responseHeaders={};d.responseBody=null;
-        d.endTime=Date.now();d.type='xhr';d.intercepted=true;post(d);this.abort();return;}
+        d.endTime=Date.now();d.type='xhr';d.intercepted=true;post(d);failBlocked(this);return;}
         for(var i=0;i<rule.headerOverrides.length;i++){var ho=rule.headerOverrides[i];
         this._cd.headers[ho.key]=ho.value;origSetH.call(this,ho.key,ho.value);}
         this._cd.intercepted=true;}
@@ -1064,7 +1175,8 @@ enum WebViewInjectedScript {
         if(init.body&&typeof init.body==='string')body=trunc(init.body);}
         method=method||'GET';
         var fullUrl=resolveUrl(url);
-        var rule=resolveRules(fullUrl);
+        /* Same gate as the XHR hook: stopped means stopped. */
+        var rule=cdOn()?resolveRules(fullUrl):null;
         /* One place that actually calls through and logs, so every path below —
            untouched, rewritten, or rebuilt-after-reading-the-body — reports the
            same way. */
@@ -1089,7 +1201,7 @@ enum WebViewInjectedScript {
         post({type:'fetch',url:fullUrl,method:method.toUpperCase(),requestHeaders:headers,body:body,
         status:0,statusText:'Blocked by SwiftyDebug',responseHeaders:{},responseBody:null,
         startTime:blockedAt,endTime:Date.now(),intercepted:true});
-        return Promise.reject(new Error('Blocked by SwiftyDebug intercept rule'));}
+        return Promise.reject(new TypeError('Blocked by SwiftyDebug intercept rule'));}
         var newUrl=applyRedirect(applyQueryParams(fullUrl,rule),rule);
         for(var i=0;i<rule.removedHeaderKeys.length;i++){var rk=rule.removedHeaderKeys[i];
         var hks=Object.keys(headers);for(var j=0;j<hks.length;j++){if(hks[j].toLowerCase()===rk.toLowerCase())delete headers[hks[j]];}}

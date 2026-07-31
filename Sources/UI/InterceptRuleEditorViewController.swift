@@ -10,6 +10,7 @@ import UIKit
 /// Editor for creating or editing a single intercept rule.
 ///
 /// Layout (mobile-first):
+///   NAME       — what to call this rule; blank keeps the auto-derived name
 ///   SCOPE      — how the rule matches (pattern / exact / hosts / global)
 ///   ACTION     — block, redirect, delete
 ///   REWRITES   — automated edits applied to the response body (see RESPONSE-REWRITE)
@@ -34,15 +35,32 @@ class InterceptRuleEditorViewController: UITableViewController {
     // MARK: - Sections
 
     private enum Section: Int, CaseIterable {
-        case endpoint = 0
-        case action = 1
+        /// First, because it is the one thing that makes a rule identifiable in
+        /// every list that shows it. Mocks, breakpoints and rewrites had no name
+        /// at all, so a list of them read as a list of "Empty rule".
+        case name = 0
+        case endpoint = 1
+        case action = 2
         /// Sits with the other "what to do with a matching request" choices —
         /// a rewrite is the same kind of decision as mock/breakpoint/redirect.
-        case responseRewrites = 2
-        case headers = 3
-        case availableHeaders = 4
-        case queryParams = 5
-        case availableParams = 6
+        case responseRewrites = 3
+        case headers = 4
+        case availableHeaders = 5
+        case queryParams = 6
+        case availableParams = 7
+    }
+
+    /// The rows of the ENDPOINT section, as a list rather than as row numbers.
+    /// The host row is only offered when there is a real host to pin to, so the
+    /// row indices move — naming them keeps `cellForRowAt` and `didSelectRowAt`
+    /// from disagreeing about what row 2 is.
+    private enum EndpointRow {
+        /// Pattern / Exact.
+        case mode
+        /// The path this rule matches, shown in full.
+        case path
+        /// This host only, or any host.
+        case hostScope
     }
 
     struct EditItem {
@@ -72,9 +90,25 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     // MARK: - State
 
+    /// The literal path an `.exact` rule matches — the FULL path, never a
+    /// pattern. Empty means "no concrete path is known here" (editing a pattern
+    /// rule with no captured request behind it), and Exact is then not offered
+    /// rather than silently saving `/product/{id}` as an exact path that no
+    /// request can ever equal.
     private var requestPath = ""
+    /// The pattern a `.normalized` rule matches (`/product/{id}/{id}`).
     private var normalizedPath = ""
+    /// Host of the request that opened this screen, lowercased. The candidate
+    /// for the host pin.
     private var requestHost = ""
+    /// The host an endpoint rule is pinned to. Empty = ANY host.
+    private var matchHost = ""
+    /// What the user typed in NAME. Empty on purpose when they did not type
+    /// anything: the rule then keeps deriving its name from what it does, so
+    /// arming a mock later renames it instead of leaving a stale label behind.
+    private var ruleName = ""
+    /// The host-vs-any-host question is asked once, on first appearance.
+    private var didAskHostScope = false
     private var matchMode: EndpointMatchMode = .normalized
     private var selectedHosts: [String] = []
     private var isBlocked = false
@@ -120,6 +154,8 @@ class InterceptRuleEditorViewController: UITableViewController {
         table.delegate = self
         tableView = table
         tableView.register(KeyValueCardCell.self, forCellReuseIdentifier: "Card")
+        tableView.register(RuleNameCell.self, forCellReuseIdentifier: "Name")
+        tableView.register(EndpointPathCell.self, forCellReuseIdentifier: "Path")
         tableView.backgroundColor = .black
         tableView.separatorStyle = .none
         tableView.rowHeight = UITableView.automaticDimension
@@ -132,30 +168,64 @@ class InterceptRuleEditorViewController: UITableViewController {
         view.forceLTR()
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        askHostScopeIfNeeded()
+    }
+
+    /// Asks, once, whether a NEW endpoint rule means "this endpoint on this
+    /// host" or "this endpoint anywhere".
+    ///
+    /// Asked rather than assumed because the two answers are genuinely different
+    /// rules and the old behaviour — path only, every host — is the surprising
+    /// one: a rule for `/api/users` fired on staging, production and every third
+    /// party that happens to use the same path. The pin is the default for that
+    /// reason; the sheet is dismissible and dismissing it keeps the default.
+    private func askHostScopeIfNeeded() {
+        guard !didAskHostScope else { return }
+        guard existingRule == nil,
+              matchMode == .exact || matchMode == .normalized,
+              !requestHost.isEmpty,
+              presentedViewController == nil
+        else { return }
+        didAskHostScope = true
+        presentHostScopePicker()
+    }
+
     // MARK: - Populate
 
     private func populateFromModel() {
         if let model = httpModel {
             requestPath = model.url?.path ?? ""
             normalizedPath = EndpointNormalizer.normalize(requestPath)
-            requestHost = (model.url?.host ?? "").lowercased()
-            if let ruleId = existingRuleId, let url = model.url as URL? {
-                existingRule = InterceptRuleStore.shared.matchingRules(forURL: url).first { $0.id == ruleId }
-            }
-        } else if let rule = ruleToEdit {
+            requestHost = InterceptRule.canonicalHost(model.url?.host ?? "")
+        }
+        // A rule handed in directly wins over an id to look up, and — unlike
+        // before — is honoured even when a captured request came along with it.
+        // The two are not alternatives: the request supplies the concrete path
+        // and host, the rule supplies what it currently matches.
+        if let rule = ruleToEdit {
             existingRule = rule
             existingRuleId = rule.id
-            if rule.matchMode == .host {
-                selectedHosts = rule.matchHosts
-            } else if rule.matchMode != .global {
-                requestPath = rule.matchEndpoint
-                normalizedPath = rule.matchEndpoint
-            }
+        } else if let ruleId = existingRuleId {
+            // The URL lookup is the fast path; `allRules()` is the safety net.
+            // Failing to find the rule being edited used to mean Save quietly
+            // created a SECOND rule and left the original behind, still armed.
+            let byURL = (httpModel?.url as URL?).map { InterceptRuleStore.shared.matchingRules(forURL: $0) } ?? []
+            existingRule = byURL.first { $0.id == ruleId }
+                ?? InterceptRuleStore.shared.allRules().first { $0.id == ruleId }
         }
 
         if let rule = existingRule {
             matchMode = rule.matchMode
             selectedHosts = rule.matchHosts
+            matchHost = InterceptRule.canonicalHost(rule.matchHost)
+            ruleName = rule.name
+            // The RULE's own scope wins over whichever request happened to open
+            // this screen. Seeding the path from `httpModel` instead showed a
+            // path the rule does not match, and Save then re-keyed the rule onto
+            // it — silently changing what it intercepts.
+            seedEndpointFields(from: rule)
             isBlocked = rule.isBlocked
             redirectMode = rule.redirectMode
             redirectTarget = rule.redirectTarget
@@ -183,9 +253,48 @@ class InterceptRuleEditorViewController: UITableViewController {
             // for it. Host/global rules stay empty on purpose: they match many
             // endpoints, so one endpoint's headers would be misleading.
             if matchMode == .exact || matchMode == .normalized {
+                // Pinned by default; `askHostScopeIfNeeded()` offers the other
+                // answer before anything is saved. Existing rules on disk keep
+                // their empty pin and their any-host behaviour.
+                matchHost = requestHost
                 prefillFromEndpoint()
             }
         }
+    }
+
+    /// Fills the Pattern and Exact fields from a rule, keeping them DISTINCT.
+    ///
+    /// They used to both be set to `rule.matchEndpoint`, so a pattern rule showed
+    /// `/product/{id}/{id}` under *Exact* as well; tapping Exact then saved that
+    /// pattern as an exact path, which no `url.path` can ever equal. Every such
+    /// rule was inert and — because the endpoint was the whole storage key —
+    /// they all landed in the same bucket and overwrote each other. That is the
+    /// "exact rules override each other" the report opens with.
+    ///
+    /// Pure and `static` so both halves are covered by tests: an exact rule keeps
+    /// its full literal path, a pattern rule only offers Exact when a captured
+    /// request is a real instance of that pattern.
+    static func endpointSeed(for rule: InterceptRule,
+                             capturedPath: String) -> (exact: String, pattern: String) {
+        switch rule.matchMode {
+        case .global, .host:
+            return (capturedPath, EndpointNormalizer.normalize(capturedPath))
+        case .exact:
+            // The full path, verbatim. Nothing here shortens it.
+            return (rule.matchEndpoint, EndpointNormalizer.normalize(rule.matchEndpoint))
+        case .normalized:
+            let pattern = rule.matchEndpoint
+            let concrete = EndpointNormalizer.normalize(capturedPath) == pattern ? capturedPath : ""
+            return (concrete, pattern)
+        }
+    }
+
+    private func seedEndpointFields(from rule: InterceptRule) {
+        guard rule.matchMode == .exact || rule.matchMode == .normalized else { return }
+        let seed = Self.endpointSeed(for: rule, capturedPath: requestPath)
+        requestPath = seed.exact
+        normalizedPath = seed.pattern
+        if requestHost.isEmpty { requestHost = InterceptRule.canonicalHost(rule.matchHost) }
     }
 
     /// Seeds a NEW endpoint-scoped rule with the headers and query parameters
@@ -270,26 +379,113 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     @objc private func cancelTapped() { dismiss(animated: true) }
 
-    @objc private func saveTapped() {
+    /// What Save decided. `internal` with a case per refusal so the whole
+    /// build-and-validate step is testable without a store, a window or disk.
+    enum SaveOutcome {
+        case ok(InterceptRule)
+        /// `.host` mode with nothing selected.
+        case noHosts
+        /// An endpoint rule with no path to match — the Exact field is empty.
+        case noEndpoint
+        /// Nothing armed: the rule would be saved and do nothing.
+        case noEffect
+    }
+
+    /// Builds the rule Save would write, or says why it will not.
+    ///
+    /// The scope is applied to `existingRule` itself rather than only to a
+    /// freshly-made one. It used to read
+    /// `rule = existingRule ?? InterceptRule(matchEndpoint: endpoint, ...)`, and
+    /// on the `existingRule` branch `matchEndpoint` was NEVER assigned — so
+    /// editing a rule and switching Pattern → Exact changed `matchMode` and left
+    /// the pattern in place, and the "did the endpoint change?" guard compared
+    /// the rule with itself and could never fire. Re-keying is now unconditional:
+    /// mode, path and host pin are written every time, and the store re-files the
+    /// rule under its new key.
+    func validatedRule() -> SaveOutcome {
         var rule: InterceptRule
-        if matchMode == .global {
+        switch matchMode {
+        case .global:
             rule = existingRule ?? InterceptRule.globalRule()
-        } else if matchMode == .host {
-            guard !selectedHosts.isEmpty else {
-                showAlert(title: "No URLs", message: "Select at least one URL to intercept.")
-                return
-            }
-            let sorted = selectedHosts.map { $0.lowercased() }.sorted()
-            rule = existingRule ?? InterceptRule(matchEndpoint: "host:" + sorted.joined(separator: ","), matchMode: .host)
-            rule.matchHosts = sorted
-        } else {
-            let endpoint = matchMode == .exact ? requestPath : normalizedPath
-            rule = existingRule ?? InterceptRule(matchEndpoint: endpoint, matchMode: matchMode)
+        case .host:
+            guard !canonicalSelectedHosts.isEmpty else { return .noHosts }
+            rule = existingRule ?? InterceptRule.hostRule(hosts: canonicalSelectedHosts)
+        case .exact, .normalized:
+            guard !currentEndpoint.isEmpty else { return .noEndpoint }
+            rule = existingRule ?? InterceptRule.endpointRule(path: currentEndpoint,
+                                                              mode: matchMode,
+                                                              host: matchHost)
         }
 
-        rule.isBlocked = isBlocked
-        rule.isEnabled = true
+        applyScope(to: &rule)
+        applyEditorState(to: &rule)
+
+        let hasEffect = rule.isBlocked
+            || rule.mock.isEnabled
+            || rule.breakpointMode != .off
+            || rule.redirectMode != .none && !rule.redirectTarget.isEmpty
+            || !rule.headerOverrides.isEmpty || !rule.removedHeaderKeys.isEmpty
+            || !rule.queryParamOverrides.isEmpty || !rule.removedQueryParamKeys.isEmpty
+            || !rule.responseRewrites.isEmpty
+        guard hasEffect else { return .noEffect }
+        return .ok(rule)
+    }
+
+    /// The endpoint the current mode matches on: the FULL literal path for
+    /// Exact, the pattern for Pattern. Never one standing in for the other.
+    private var currentEndpoint: String {
+        matchMode == .exact ? requestPath : normalizedPath
+    }
+
+    private var canonicalSelectedHosts: [String] {
+        InterceptRule.canonicalHosts(selectedHosts)
+    }
+
+    /// Writes mode + endpoint + host pin onto `rule`, unconditionally.
+    private func applyScope(to rule: inout InterceptRule) {
         rule.matchMode = matchMode
+        switch matchMode {
+        case .global:
+            rule.matchEndpoint = "global"
+            rule.matchHosts = []
+            rule.matchHost = ""
+        case .host:
+            let hosts = canonicalSelectedHosts
+            rule.matchHosts = hosts
+            rule.matchEndpoint = InterceptRule.hostKey(for: hosts)
+            rule.matchHost = ""
+        case .exact, .normalized:
+            rule.matchEndpoint = currentEndpoint
+            rule.matchHost = InterceptRule.canonicalHost(matchHost)
+            rule.matchHosts = []
+        }
+    }
+
+    /// Whether the saved rule is armed. Pure and `internal` so the rule can be
+    /// unit-tested: this screen has no enable control, so an existing rule must
+    /// keep whatever the list's switch said, and only a brand-new rule arms
+    /// itself. Forcing `true` here silently re-armed a rule the user had switched
+    /// off — and a blocking rule then broke the host app's traffic again.
+    static func applyEnablement(to rule: inout InterceptRule, existing: InterceptRule?) {
+        rule.isEnabled = existing?.isEnabled ?? true
+    }
+
+    /// Writes everything the editor arms onto `rule`. Pure state transfer — no
+    /// store, no disk — so `derivedNamePreview` can run it on a throwaway rule.
+    private func applyEditorState(to rule: inout InterceptRule) {
+        // Empty when the user did not type a name, which is what keeps the rule
+        // tracking its own configuration: freezing today's derived text into
+        // `name` would leave "3 headers" on a rule that now mocks a 404.
+        rule.name = ruleName.trimmingCharacters(in: .whitespacesAndNewlines)
+        rule.isBlocked = isBlocked
+        // Do NOT force this on. A rule switched off in the list and then merely
+        // opened and saved used to re-arm itself — and if it blocks requests, the
+        // host app starts failing again with nothing on screen suggesting the user
+        // asked for it. There is no enable control on this screen, so the only
+        // honest behaviour is to leave the flag exactly as it was. A brand-new
+        // rule (no existing one) still arms itself, which is what the user means
+        // by creating it.
+        Self.applyEnablement(to: &rule, existing: existingRule)
         rule.redirectMode = redirectMode
         rule.redirectTarget = redirectTarget.trimmingCharacters(in: .whitespacesAndNewlines)
         rule.mock = mock
@@ -304,28 +500,42 @@ class InterceptRuleEditorViewController: UITableViewController {
         rule.removedHeaderKeys = headers.removed
         rule.queryParamOverrides = params.overrides
         rule.removedQueryParamKeys = params.removed
+    }
 
-        let hasEffect = rule.isBlocked
-            || rule.mock.isEnabled
-            || rule.breakpointMode != .off
-            || rule.redirectMode != .none && !rule.redirectTarget.isEmpty
-            || !rule.headerOverrides.isEmpty || !rule.removedHeaderKeys.isEmpty
-            || !rule.queryParamOverrides.isEmpty || !rule.removedQueryParamKeys.isEmpty
-            || !rule.responseRewrites.isEmpty
-        guard hasEffect else {
+    /// The name this rule would carry with the NAME field left blank. Shown as
+    /// the field's placeholder and refreshed whenever anything is armed, so the
+    /// auto-name is never a mystery.
+    ///
+    /// Pure: builds a throwaway rule and reads `derivedName`, which does no I/O.
+    var derivedNamePreview: String {
+        var rule = existingRule ?? InterceptRule(matchEndpoint: currentEndpoint, matchMode: matchMode)
+        applyScope(to: &rule)
+        applyEditorState(to: &rule)
+        rule.name = ""
+        return rule.derivedName
+    }
+
+    @objc private func saveTapped() {
+        switch validatedRule() {
+        case .noHosts:
+            showAlert(title: "No URLs", message: "Select at least one URL to intercept.")
+        case .noEndpoint:
+            showAlert(title: "No Endpoint",
+                      message: "This rule has no path to match. Pick Pattern, or open it from a captured request "
+                        + "so there is a real path to match exactly.")
+        case .noEffect:
             showAlert(title: "Empty Rule",
                       message: "Add a header/parameter change, a response rewrite, a redirect, or enable blocking.")
-            return
-        }
-
-        if let existing = existingRule, existing.matchEndpoint != rule.matchEndpoint {
-            InterceptRuleStore.shared.remove(id: existing.id)
-        }
-        InterceptRuleStore.shared.addOrUpdate(rule)
-        if isPresentedModally {
-            dismiss(animated: true)
-        } else {
-            navigationController?.popViewController(animated: true)
+        case .ok(let rule):
+            // No remove-then-add: `addOrUpdate` drops every copy of this id from
+            // every bucket before re-filing it, so a re-scoped rule cannot leave
+            // a stale twin behind still matching what it used to.
+            InterceptRuleStore.shared.addOrUpdate(rule)
+            if isPresentedModally {
+                dismiss(animated: true)
+            } else {
+                navigationController?.popViewController(animated: true)
+            }
         }
     }
 
@@ -336,7 +546,13 @@ class InterceptRuleEditorViewController: UITableViewController {
     }
 
     @objc private func blockToggleChanged(_ sender: UISwitch) {
-        isBlocked = sender.isOn
+        setBlocked(sender.isOn)
+    }
+
+    /// Arms or disarms blocking. `internal` so a test drives the same code the
+    /// switch does.
+    func setBlocked(_ blocked: Bool) {
+        isBlocked = blocked
         tableView.reloadData()
     }
 
@@ -364,8 +580,80 @@ class InterceptRuleEditorViewController: UITableViewController {
     }
 
     @objc private func endpointModeChanged(_ sender: UISegmentedControl) {
-        matchMode = sender.selectedSegmentIndex == 0 ? .normalized : .exact
+        // Exact is disabled without a concrete path, so this can only pick a mode
+        // that has something to match on.
+        setMatchMode(sender.selectedSegmentIndex == 0 ? .normalized : .exact)
+    }
+
+    /// Switches between Pattern and Exact. `internal` so a test drives the same
+    /// code the segmented control does.
+    func setMatchMode(_ mode: EndpointMatchMode) {
+        matchMode = mode
         reloadAll()
+    }
+
+    // MARK: - Host scope (this host / any host)
+
+    /// The host this rule could be pinned to: the one it is already pinned to,
+    /// or the one the request in context came from. Empty means there is no host
+    /// to offer — a curl import with no captured request, for instance.
+    private var hostScopeCandidate: String {
+        matchHost.isEmpty ? requestHost : matchHost
+    }
+
+    /// "This endpoint on api.example.com" vs "This endpoint on any host".
+    ///
+    /// A sheet, not an alert: hosts and paths are long and an alert row cuts them
+    /// off, which is the whole reason `OptionPickerSheetViewController` exists.
+    private func presentHostScopePicker() {
+        let host = hostScopeCandidate
+        guard !host.isEmpty else { return }
+        let endpoint = currentEndpoint.isEmpty ? "this endpoint" : currentEndpoint
+
+        let pinned = OptionPickerSheetViewController.Option(
+            title: "This endpoint on \(host)",
+            subtitle: "Matches \(endpoint) only when the request goes to \(host). "
+                + "Requests to any other host are left alone.",
+            symbol: "lock.circle", tint: .systemPurple
+        ) { [weak self] in
+            self?.setHostScope(pinned: true)
+        }
+        let anyHost = OptionPickerSheetViewController.Option(
+            title: "This endpoint on any host",
+            subtitle: "Matches \(endpoint) wherever it is requested — staging, production and "
+                + "anything else that uses the same path.",
+            symbol: "globe", tint: .systemOrange
+        ) { [weak self] in
+            self?.setHostScope(pinned: false)
+        }
+
+        OptionPickerSheetViewController.present(
+            from: self,
+            title: "Which Requests?",
+            message: "An endpoint rule can match one host or every host. Matching every host is how "
+                + "a rule for one app ends up firing on someone else's.",
+            options: [pinned, anyHost],
+            selectedIndex: matchHost.isEmpty ? 1 : 0)
+    }
+
+    /// The two answers to "which requests?", as one seam the picker and the
+    /// tests both go through. `internal` for that reason.
+    func setHostScope(pinned: Bool) {
+        matchHost = pinned ? hostScopeCandidate : ""
+        reloadAll()
+    }
+
+    // MARK: - Name
+
+    @objc private func nameFieldChanged(_ sender: UITextField) {
+        // Held in `ruleName`, not read back off the cell: the cell is rebuilt by
+        // every reload and a value living only in a text field would vanish with
+        // it. Blank stays blank — see `applyEditorState`.
+        ruleName = sender.text ?? ""
+    }
+
+    @objc private func nameFieldDone(_ sender: UITextField) {
+        sender.resignFirstResponder()
     }
 
     private func addHeader(key: String = "", value: String = "") {
@@ -551,10 +839,20 @@ class InterceptRuleEditorViewController: UITableViewController {
             let hosts = selectedHosts.isEmpty ? (requestHost.isEmpty ? [] : [requestHost]) : selectedHosts
             return hosts.contains { InterceptRuleStore.urlMatchesPattern(url, pattern: $0) }
         case .exact:
+            guard hostPinAllows(url) else { return false }
             return !requestPath.isEmpty && url.path == requestPath
         case .normalized:
+            guard hostPinAllows(url) else { return false }
             return !normalizedPath.isEmpty && EndpointNormalizer.normalize(url.path) == normalizedPath
         }
+    }
+
+    /// Mirrors `InterceptRule.hostPinAllows(_:)` for the scope currently being
+    /// edited — so the rewrite preview samples a response this rule could
+    /// actually have seen, not one from a host it is pinned away from.
+    private func hostPinAllows(_ url: URL) -> Bool {
+        let pin = InterceptRule.canonicalHost(matchHost)
+        return pin.isEmpty || InterceptRule.canonicalHost(url.host ?? "") == pin
     }
 
     /// "GET /v1/products · 200" — shown as the editor's prompt so it is never a
@@ -688,12 +986,23 @@ class InterceptRuleEditorViewController: UITableViewController {
         Array(availableParams.prefix(Self.availablePreviewCount))
     }
 
+    /// The ENDPOINT section's rows for the current mode. The host row only
+    /// appears when there is a host it could be pinned to.
+    private var endpointRows: [EndpointRow] {
+        guard matchMode == .exact || matchMode == .normalized else { return [] }
+        var rows: [EndpointRow] = [.mode, .path]
+        if !hostScopeCandidate.isEmpty { rows.append(.hostScope) }
+        return rows
+    }
+
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
+        case .name:
+            return 1
         case .endpoint:
             if matchMode == .global { return 1 }
             if matchMode == .host { return 1 + selectedHosts.count }
-            return 2
+            return endpointRows.count
         case .action:
             return existingRule != nil ? 5 : 4      // block, redirect, mock, breakpoint (+ delete)
         case .responseRewrites:
@@ -715,6 +1024,7 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         switch Section(rawValue: indexPath.section)! {
+        case .name:       return nameCell(indexPath)
         case .endpoint:   return endpointCell(indexPath)
         case .action:     return actionCell(indexPath)
         case .responseRewrites:
@@ -781,39 +1091,94 @@ class InterceptRuleEditorViewController: UITableViewController {
             c.textLabel?.numberOfLines = 2
             return c
         }
-        if ip.row == 0 {
-            let c = plainCell("mode")
-            c.selectionStyle = .none
-            let seg = UISegmentedControl(items: ["Pattern", "Exact"])
-            seg.selectedSegmentIndex = matchMode == .normalized ? 0 : 1
-            seg.selectedSegmentTintColor = DebugTheme.accentColor
-            seg.setTitleTextAttributes([.foregroundColor: UIColor.black], for: .selected)
-            seg.setTitleTextAttributes([.foregroundColor: UIColor(white: 0.65, alpha: 1)], for: .normal)
-            seg.addTarget(self, action: #selector(endpointModeChanged(_:)), for: .valueChanged)
-            seg.translatesAutoresizingMaskIntoConstraints = false
-            c.contentView.addSubview(seg)
-            NSLayoutConstraint.activate([
-                seg.leadingAnchor.constraint(equalTo: c.contentView.leadingAnchor, constant: 12),
-                seg.trailingAnchor.constraint(equalTo: c.contentView.trailingAnchor, constant: -12),
-                seg.topAnchor.constraint(equalTo: c.contentView.topAnchor, constant: 8),
-                seg.bottomAnchor.constraint(equalTo: c.contentView.bottomAnchor, constant: -8),
-                seg.heightAnchor.constraint(equalToConstant: 32),
-            ])
-            return c
+        guard endpointRows.indices.contains(ip.row) else { return plainCell("endpointEmpty") }
+        switch endpointRows[ip.row] {
+        case .mode:      return endpointModeCell()
+        case .path:      return endpointPathCell(ip)
+        case .hostScope: return endpointHostScopeCell()
         }
-        let c = plainCell("endpoint", style: .subtitle)
+    }
+
+    private func endpointModeCell() -> UITableViewCell {
+        let c = plainCell("mode")
         c.selectionStyle = .none
-        c.textLabel?.text = matchMode == .exact ? requestPath : normalizedPath
-        c.textLabel?.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
-        c.textLabel?.textColor = matchMode == .exact ? .systemOrange : DebugTheme.accentColor
-        c.textLabel?.numberOfLines = 3
-        c.detailTextLabel?.text = matchMode == .exact
+        let seg = UISegmentedControl(items: ["Pattern", "Exact"])
+        seg.selectedSegmentIndex = matchMode == .normalized ? 0 : 1
+        // Exact needs a real path. Editing a pattern rule with no captured
+        // request behind it has none, and the old screen offered the pattern
+        // itself — saving `/product/{id}` as an "exact" path that nothing can
+        // ever equal.
+        seg.setEnabled(!requestPath.isEmpty, forSegmentAt: 1)
+        seg.selectedSegmentTintColor = DebugTheme.accentColor
+        seg.setTitleTextAttributes([.foregroundColor: UIColor.black], for: .selected)
+        seg.setTitleTextAttributes([.foregroundColor: UIColor(white: 0.65, alpha: 1)], for: .normal)
+        seg.addTarget(self, action: #selector(endpointModeChanged(_:)), for: .valueChanged)
+        seg.translatesAutoresizingMaskIntoConstraints = false
+        c.contentView.addSubview(seg)
+        NSLayoutConstraint.activate([
+            seg.leadingAnchor.constraint(equalTo: c.contentView.leadingAnchor, constant: 12),
+            seg.trailingAnchor.constraint(equalTo: c.contentView.trailingAnchor, constant: -12),
+            seg.topAnchor.constraint(equalTo: c.contentView.topAnchor, constant: 8),
+            seg.bottomAnchor.constraint(equalTo: c.contentView.bottomAnchor, constant: -8),
+            seg.heightAnchor.constraint(equalToConstant: 32),
+        ])
+        return c
+    }
+
+    /// The path this rule matches — **in full**, however long it is.
+    ///
+    /// This used to be a stock `.subtitle` cell whose `textLabel` was given
+    /// `numberOfLines = 3`. The stock labels do not self-size with
+    /// `automaticDimension` (the same defect `OptionPickerSheetViewController`
+    /// was built to avoid), so the row kept its stock height and the path was
+    /// clipped: `/product/10289032912/20920220` showed as `/product/10289032912`
+    /// and it was impossible to tell which of two long paths a rule was on.
+    /// `EndpointPathCell` wraps instead, with real constraints top AND bottom.
+    private func endpointPathCell(_ ip: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "Path", for: ip) as! EndpointPathCell
+        let exact = matchMode == .exact
+        cell.configure(path: currentEndpoint,
+                       detail: endpointScopeExplanation,
+                       tint: exact ? .systemOrange : DebugTheme.accentColor)
+        return cell
+    }
+
+    /// Says, in one line, exactly which requests this scope catches — including
+    /// the host, so "any host" is never the silent default it used to be.
+    private var endpointScopeExplanation: String {
+        let pin = InterceptRule.canonicalHost(matchHost)
+        let what = matchMode == .exact
             ? "Matches only this exact path"
             : "Matches every path with this pattern (IDs replaced)"
-        c.detailTextLabel?.font = .systemFont(ofSize: 10)
-        c.detailTextLabel?.textColor = UIColor(white: 0.45, alpha: 1)
-        c.detailTextLabel?.numberOfLines = 2
+        return pin.isEmpty ? what + ", on ANY host" : what + ", on " + pin + " only"
+    }
+
+    private func endpointHostScopeCell() -> UITableViewCell {
+        let c = plainCell("hostScope", style: .subtitle)
+        let pin = InterceptRule.canonicalHost(matchHost)
+        c.textLabel?.text = pin.isEmpty ? "Any host" : pin
+        c.textLabel?.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        c.textLabel?.textColor = pin.isEmpty ? .systemOrange : .systemPurple
+        c.detailTextLabel?.text = pin.isEmpty
+            ? "Fires wherever this path is requested — tap to limit it to one host"
+            : "Only requests to this host — tap to change"
+        c.detailTextLabel?.font = .systemFont(ofSize: 11)
+        c.detailTextLabel?.textColor = UIColor(white: 0.5, alpha: 1)
+        c.accessoryType = .disclosureIndicator
         return c
+    }
+
+    /// NAME. The field is pre-filled with the user's own name and *placeholdered*
+    /// with the derived one — deliberately not pre-filled with the derived text,
+    /// because a name frozen at creation stops describing the rule the moment
+    /// anything is armed.
+    private func nameCell(_ ip: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "Name", for: ip) as! RuleNameCell
+        cell.configure(name: ruleName, placeholder: derivedNamePreview)
+        cell.field.removeTarget(self, action: nil, for: .allEvents)
+        cell.field.addTarget(self, action: #selector(nameFieldChanged(_:)), for: .editingChanged)
+        cell.field.addTarget(self, action: #selector(nameFieldDone(_:)), for: .editingDidEndOnExit)
+        return cell
     }
 
     private func actionCell(_ ip: IndexPath) -> UITableViewCell {
@@ -824,8 +1189,16 @@ class InterceptRuleEditorViewController: UITableViewController {
             c.textLabel?.text = "Block Request"
             c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
             c.textLabel?.textColor = .white
-            let target = matchMode == .global ? "all URLs" : matchMode == .host ? "selected hosts" : "this endpoint"
+            let pin = InterceptRule.canonicalHost(matchHost)
+            let target: String
+            switch matchMode {
+            case .global:     target = "all URLs"
+            case .host:       target = "selected hosts"
+            case .exact, .normalized:
+                target = pin.isEmpty ? "this endpoint on any host" : "this endpoint on \(pin)"
+            }
             c.detailTextLabel?.text = "Cancel all future requests to \(target)"
+            c.detailTextLabel?.numberOfLines = 2
             c.detailTextLabel?.font = .systemFont(ofSize: 11)
             c.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
             let sw = UISwitch()
@@ -1048,8 +1421,15 @@ class InterceptRuleEditorViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, didSelectRowAt ip: IndexPath) {
         tableView.deselectRow(at: ip, animated: true)
         switch Section(rawValue: ip.section)! {
+        case .name:
+            break
         case .endpoint:
-            if matchMode == .host && ip.row == 0 { selectHostsTapped() }
+            if matchMode == .host {
+                if ip.row == 0 { selectHostsTapped() }
+                return
+            }
+            guard endpointRows.indices.contains(ip.row) else { return }
+            if endpointRows[ip.row] == .hostScope { presentHostScopePicker() }
         case .action:
             if ip.row == 1 { presentRedirectEditor() }
             else if ip.row == 2 { presentMockEditor() }
@@ -1101,6 +1481,7 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     private func sectionTitle(_ s: Section) -> String? {
         switch s {
+        case .name:     return "NAME"
         case .endpoint: return matchMode == .global ? "SCOPE" : matchMode == .host ? "URLS" : "ENDPOINT"
         case .action:   return "ACTION"
         case .responseRewrites:
@@ -1139,6 +1520,7 @@ class InterceptRuleEditorViewController: UITableViewController {
         hint.textColor = UIColor(white: 0.4, alpha: 1)
         hint.translatesAutoresizingMaskIntoConstraints = false
         switch s {
+        case .name: hint.text = "blank = auto"
         case .availableHeaders, .availableParams: hint.text = "tap to add"
         case .headers, .queryParams:
             // Say out loud that the checkbox is what makes a row take effect.
@@ -1168,6 +1550,13 @@ class InterceptRuleEditorViewController: UITableViewController {
     /// What the section does, in one plain sentence — and when the honest answer
     /// is "nothing right now", it says that instead.
     private func sectionFooterText(_ s: Section) -> String? {
+        if s == .name {
+            // Says out loud that leaving it blank is a live default, not an
+            // absence: the rule keeps re-describing itself as it changes.
+            return ruleName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Left blank, this rule is listed as \u{201C}\(derivedNamePreview)\u{201D} and keeps up with whatever you arm."
+                : nil
+        }
         guard s == .responseRewrites, !isBlocked else { return nil }
         // A mock replaces the whole response, so rewrites never see it. Better to
         // say so here than to let someone arm a rewrite that can never run.
@@ -1273,5 +1662,105 @@ class InterceptRuleEditorViewController: UITableViewController {
     deinit {
         _dismissKeyboardButton?.removeFromSuperview()
         NotificationCenter.default.removeObserver(self)
+    }
+}
+
+// MARK: - Endpoint path cell
+
+/// Shows a URL path **in full**, wrapping over as many lines as it takes.
+///
+/// Built with real constraints from `contentView.top` to `contentView.bottom` so
+/// the row self-sizes. The stock `UITableViewCell` labels do not — they keep the
+/// stock row height and clip, which is how `/product/10289032912/20920220` came
+/// out as `/product/10289032912` on the screen where you choose what a rule
+/// matches. Paths have no spaces, so wrapping is `.byCharWrapping`: word
+/// wrapping has nowhere to break and falls back to cutting the tail.
+final class EndpointPathCell: UITableViewCell {
+
+    private let pathLabel = UILabel()
+    private let detailLabel = UILabel()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        backgroundColor = UIColor(white: 0.11, alpha: 1)
+        selectionStyle = .none
+
+        pathLabel.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        pathLabel.numberOfLines = 0
+        pathLabel.lineBreakMode = .byCharWrapping
+        pathLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        detailLabel.font = .systemFont(ofSize: 11)
+        detailLabel.textColor = UIColor(white: 0.45, alpha: 1)
+        detailLabel.numberOfLines = 0
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        contentView.addSubview(pathLabel)
+        contentView.addSubview(detailLabel)
+        NSLayoutConstraint.activate([
+            pathLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            pathLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            pathLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 10),
+
+            detailLabel.leadingAnchor.constraint(equalTo: pathLabel.leadingAnchor),
+            detailLabel.trailingAnchor.constraint(equalTo: pathLabel.trailingAnchor),
+            detailLabel.topAnchor.constraint(equalTo: pathLabel.bottomAnchor, constant: 4),
+            // Pinned to the BOTTOM as well — without this the cell has no height
+            // to compute and self-sizing silently falls back to the estimate.
+            detailLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -10),
+        ])
+        forceLTR()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func configure(path: String, detail: String, tint: UIColor) {
+        pathLabel.text = path.isEmpty ? "(no path)" : path
+        pathLabel.textColor = path.isEmpty ? UIColor(white: 0.45, alpha: 1) : tint
+        detailLabel.text = detail
+    }
+}
+
+// MARK: - Rule name cell
+
+/// The NAME field. A rule with no name of its own is listed under a description
+/// of what it does, which is what the placeholder shows.
+final class RuleNameCell: UITableViewCell {
+
+    let field = UITextField()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        backgroundColor = UIColor(white: 0.11, alpha: 1)
+        selectionStyle = .none
+
+        field.font = .systemFont(ofSize: 15, weight: .medium)
+        field.textColor = .white
+        field.tintColor = DebugTheme.accentColor
+        field.autocorrectionType = .no
+        field.autocapitalizationType = .sentences
+        field.returnKeyType = .done
+        field.clearButtonMode = .whileEditing
+        field.translatesAutoresizingMaskIntoConstraints = false
+
+        contentView.addSubview(field)
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            field.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
+            field.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 10),
+            field.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -10),
+        ])
+        forceLTR()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func configure(name: String, placeholder: String) {
+        // Only assign when it differs: assigning `text` to a focused field moves
+        // the caret to the end mid-typing.
+        if field.text != name { field.text = name }
+        field.attributedPlaceholder = NSAttributedString(
+            string: placeholder,
+            attributes: [.foregroundColor: UIColor(white: 0.42, alpha: 1)])
     }
 }

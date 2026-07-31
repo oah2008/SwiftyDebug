@@ -748,15 +748,9 @@ class NetworkDetailViewController: UITableViewController {
         
         //detect the request format (JSON/Form)
         detectRequestSerializer()
-        
-        setupModels()
-        
-        if var lastModel = detailModels.last {
-            lastModel.isLast = true
-            detailModels.removeLast()
-            detailModels.append(lastModel)
-        }
-        
+
+        buildDetailModels()
+
         //Register programmatic cells (overrides storyboard prototypes)
         tableView.register(NetworkCell.self, forCellReuseIdentifier: "NetworkCell")
         tableView.register(NetworkDetailCell.self, forCellReuseIdentifier: "NetworkDetailCell")
@@ -868,6 +862,42 @@ class NetworkDetailViewController: UITableViewController {
 
     private var hasPerformedInitialReload = false
 
+    /// True between the `viewWillDisappear` release below and the next
+    /// appearance. Only a CANCELLED pop can observe it as true, and that is
+    /// exactly the case `viewDidAppear` has to undo.
+    private var didReleaseCachedContent = false
+
+    /// Builds `detailModels` from scratch and marks the closing section.
+    ///
+    /// `setupModels()` APPENDS, so the list is always cleared first — a rebuild
+    /// that skipped this would render every section twice.
+    private func buildDetailModels() {
+        detailModels.removeAll()
+        setupModels()
+
+        if var lastModel = detailModels.last {
+            lastModel.isLast = true
+            detailModels.removeLast()
+            detailModels.append(lastModel)
+        }
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+
+        // A swipe-back that the user abandoned. `isMovingFromParent` is already
+        // true when the gesture STARTS, so `viewWillDisappear` released the
+        // sections and the cached body — and then UIKit reversed the transition
+        // and left this screen in front of the user with nothing in it: no rows,
+        // and Copy / Share producing a header line with no request in it.
+        // Rebuild what was released. A real pop never gets here.
+        guard didReleaseCachedContent else { return }
+        didReleaseCachedContent = false
+
+        buildDetailModels()
+        tableView.reloadData()
+    }
+
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         // After the table gets its correct width, reload once so
@@ -898,8 +928,13 @@ class NetworkDetailViewController: UITableViewController {
 
         // Release large strings (response body, request body) immediately
         // when navigating away instead of waiting for dealloc.
+        //
+        // This also runs the moment an interactive pop STARTS, which is not yet
+        // a decision to leave — `viewDidAppear` puts it all back if the gesture
+        // is cancelled.
         detailModels.removeAll()
         cachedResponseBody = nil
+        didReleaseCachedContent = true
     }
     
     //MARK: - target action

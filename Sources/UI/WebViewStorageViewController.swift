@@ -8,6 +8,113 @@
 import UIKit
 import WebKit
 
+// MARK: - Storage entry identity
+
+/// How one storage entry is identified — the single definition, used by the pin
+/// store keys, the write read-back and the delete read-back.
+///
+/// A web-storage key is unique inside its store, so the key *is* the identity.
+/// **A cookie name is not.** Two sites both having a `session`, `token` or `jwt`
+/// cookie is the normal case, not an edge case. Identifying a cookie by name
+/// alone meant editing one site's cookie could pin, read back against, or delete
+/// a different domain's cookie of the same name — and with force overwrite on,
+/// that value then got written back onto the host app's real session cookie for
+/// another domain after every page load.
+///
+/// Pure and free of UIKit/WebKit state so the rules are directly testable.
+enum StorageEntryIdentity {
+
+    /// What a write or delete is expected to have produced.
+    enum Target {
+        /// A `localStorage` / `sessionStorage` key.
+        case webStorage(key: String)
+        /// A cookie whose (name, domain, path) is known exactly — an edit of a
+        /// cookie that was read out of the store.
+        case cookie(name: String, domain: String, path: String)
+        /// A cookie the SDK has just created. It asked for the page host and
+        /// path `/`, but the cookie store may store the domain in a different
+        /// but equivalent form (a leading dot, most often), so the exact
+        /// identity is not knowable in advance. Never matches on the name alone.
+        case newCookie(name: String, host: String?)
+    }
+
+    /// Separates the cookie name from its domain+path.
+    ///
+    /// Readable on purpose: `WebViewStoragePinStore` composes user-visible
+    /// failure messages out of raw pin keys ("skipped …"), so a key full of
+    /// control characters would leak into an alert. This stays unambiguous
+    /// anyway — see `cookiePinKey`.
+    private static let separator = " @ "
+
+    /// The key an entry is pinned under.
+    static func pinKey(for item: WebViewStorageService.Item,
+                       scope: WebViewStorageService.Scope) -> String {
+        guard scope == .cookies, let cookie = item.cookie else { return item.key }
+        return cookiePinKey(name: cookie.name, domain: cookie.domain, path: cookie.path)
+    }
+
+    /// `name @ domain/path`.
+    ///
+    /// Two different (name, domain, path) triples can never produce the same
+    /// key. A domain contains no `/` and the path is normalised to start with
+    /// one, so the domain/path split is the first `/` after the separator; a
+    /// domain contains no ` @ `, so the name/domain split is the last ` @ `
+    /// before that. (Without the path normalisation, `("s", "example.co", "m/")`
+    /// and `("s", "example.com", "/")` produce the same string — which is the
+    /// exact failure this whole type exists to prevent.)
+    static func cookiePinKey(name: String, domain: String, path: String) -> String {
+        // Domain is case-insensitive per RFC 6265, so it is lowercased. The
+        // leading dot is NOT stripped: `.example.com` and `example.com` are two
+        // separate records in the jar, and collapsing them would put us straight
+        // back into writing one cookie's value onto another's.
+        let normalizedPath = path.hasPrefix("/") ? path : "/" + path
+        return name + separator
+            + domain.trimmingCharacters(in: .whitespaces).lowercased()
+            + normalizedPath
+    }
+
+    /// The entry a write/delete should be confirmed against, or nil when the
+    /// store holds nothing that matches — which is the honest answer even when
+    /// something of the same *name* is present.
+    static func find(_ target: Target,
+                     in items: [WebViewStorageService.Item],
+                     scope: WebViewStorageService.Scope) -> WebViewStorageService.Item? {
+        switch target {
+        case .webStorage(let key):
+            guard scope != .cookies else { return nil }
+            return items.first { $0.key == key }
+
+        case .cookie(let name, let domain, let path):
+            let wanted = cookiePinKey(name: name, domain: domain, path: path)
+            return items.first { item in
+                guard let c = item.cookie else { return false }
+                return cookiePinKey(name: c.name, domain: c.domain, path: c.path) == wanted
+            }
+
+        case .newCookie(let name, let host):
+            // No host means no domain was sent, which means no cookie was
+            // created — matching anything here would invent a success.
+            guard let host, !host.isEmpty else { return nil }
+            return items.first { item in
+                guard let c = item.cookie, c.name == name else { return false }
+                guard c.path.isEmpty || c.path == "/" else { return false }
+                return domain(c.domain, isEquivalentToHost: host)
+            }
+        }
+    }
+
+    /// Leading-dot-insensitive host comparison, used **only** to recognise a
+    /// cookie the SDK itself just created for the page's own host.
+    static func domain(_ cookieDomain: String, isEquivalentToHost host: String) -> Bool {
+        func bare(_ s: String) -> String {
+            var out = s.trimmingCharacters(in: .whitespaces).lowercased()
+            while out.hasPrefix(".") { out.removeFirst() }
+            return out
+        }
+        return bare(cookieDomain) == bare(host)
+    }
+}
+
 // MARK: - Storage editor
 
 /// Editable storage viewer for one WKWebView: Local / Session / Cookies.
@@ -223,11 +330,15 @@ final class WebViewStorageViewController: UITableViewController {
         displays = items.map { item in
             var detail: String?
             if isCookies, let c = item.cookie { detail = "\(c.domain)\(c.path)" }
+            // Pins are keyed by identity, so the FORCED badge lands on the one
+            // cookie that is actually pinned rather than on every cookie in the
+            // list that happens to share its name.
+            let pinKey = StorageEntryIdentity.pinKey(for: item, scope: scope)
             return StorageRowDisplay(
                 key: item.key,
                 value: item.value,
                 detail: detail,
-                isPinned: (set?.isForcing ?? false) && (set?.isPinned(item.key) ?? false))
+                isPinned: (set?.isForcing ?? false) && (set?.isPinned(pinKey) ?? false))
         }
     }
 
@@ -323,9 +434,10 @@ final class WebViewStorageViewController: UITableViewController {
         // Un-pin affordance: a value that keeps reverting to what the SDK set is
         // confusing unless the reason is visible and switchable from the same
         // screen that set it.
-        if let webView, !isNew, pins.isPinned(item.key, webView: webView, scope: scope) {
+        let pinKey = StorageEntryIdentity.pinKey(for: item, scope: scope)
+        if let webView, !isNew, pins.isPinned(pinKey, webView: webView, scope: scope) {
             let scope = self.scope
-            let pinnedValue = pins.pinSet(for: webView, scope: scope).value(for: item.key) ?? item.value
+            let pinnedValue = pins.pinSet(for: webView, scope: scope).value(for: pinKey) ?? item.value
             let cookie = item.cookie
             editor.pinControl = StorageValueEditorViewController.PinControl(
                 isOn: true,
@@ -339,9 +451,9 @@ final class WebViewStorageViewController: UITableViewController {
                     guard let self, let webView else { return }
                     if on {
                         self.pins.record(webView: webView, scope: scope,
-                                         key: item.key, value: pinnedValue, cookie: cookie)
+                                         key: pinKey, value: pinnedValue, cookie: cookie)
                     } else {
-                        self.pins.unpin(webView: webView, scope: scope, key: item.key)
+                        self.pins.unpin(webView: webView, scope: scope, key: pinKey)
                     }
                 })
         }
@@ -357,8 +469,25 @@ final class WebViewStorageViewController: UITableViewController {
         let scope = self.scope
 
         if scope == .cookies, let cookie = original.cookie {
+            // The read-back target carries the cookie's FULL identity. Confirming
+            // on the name alone could match another domain's cookie of the same
+            // name, report a success that never happened, and then pin — and
+            // force-write — this value onto that other domain's cookie.
+            let target = StorageEntryIdentity.Target.cookie(name: cookie.name,
+                                                            domain: cookie.domain,
+                                                            path: cookie.path)
             service.updateCookie(cookie, newValue: newValue) { [weak self] _ in
-                self?.confirmWrite(scope: scope, key: cookie.name, expected: newValue)
+                self?.confirmWrite(scope: scope, target: target, label: cookie.name, expected: newValue)
+            }
+            return
+        }
+
+        // A brand-new cookie: the store assigns the domain from the page, so the
+        // exact identity is only knowable once it is read back.
+        if scope == .cookies {
+            let target = StorageEntryIdentity.Target.newCookie(name: newKey, host: service.pageURL?.host)
+            service.setItem(scope: scope, key: newKey, value: newValue) { [weak self] _ in
+                self?.confirmWrite(scope: scope, target: target, label: newKey, expected: newValue)
             }
             return
         }
@@ -367,20 +496,23 @@ final class WebViewStorageViewController: UITableViewController {
         // strictly sequenced so a failure of the first step is visible in the
         // read-back instead of racing the second.
         if !isNew, newKey != original.key, !original.key.isEmpty {
+            let oldPinKey = StorageEntryIdentity.pinKey(for: original, scope: scope)
             service.deleteItem(scope: scope, item: original) { [weak self] _ in
                 guard let self else { return }
                 if let webView = self.webView {
-                    self.pins.unpin(webView: webView, scope: scope, key: original.key)
+                    self.pins.unpin(webView: webView, scope: scope, key: oldPinKey)
                 }
                 self.service.setItem(scope: scope, key: newKey, value: newValue) { [weak self] _ in
-                    self?.confirmWrite(scope: scope, key: newKey, expected: newValue)
+                    self?.confirmWrite(scope: scope, target: .webStorage(key: newKey),
+                                       label: newKey, expected: newValue)
                 }
             }
             return
         }
 
         service.setItem(scope: scope, key: newKey, value: newValue) { [weak self] _ in
-            self?.confirmWrite(scope: scope, key: newKey, expected: newValue)
+            self?.confirmWrite(scope: scope, target: .webStorage(key: newKey),
+                               label: newKey, expected: newValue)
         }
     }
 
@@ -391,18 +523,28 @@ final class WebViewStorageViewController: UITableViewController {
     /// script never ran. The read-back is the only honest confirmation, and it
     /// doubles as detection for the case this screen's force-overwrite toggle
     /// exists for — the page immediately clobbering the value.
-    private func confirmWrite(scope: WebViewStorageService.Scope, key: String, expected: String) {
+    private func confirmWrite(scope: WebViewStorageService.Scope,
+                              target: StorageEntryIdentity.Target,
+                              label: String,
+                              expected: String) {
         reload { [weak self] items in
             guard let self, self.scope == scope else { return }
-            guard let found = items.first(where: { $0.key == key }) else {
+            guard let found = StorageEntryIdentity.find(target, in: items, scope: scope) else {
                 self.alert(title: "Save did not stick",
-                           message: "“\(key)” is not in \(scope.title) after writing. The page may "
-                                  + "block storage on this origin, or it removed the key immediately.")
+                           message: "“\(label)” is not in \(scope.title) after writing. The page may "
+                                  + "block storage on this origin, or it removed the key immediately."
+                                  + (scope == .cookies
+                                     ? " A cookie of the same name for a different domain does not count."
+                                     : ""))
                 return
             }
-            let recorded = self.recordPin(key: key, value: expected, cookie: found.cookie, scope: scope)
+            // Pin under the identity of the entry that was actually read back —
+            // for a new cookie that is the only point at which the domain the
+            // store settled on is known.
+            let pinKey = StorageEntryIdentity.pinKey(for: found, scope: scope)
+            let recorded = self.recordPin(key: pinKey, value: expected, cookie: found.cookie, scope: scope)
             guard found.value == expected else {
-                self.reportClobbered(key: key, scope: scope, canForce: recorded)
+                self.reportClobbered(key: label, scope: scope, canForce: recorded)
                 return
             }
             if !recorded, let webView = self.webView, self.pins.isForcing(webView, scope: scope) {
@@ -453,6 +595,8 @@ final class WebViewStorageViewController: UITableViewController {
 
     /// Remembers a successfully written value so force-overwrite can reinstate
     /// it. Returns false when it could not be pinned.
+    ///
+    /// `key` is a **pin key** from `StorageEntryIdentity`, not a display name.
     @discardableResult
     private func recordPin(key: String,
                            value: String,
@@ -470,17 +614,28 @@ final class WebViewStorageViewController: UITableViewController {
 
     private func delete(_ item: WebViewStorageService.Item) {
         let scope = self.scope
+        let pinKey = StorageEntryIdentity.pinKey(for: item, scope: scope)
+        // The delete read-back matched on name + path only, so another domain's
+        // cookie of the same name and path made a successful delete look failed
+        // — and, worse, a *failed* delete look successful once the domains
+        // differed the other way round. Match the full identity.
+        let target: StorageEntryIdentity.Target = {
+            guard scope == .cookies, let c = item.cookie else {
+                return .webStorage(key: item.key)
+            }
+            return .cookie(name: c.name, domain: c.domain, path: c.path)
+        }()
         service.deleteItem(scope: scope, item: item) { [weak self] _ in
             guard let self else { return }
             // A deleted key is no longer an edit to reinstate. Deletions are
             // deliberately NOT forced: re-deleting a key the page re-creates
             // would be the SDK removing data nobody can see it removing.
             if let webView = self.webView {
-                self.pins.unpin(webView: webView, scope: scope, key: item.key)
+                self.pins.unpin(webView: webView, scope: scope, key: pinKey)
             }
             self.reload { [weak self] items in
                 guard let self, self.scope == scope else { return }
-                if items.contains(where: { $0.key == item.key && $0.cookie?.path == item.cookie?.path }) {
+                if StorageEntryIdentity.find(target, in: items, scope: scope) != nil {
                     self.alert(title: "Delete did not stick",
                                message: "“\(item.key)” is still in \(scope.title). "
                                       + (scope == .cookies

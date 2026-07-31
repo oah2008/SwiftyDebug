@@ -111,9 +111,7 @@ class InterceptRuleListViewController: UITableViewController {
             message: "Choose what the new rule should apply to.",
             options: [
                 .init(title: "Intercept Endpoint",
-                      subtitle: normalizedPath.isEmpty
-                          ? "This endpoint only"
-                          : "This endpoint only — \(normalizedPath)",
+                      subtitle: endpointOptionSubtitle,
                       symbol: "point.topleft.down.curvedto.point.bottomright.up",
                       tint: DebugTheme.accentColor) { openEditor(.normalized) },
                 .init(title: "Intercept Host",
@@ -126,6 +124,24 @@ class InterceptRuleListViewController: UITableViewController {
                       symbol: "globe", tint: .systemPink) { openEditor(.global) },
             ]
         )
+    }
+
+    /// Spells out BOTH forms of the endpoint before the user commits to a scope.
+    ///
+    /// It used to show only the normalized pattern, which for
+    /// `/product/10289032912/20920220` reads `/product/{id}/{id}` — the user
+    /// reported this as the full path being cut short. The exact path is what an
+    /// EXACT rule will match, so it is shown in full, on its own line
+    /// (`OptionPickerSheetViewController` sets `numberOfLines = 0`, so nothing
+    /// here is truncated), next to the pattern it would become.
+    private var endpointOptionSubtitle: String {
+        guard !requestPath.isEmpty else { return "This endpoint only" }
+        var lines = ["Exact path: \(requestPath)"]
+        if normalizedPath != requestPath {
+            lines.append("As a pattern: \(normalizedPath)")
+        }
+        lines.append("Pick exact or pattern on the next screen.")
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - Export / import
@@ -214,10 +230,22 @@ class InterceptRuleListViewController: UITableViewController {
         let cell = tableView.dequeueReusableCell(withIdentifier: "RuleCell", for: indexPath) as! InterceptRuleCell
         let rule = ruleList[indexPath.row]
         cell.configure(with: rule, index: indexPath.row + 1)
+
+        // Keyed on the rule's IDENTITY, never on `indexPath.row`. A swipe-delete
+        // calls `deleteRows`, which shifts the surviving cells up WITHOUT
+        // re-running this method, so a row-numbered toggle would then arm or
+        // disarm whichever rule inherited the old index — silently blocking
+        // requests or mocking responses in somebody's app. Same defect class as
+        // the `tag = indexPath.row` switch this file used to carry.
+        let ruleId = rule.id
         cell.onToggle = { [weak self] isEnabled in
             guard let self = self else { return }
-            self.ruleList[indexPath.row].isEnabled = isEnabled
-            InterceptRuleStore.shared.update(self.ruleList[indexPath.row])
+            // NO-OP when the id is gone: the rule was deleted between this cell
+            // being rendered and the switch being tapped, and there is nothing
+            // left to write.
+            guard let idx = self.ruleList.firstIndex(where: { $0.id == ruleId }) else { return }
+            self.ruleList[idx].isEnabled = isEnabled
+            InterceptRuleStore.shared.update(self.ruleList[idx])
         }
         return cell
     }
@@ -233,24 +261,39 @@ class InterceptRuleListViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool { true }
 
     override func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
-        guard editingStyle == .delete else { return }
+        guard editingStyle == .delete, ruleList.indices.contains(indexPath.row) else { return }
         let rule = ruleList[indexPath.row]
         ruleList.remove(at: indexPath.row)
         InterceptRuleStore.shared.remove(id: rule.id)
-        tableView.deleteRows(at: [indexPath], with: .automatic)
+        tableView.performBatchUpdates {
+            tableView.deleteRows(at: [indexPath], with: .automatic)
+        } completion: { [weak tableView] _ in
+            // Every surviving row carries a printed "RULE #n" that `deleteRows`
+            // does not rebuild. Reloading afterwards re-runs `cellForRowAt` for
+            // the survivors, so no row is left describing a position it no
+            // longer occupies.
+            tableView?.reloadData()
+        }
     }
 
-    // Reorder — only within same matchEndpoint group
+    // Reorder
     override func tableView(_ tableView: UITableView, canMoveRowAt indexPath: IndexPath) -> Bool { true }
 
     override func tableView(_ tableView: UITableView, moveRowAt sourceIndexPath: IndexPath, to destinationIndexPath: IndexPath) {
         let moved = ruleList.remove(at: sourceIndexPath.row)
         ruleList.insert(moved, at: destinationIndexPath.row)
-        // Reorder within each matchEndpoint group
-        let grouped = Dictionary(grouping: ruleList, by: \.matchEndpoint)
-        for (endpoint, rules) in grouped {
-            InterceptRuleStore.shared.reorder(ids: rules.map(\.id), for: endpoint)
-        }
+        // ONE call with the whole visible order, not one call per endpoint
+        // group. The store's `reorder(ids:for:)` treats the ids as authoritative
+        // and re-orders them wherever they live, and a rule's bucket now depends
+        // on its mode and host pin as well as its endpoint — so per-endpoint
+        // calls would hand out position 0 several times over and the list would
+        // not come back in the order the user just dragged it into.
+        InterceptRuleStore.shared.reorder(ids: ruleList.map(\.id), for: requestPath)
+        // The printed "RULE #n" on each card is now stale for every row between
+        // source and destination. Reloaded on the next turn of the run loop:
+        // this is called while UIKit is still committing the move animation, and
+        // reloading inside that is what makes a table view assert.
+        DispatchQueue.main.async { [weak tableView] in tableView?.reloadData() }
     }
 
     // Section header
@@ -261,7 +304,10 @@ class InterceptRuleListViewController: UITableViewController {
         let label = UILabel()
         label.font = UIFont(name: "Menlo", size: 12) ?? .monospacedSystemFont(ofSize: 12, weight: .medium)
         label.textColor = UIColor(white: 0.5, alpha: 1)
-        label.text = requestPath
+        // Host included: rules can now be pinned to a host, so "which host am I
+        // looking at?" is part of reading this list.
+        let host = httpModel?.url?.host ?? ""
+        label.text = host.isEmpty ? requestPath : host + requestPath
         label.numberOfLines = 2
         label.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(label)
@@ -325,13 +371,16 @@ private class InterceptRuleCell: UITableViewCell {
 
         summaryLabel.font = .systemFont(ofSize: 14, weight: .semibold)
         summaryLabel.textColor = .white
-        summaryLabel.numberOfLines = 1
+        // Two lines: a rule's name is now a sentence ("Mock 404 + Breakpoint
+        // after response"), not a two-word count, and the card is self-sizing
+        // from contentView top to bottom so it grows rather than truncating.
+        summaryLabel.numberOfLines = 2
         summaryLabel.translatesAutoresizingMaskIntoConstraints = false
         cardView.addSubview(summaryLabel)
 
-        detailLabel.font = .systemFont(ofSize: 11)
+        detailLabel.font = InterceptRuleRowFormatter.detailFont
         detailLabel.textColor = UIColor(white: 0.5, alpha: 1)
-        detailLabel.numberOfLines = 2
+        detailLabel.numberOfLines = 3
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
         cardView.addSubview(detailLabel)
 
@@ -375,51 +424,20 @@ private class InterceptRuleCell: UITableViewCell {
         indexLabel.text = "RULE #\(index)"
 
         // Match mode badge
-        switch rule.matchMode {
-        case .exact:
-            matchModeLabel.text = " EXACT "
-            matchModeLabel.textColor = .systemOrange
-            matchModeLabel.backgroundColor = UIColor.systemOrange.withAlphaComponent(0.15)
-        case .normalized:
-            matchModeLabel.text = " PATTERN "
-            matchModeLabel.textColor = DebugTheme.accentColor
-            matchModeLabel.backgroundColor = DebugTheme.accentColor.withAlphaComponent(0.15)
-        case .host:
-            matchModeLabel.text = " HOST "
-            matchModeLabel.textColor = .systemPurple
-            matchModeLabel.backgroundColor = UIColor.systemPurple.withAlphaComponent(0.15)
-        case .global:
-            matchModeLabel.text = " GLOBAL "
-            matchModeLabel.textColor = .systemPink
-            matchModeLabel.backgroundColor = UIColor.systemPink.withAlphaComponent(0.15)
-        }
+        let mode = rule.matchMode
+        matchModeLabel.text = " " + InterceptRuleRowFormatter.badge(for: mode) + " "
+        matchModeLabel.textColor = InterceptRuleRowFormatter.color(for: mode)
+        matchModeLabel.backgroundColor = InterceptRuleRowFormatter.color(for: mode).withAlphaComponent(0.15)
 
-        if rule.isBlocked {
-            summaryLabel.text = "Block Request"
-            summaryLabel.textColor = .systemRed
-        } else {
-            var parts: [String] = []
-            let headerCount = rule.headerOverrides.count + rule.removedHeaderKeys.count
-            let paramCount = rule.queryParamOverrides.count + rule.removedQueryParamKeys.count
-            if headerCount > 0 { parts.append("\(headerCount) header\(headerCount == 1 ? "" : "s")") }
-            if paramCount > 0 { parts.append("\(paramCount) param\(paramCount == 1 ? "" : "s")") }
-            summaryLabel.text = parts.isEmpty ? "Empty rule" : parts.joined(separator: ", ")
-            summaryLabel.textColor = .white
-        }
+        // Lead with the rule's NAME. This used to count headers and query
+        // parameters only, so a rule that mocked / blocked / breakpointed /
+        // redirected / rewrote counted zero of both and read "Empty rule".
+        summaryLabel.text = InterceptRuleRowFormatter.title(for: rule)
+        summaryLabel.textColor = InterceptRuleRowFormatter.titleColor(for: rule)
 
-        var details: [String] = []
-        if rule.matchMode == .host && !rule.matchHosts.isEmpty {
-            details.append(rule.matchHosts.joined(separator: ", "))
-        } else if rule.matchMode == .global {
-            details.append("Applies to all requests")
-        }
-        if !rule.headerOverrides.isEmpty {
-            details.append("Override: " + rule.headerOverrides.map(\.key).joined(separator: ", "))
-        }
-        if !rule.removedHeaderKeys.isEmpty {
-            details.append("Drop: " + rule.removedHeaderKeys.sorted().joined(separator: ", "))
-        }
-        detailLabel.text = details.isEmpty ? "Tap to edit" : details.joined(separator: " · ")
+        // Scope underneath, always — two rules can now legitimately share a name
+        // and differ only in which host they are pinned to.
+        detailLabel.text = InterceptRuleRowFormatter.detailText(for: rule)
 
         enableSwitch.isOn = rule.isEnabled
         contentView.alpha = rule.isEnabled ? 1 : 0.5
