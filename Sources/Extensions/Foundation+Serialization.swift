@@ -239,15 +239,21 @@ extension Data {
         //  per-keystroke.
         if ignoringSizeCeiling || canPrettyPrintInSourceOrder,
            let document = JSONDocument(data: self) {
+            // Lifting the printer's ceiling without lifting the DOCUMENT's index
+            // ceiling would still hand back sorted keys — the two must move
+            // together, which is what the coupling test pins.
+            document.indexesSourceRegardlessOfSize = ignoringSizeCeiling
             let text = document.prettyText()
             // `prettyText()` yields "" for a document it cannot represent;
             // fall through rather than shipping an empty body.
             if !text.isEmpty { return text }
         }
-        //2.over the ceiling, not UTF-8 (a UTF-16 body parses here and nowhere
-        //  else), or unrepresentable: Foundation's writer — valid JSON, in its
-        //  own key order. `.withoutEscapingSlashes` keeps URLs/paths readable
-        //  and valid when copied (see COPY).
+        //2.over the ceiling, not UTF-8, or unrepresentable: Foundation's writer.
+        //  NOTE: this re-serialises, so it emits Foundation's key order, not the
+        //  server's. That is a KNOWN divergence above the ceiling and it is why
+        //  COPY passes `ignoringSizeCeiling: true` — the clipboard is the path
+        //  the maintainer requires to be faithful at every size, and it now has
+        //  an overlay to pay for it. The bounded preview keeps this fallback.
         guard let jsonObject = self.dataToJSONObject() else { return nil }
         //  `isValidJSONObject` FIRST, and not as a formality.
         //
