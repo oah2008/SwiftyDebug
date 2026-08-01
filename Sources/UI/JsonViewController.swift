@@ -108,10 +108,15 @@ class JsonViewController: UIViewController {
         }
 
         // Try pretty-printing as JSON
+        // Source order, not sorted: this screen's own copy button copies the raw
+        // original, so sorting here made the preview and the clipboard disagree
+        // about the same body.
+        // `prettyPrintedJSONString()` returns nil for non-JSON; the canonical
+        // printer falls back to raw UTF-8 and so is NEVER nil for text — which
+        // made the plain-text branch below dead code, losing the red ERROR/FAULT
+        // colouring, the orange warnings and the underlined URLs on log lines.
         if let data = rawContent.data(using: .utf8),
-           let obj = try? JSONSerialization.jsonObject(with: data, options: []),
-           let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
-           let prettyStr = String(data: pretty, encoding: .utf8) {
+           let prettyStr = data.prettyPrintedJSONString() {
             result.append(NetworkDetailCell.highlightJSON(prettyStr))
         } else {
             // Try to detect key-value patterns and colorize

@@ -95,27 +95,26 @@ class NetworkDetailViewController: UITableViewController {
 
                 // 2. Handle application/x-www-form-urlencoded
                 if rawString.contains("=") && !rawString.contains("Content-Disposition: form-data;") {
-                    var dict: [String: String] = [:]
+                    // Kept as ordered pairs, not a dictionary: the wire order is
+                    // the order the app sent these fields in, and a dictionary
+                    // rendered them in hash order. (See OrderedJSON.)
+                    var fields: [(key: String, value: String)] = []
                     let pairs = rawString.components(separatedBy: "&")
                     for pair in pairs {
                         let parts = pair.components(separatedBy: "=")
                         if parts.count >= 2 {
                             let key = parts[0].removingPercentEncoding ?? parts[0]
                             let value = parts[1...].joined(separator: "=").removingPercentEncoding ?? ""
-                            dict[key] = value
+                            fields.append((key: key, value: value))
                         }
                     }
-                    if !dict.isEmpty,
-                       let jsonData = try? JSONSerialization.data(withJSONObject: dict, options: .prettyPrinted),
-                       let jsonString = String(data: jsonData, encoding: .utf8) {
-                        requestContent = jsonString
-                    } else {
-                        requestContent = rawString
-                    }
+                    requestContent = OrderedJSON.text(from: fields) ?? rawString
                 }
                 // 3. Handle multipart/form-data
                 else if rawString.contains("Content-Disposition: form-data;") {
-                    var formDict: [String: String] = [:]
+                    // Same reason as above: parts arrive in a defined order and
+                    // are shown in it.
+                    var formFields: [(key: String, value: String)] = []
                     let boundaryParts = rawString.components(separatedBy: "--").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                     for part in boundaryParts {
                         if let nameRange = part.range(of: "name=\""),
@@ -125,18 +124,12 @@ class NetworkDetailViewController: UITableViewController {
                             if sections.count > 1 {
                                 let value = sections[1].replacingOccurrences(of: "\r\n", with: "")
                                 if !value.isEmpty {
-                                    formDict[name] = value
+                                    formFields.append((key: name, value: value))
                                 }
                             }
                         }
                     }
-                    if !formDict.isEmpty,
-                       let jsonData = try? JSONSerialization.data(withJSONObject: formDict, options: .prettyPrinted),
-                       let jsonString = String(data: jsonData, encoding: .utf8) {
-                        requestContent = jsonString
-                    } else {
-                        requestContent = rawString
-                    }
+                    requestContent = OrderedJSON.text(from: formFields) ?? rawString
                 }
                 // 4. Fallback
                 else {
@@ -161,14 +154,12 @@ class NetworkDetailViewController: UITableViewController {
         var modelParams = NetworkDetailSection(title: "REQUEST PARAMETERS", content: nil, url: urlStr, httpModel: httpModel)
         if let url = httpModel?.url as URL?, let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
            let queryItems = components.queryItems, !queryItems.isEmpty {
-            var dict: [String: Any] = [:]
-            for item in queryItems {
-                dict[item.name] = item.value ?? ""
-            }
-            if let jsonData = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
-               let jsonString = String(data: jsonData, encoding: .utf8) {
-                modelParams.content = jsonString
-            }
+            // The URL states an order; `.sortedKeys` over a dictionary replaced
+            // it with the alphabet, so the parameters never lined up with the
+            // request they came from. (See OrderedJSON.)
+            modelParams.content = OrderedJSON.text(from: queryItems.map {
+                (key: $0.name, value: $0.value ?? "")
+            })
         }
         modelParams.showPreview = true
 
@@ -204,16 +195,6 @@ class NetworkDetailViewController: UITableViewController {
         }
         model_4.showPreview = true
 
-        // Parse the response body ONCE. Both the pretty-printed text below and
-        // the "can this be rewritten?" decision come out of this single parse —
-        // parsing twice is what makes a big response stutter on open.
-        // `.fragmentsAllowed` matches ResponseRewriteEngine exactly, so the card
-        // can never offer a rewrite the engine would then refuse.
-        var responseRoot: Any? = nil
-        if httpModel?.isImage != true, let data = cachedResponseData, !data.isEmpty {
-            responseRoot = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
-        }
-
         // Response body
         var model_5: NetworkDetailSection
         // An image only takes the image path when its bytes actually decode.
@@ -228,18 +209,12 @@ class NetworkDetailViewController: UITableViewController {
             model_5 = NetworkDetailSection(title: "RESPONSE", content: nil, url: urlStr,
                                            image: decodedImage, httpModel: httpModel)
         } else {
-            // Same output as `dataToPrettyPrintString()`, reusing the parse above:
-            // pretty JSON when it is JSON, the raw UTF-8 text when it is not.
-            let prettyResponse: String? = {
-                guard let data = cachedResponseData else { return nil }
-                if let root = responseRoot,
-                   let out = try? JSONSerialization.data(withJSONObject: root,
-                                                         options: [.prettyPrinted, .withoutEscapingSlashes]),
-                   let text = String(data: out, encoding: .utf8) {
-                    return text
-                }
-                return data.dataToPrettyPrintString()
-            }()
+            // One parse, in the ONE canonical pretty-printer. The inlined copy
+            // that used to live here re-serialised through `JSONSerialization`
+            // and so printed the body in hash order — the same screen's copy
+            // button went through `dataToPrettyPrintString()` and printed it in
+            // a different one. Preview and copy must be the same bytes.
+            let prettyResponse = cachedResponseData?.dataToPrettyPrintString()
             model_5 = NetworkDetailSection(title: "RESPONSE", content: prettyResponse, url: urlStr, httpModel: httpModel)
         }
         model_5.showPreview = true
@@ -306,16 +281,17 @@ class NetworkDetailViewController: UITableViewController {
             let parts = token.components(separatedBy: ".")
             if parts.count >= 2 {
                 var blocks: [String] = []
+                // A JWT's claims are JSON somebody minted in a definite order —
+                // printed through the same canonical helper as every other body
+                // so the claims read the way the token spells them.
                 if let data = Data(base64Encoded: padBase64(parts[0])),
-                   let obj  = try? JSONSerialization.jsonObject(with: data),
-                   let pretty = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted),
-                   let str = String(data: pretty, encoding: .utf8) {
+                   data.dataToJSONObject() != nil,
+                   let str = data.dataToPrettyPrintString() {
                     blocks.append("// HEADER\n\(str)")
                 }
                 if let data = Data(base64Encoded: padBase64(parts[1])),
-                   let obj  = try? JSONSerialization.jsonObject(with: data),
-                   let pretty = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted),
-                   let str = String(data: pretty, encoding: .utf8) {
+                   let obj  = data.dataToJSONObject(),
+                   let str = data.dataToPrettyPrintString() {
                     blocks.append("// PAYLOAD\n\(str)")
                     if let dict = obj as? [String: Any],
                        let expNum = dict["exp"] as? NSNumber {
@@ -422,6 +398,15 @@ class NetworkDetailViewController: UITableViewController {
         // when something changed. A rewrite that matched zero values is the
         // failure mode this codebase keeps producing, so it is listed with its
         // "matched 0" in full rather than vanishing.
+        // A breakpoint that never paused is its own fact, under its own heading —
+        // burying it in RESPONSE REWRITES is the last place anyone would look for
+        // it, and it is what the inbox already reports while you are waiting.
+        var modelBreakpoint = NetworkDetailSection(title: "BREAKPOINT", content: nil,
+                                                   url: urlStr, httpModel: httpModel)
+        if let reason = httpModel?.breakpointSkippedReason, !reason.isEmpty {
+            modelBreakpoint.content = "\u{26A0}\u{FE0E} " + reason
+        }
+
         var modelRewrites = NetworkDetailSection(title: "RESPONSE REWRITES", content: nil,
                                                  url: urlStr, httpModel: httpModel)
         // `isResponseRewritten` is included in the condition on purpose: a body
@@ -487,7 +472,7 @@ class NetworkDetailViewController: UITableViewController {
         // reading a value you want changed is the moment the action has to be
         // within reach.
         var allSections = [model_1, modelParams, model_2, model_3, model_4,
-                           modelRewrites, model_5]
+                           modelBreakpoint, modelRewrites, model_5]
         if !rewriteEntryState.isHidden { allSections.append(modelRewriteAction) }
         allSections += [model_6, model_7, modelCurl,
                         modelTiming, modelJWT, modelErrorDetails, modelCache]
@@ -1008,10 +993,23 @@ class NetworkDetailViewController: UITableViewController {
         present(alert, animated: true)
     }
 
+    /// Export/share-ready text for a body that has already been through the
+    /// canonical pretty-printer.
+    ///
+    /// `renderedBody` is whatever `dataToPrettyPrintString()` returned: valid
+    /// JSON in the server's key order, or the raw text when the body was not
+    /// JSON. Re-serialising it here — which is what a `JSONSerialization`-based
+    /// normaliser does — parses it back into an unordered dictionary and
+    /// alphabetises the very keys the preview just got right. Trim the bytes
+    /// that were already rendered and ship those, so the exported file, the
+    /// clipboard and the screen all say the same thing.
+    static func exportText(for renderedBody: String) -> String {
+        return renderedBody.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Writes a JSON string to a temp file and shares the file URL.
     private func shareAsFile(jsonText: String, kind: String, sourceItem: UIBarButtonItem) {
-        // Ensure the exported bytes are valid JSON (or verbatim if not JSON).
-        let contents = JSONExporter.clipboardString(from: jsonText)
+        let contents = Self.exportText(for: jsonText)
         let host = httpModel?.url?.host ?? "request"
         let path = (httpModel?.url?.path ?? "").replacingOccurrences(of: "/", with: "-")
         let name = "\(host)\(path)-\(kind)"

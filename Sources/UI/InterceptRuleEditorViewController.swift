@@ -107,8 +107,6 @@ class InterceptRuleEditorViewController: UITableViewController {
     /// anything: the rule then keeps deriving its name from what it does, so
     /// arming a mock later renames it instead of leaving a stale label behind.
     private var ruleName = ""
-    /// The host-vs-any-host question is asked once, on first appearance.
-    private var didAskHostScope = false
     private var matchMode: EndpointMatchMode = .normalized
     private var selectedHosts: [String] = []
     private var isBlocked = false
@@ -168,29 +166,18 @@ class InterceptRuleEditorViewController: UITableViewController {
         view.forceLTR()
     }
 
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        askHostScopeIfNeeded()
-    }
-
-    /// Asks, once, whether a NEW endpoint rule means "this endpoint on this
-    /// host" or "this endpoint anywhere".
-    ///
-    /// Asked rather than assumed because the two answers are genuinely different
-    /// rules and the old behaviour — path only, every host — is the surprising
-    /// one: a rule for `/api/users` fired on staging, production and every third
-    /// party that happens to use the same path. The pin is the default for that
-    /// reason; the sheet is dismissible and dismissing it keeps the default.
-    private func askHostScopeIfNeeded() {
-        guard !didAskHostScope else { return }
-        guard existingRule == nil,
-              matchMode == .exact || matchMode == .normalized,
-              !requestHost.isEmpty,
-              presentedViewController == nil
-        else { return }
-        didAskHostScope = true
-        presentHostScopePicker()
-    }
+    // NO `viewDidAppear` OVERRIDE, DELIBERATELY.
+    //
+    // A previous round popped the "this host / any host" sheet automatically the
+    // first time a NEW endpoint rule appeared. The maintainer asked for it gone:
+    // the answer it offered as its default (THIS HOST) is the answer the editor
+    // already applies in `populateFromModel()`, so the sheet asked a question
+    // whose answer never changed anything and stood between the user and the
+    // screen they asked for.
+    //
+    // The scope did not go away with it — it is stated on the ENDPOINT rows
+    // (`endpointHostScopeCell`, `endpointScopeExplanation`) and changed by
+    // tapping the host row, which still opens `presentHostScopePicker()`.
 
     // MARK: - Populate
 
@@ -253,9 +240,12 @@ class InterceptRuleEditorViewController: UITableViewController {
             // for it. Host/global rules stay empty on purpose: they match many
             // endpoints, so one endpoint's headers would be misleading.
             if matchMode == .exact || matchMode == .normalized {
-                // Pinned by default; `askHostScopeIfNeeded()` offers the other
-                // answer before anything is saved. Existing rules on disk keep
-                // their empty pin and their any-host behaviour.
+                // Pinned to the request's host by default — nothing asks, because
+                // the host row on screen both STATES this and is the way to change
+                // it. Any-host is the surprising answer (a rule for `/api/users`
+                // firing on staging, production and every third party using the
+                // same path), so it is the one you opt into. Existing rules on disk
+                // keep their empty pin and their any-host behaviour.
                 matchHost = requestHost
                 prefillFromEndpoint()
             }
@@ -565,6 +555,52 @@ class InterceptRuleEditorViewController: UITableViewController {
         }
     }
 
+    /// Save this rule, then open a switched-off copy of it.
+    ///
+    /// The maintainer's reason for wanting duplication is "easier to edit", so
+    /// the copy carries what is on SCREEN, not what was last written to disk —
+    /// which means this rule has to be saved first, or the edits you can see
+    /// would exist only on the copy and silently vanish from the original.
+    /// Validation is the same one Save uses, and refuses for the same reasons.
+    ///
+    /// The copy is created disabled (see `InterceptRuleDuplicator.duplicate`),
+    /// and the editor that opens on it says so in the ACTION footer.
+    @objc private func duplicateRuleTapped() {
+        // Nothing to duplicate until the rule exists; the row is not offered
+        // then either.
+        guard existingRule != nil else { return }
+        switch validatedRule() {
+        case .noHosts:
+            showAlert(title: "No URLs", message: "Select at least one URL to intercept.")
+        case .noEndpoint:
+            showAlert(title: "No Endpoint",
+                      message: "This rule has no path to match, so there is nothing to copy.")
+        case .noEffect:
+            showAlert(title: "Empty Rule",
+                      message: "This rule does nothing yet, so a copy of it would do nothing either.")
+        case .ok(let rule):
+            InterceptRuleStore.shared.addOrUpdate(rule)
+            guard let copy = InterceptRuleDuplicator.duplicateAndStore(id: rule.id) else { return }
+            openEditor(for: copy)
+        }
+    }
+
+    /// Pushes a second editor onto the copy, leaving this one behind it so Back
+    /// returns to the original.
+    private func openEditor(for rule: InterceptRule) {
+        let editor = InterceptRuleEditorViewController()
+        editor.httpModel = httpModel
+        editor.ruleToEdit = rule
+        // Both, so the title reads "Edit Rule" — `viewDidLoad` chooses it before
+        // `populateFromModel()` derives the id from `ruleToEdit`.
+        editor.existingRuleId = rule.id
+        if let nav = navigationController {
+            nav.pushViewController(editor, animated: true)
+        } else {
+            present(SwiftyDebugNavigationController(rootViewController: editor), animated: true)
+        }
+    }
+
     @objc private func selectHostsTapped() {
         let picker = HostPickerSheetViewController()
         picker.selectedHosts = Set(selectedHosts)
@@ -754,6 +790,9 @@ class InterceptRuleEditorViewController: UITableViewController {
                                                          sampleBody: sample.body,
                                                          sampleLabel: sample.label,
                                                          destination: .caller)
+        // Two rules can now share scope and host pin (duplication), so name the
+        // one this editor owns rather than letting the store guess.
+        editor.attachRuleId = existingRule?.id
         editor.onSave = { [weak self] rewrite in
             guard let self else { return }
             // Match on id, so editing replaces instead of adding a second copy.
@@ -1004,7 +1043,9 @@ class InterceptRuleEditorViewController: UITableViewController {
             if matchMode == .host { return 1 + selectedHosts.count }
             return endpointRows.count
         case .action:
-            return existingRule != nil ? 5 : 4      // block, redirect, mock, breakpoint (+ delete)
+            // block, redirect, mock, breakpoint (+ duplicate, delete once the
+            // rule exists — there is nothing to copy or remove before that).
+            return existingRule != nil ? 6 : 4
         case .responseRewrites:
             // A blocked request never gets a response, so there is nothing for a
             // rewrite to act on — the section disappears, exactly like headers.
@@ -1247,6 +1288,17 @@ class InterceptRuleEditorViewController: UITableViewController {
             c.detailTextLabel?.numberOfLines = 3
             c.accessoryType = .disclosureIndicator
             return c
+        case 4:
+            let c = plainCell("duplicate", style: .subtitle)
+            c.textLabel?.text = "Duplicate Rule"
+            c.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+            c.textLabel?.textColor = DebugTheme.accentColor
+            c.detailTextLabel?.text = "Saves this rule, then opens a switched-off copy of it"
+            c.detailTextLabel?.font = .systemFont(ofSize: 11)
+            c.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
+            c.detailTextLabel?.numberOfLines = 2
+            c.accessoryType = .disclosureIndicator
+            return c
         default:
             let c = plainCell("delete")
             c.textLabel?.text = "Delete Rule"
@@ -1434,7 +1486,8 @@ class InterceptRuleEditorViewController: UITableViewController {
             if ip.row == 1 { presentRedirectEditor() }
             else if ip.row == 2 { presentMockEditor() }
             else if ip.row == 3 { presentBreakpointPicker() }
-            else if ip.row == 4 { removeRuleTapped() }
+            else if ip.row == 4 { duplicateRuleTapped() }
+            else if ip.row == 5 { removeRuleTapped() }
         case .responseRewrites:
             guard responseRewrites.indices.contains(ip.row) else { presentRewriteEditor(nil); return }
             presentRewriteEditor(responseRewrites[ip.row])
@@ -1556,6 +1609,28 @@ class InterceptRuleEditorViewController: UITableViewController {
             return ruleName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "Left blank, this rule is listed as \u{201C}\(derivedNamePreview)\u{201D} and keeps up with whatever you arm."
                 : nil
+        }
+        if s == .action {
+            // ORDER MATTERS. "Switched off" subsumes everything else — if the rule
+            // does not run, no conflict between its actions is worth mentioning
+            // yet. This screen has NO enable control (see `applyEnablement`), so a
+            // disabled rule otherwise reads exactly like an armed one, which bites
+            // hardest on a fresh duplicate (created switched off on purpose):
+            // without this you would edit a copy, save it, and watch nothing happen.
+            if let existing = existingRule, !existing.isEnabled {
+                return "This rule is switched OFF, so none of the above happens yet. "
+                    + "Turn it on with the switch on its row in the rules list."
+            }
+            // A mock answers from `startLoading` and never touches the network, so
+            // the breakpoint parked further down that path never fires. Say so
+            // HERE, while both are being armed — the paused inbox reports it
+            // afterwards, but by then you are already waiting for a pause that is
+            // never coming.
+            if mock.isEnabled, breakpointMode != .off {
+                return "This rule returns a mock, so the breakpoint never pauses — "
+                    + "a mock answers before the request is sent. Edit the mock body instead."
+            }
+            return nil
         }
         guard s == .responseRewrites, !isBlocked else { return nil }
         // A mock replaces the whole response, so rewrites never see it. Better to

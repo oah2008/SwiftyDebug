@@ -393,7 +393,11 @@ final class BreakpointDetailViewController: UITableViewController {
         self.isRequestBodyBinary = !bodyData.isEmpty && decoded.isEmpty
         self.isRequestBodyJSONEditable = bodyData.isEmpty || document != nil
         // Pretty-print JSON so it is legible — and editable — on a phone.
-        self.requestBodyText = document?.prettyText() ?? decoded
+        // Same trap as the mock editor: `prettyText()` returns "" — not nil — for
+        // a body JSON cannot represent, so a held request with a real body showed
+        // an empty one. Fall back whenever the render is empty.
+        let renderedRequestBody = document?.prettyText()
+        self.requestBodyText = (renderedRequestBody?.isEmpty == false) ? renderedRequestBody! : decoded
         self.editedRequestBody = self.requestBodyText
         super.init(style: .grouped)
     }

@@ -69,10 +69,8 @@ final class WebViewStorageService {
 
     private func loadWebStorage(scope: Scope, completion: @escaping ([Item]) -> Void) {
         guard let webView, let obj = scope.jsObject else { DispatchQueue.main.async { completion([]) }; return }
-        // Serialize the whole store to a JSON object of key -> value.
-        let js = """
-        (function(){try{var o=Object.create(null);for(var i=0;i<\(obj).length;i++){var k=\(obj).key(i);o[k]=\(obj).getItem(k);}return JSON.stringify(o);}catch(e){return '{}';}})();
-        """
+        let js = Self.enumerationScript(for: obj)
+
         runOnMain {
             webView.evaluateJavaScript(js) { result, _ in
                 var items: [Item] = []
@@ -218,5 +216,30 @@ final class WebViewStorageService {
 
     private func runOnMain(_ block: @escaping () -> Void) {
         if Thread.isMainThread { block() } else { DispatchQueue.main.async(execute: block) }
+    }
+
+    /// The store-enumeration script, `internal` so its per-key isolation can be
+    /// unit-tested without standing up a WKWebView.
+    static func enumerationScript(for jsObject: String) -> String {
+        let obj = jsObject
+        return """
+        (function(){var o=Object.create(null);var n=0;
+        try{n=\(obj).length;}catch(e){return '{}';}
+        for(var i=0;i<n;i++){
+        /* Per-key isolation: ONE value containing a lone surrogate used to make
+           the single JSON.stringify at the end throw, and the catch returned '{}'
+           — so one bad value blanked the ENTIRE storage list. Stringify each value
+           on its own and substitute a marker for the one that cannot be encoded. */
+        var k=null;
+        try{k=\(obj).key(i);var v=\(obj).getItem(k);JSON.stringify(v);o[k]=v;}
+        catch(e){if(k!==null){o[k]='\\u26a0\\ufe0f (value cannot be displayed)';}}}
+        try{return JSON.stringify(o);}catch(e){return '{}';}})();
+        """
+    }
+
+    /// Convenience for tests and callers that have a Scope rather than a name.
+    static func enumerationScriptSource(for scope: Scope) -> String {
+        guard let obj = scope.jsObject else { return "" }
+        return enumerationScript(for: obj)
     }
 }

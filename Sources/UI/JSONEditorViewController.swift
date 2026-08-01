@@ -11,9 +11,11 @@ import UIKit
 ///
 /// **Tree** — every node is a tappable row (key, value preview, type badge).
 /// Containers collapse. Each row has a full action menu: edit, rename, change
-/// type, duplicate, add child, delete, copy. Arrays of objects get first-class
-/// treatment: "Add item" builds an element shaped like its siblings, and
-/// duplicate/reorder are one tap.
+/// type, duplicate, add child, delete, copy. Arrays get first-class treatment:
+/// "Add item" builds an element of the same type as the ones already there —
+/// all the way down for an object — names that type in the menu so you can see
+/// what you are about to get, and offers a different type when the guess isn't
+/// what you wanted. Duplicate/reorder are one tap.
 ///
 /// **Raw** — the whole document as text with live validation, format/minify and
 /// paste, for when you'd rather type or paste a payload wholesale.
@@ -325,19 +327,67 @@ final class JSONEditorViewController: UIViewController {
             }
             document.setValue(parsed.root, at: [])
         }
+        // Going to Raw with a document that cannot be written as text would
+        // render an EMPTY text view over a body that is still there — see
+        // `renderedText(of:)`.
+        var rawRender: String?
+        if newMode == .raw {
+            guard let text = renderedText(of: document) else {
+                modeControl.selectedSegmentIndex = Mode.tree.rawValue
+                showAlert("Can't show this as text",
+                          unrepresentableReason(of: document)
+                            + "\n\nRaw mode would show an empty document. Fix that value in the tree first.")
+                return
+            }
+            rawRender = text
+        }
         mode = newMode
         tableView.isHidden = (mode != .tree)
         rawTextView.isHidden = (mode != .raw)
-        if mode == .raw { rawTextView.text = document.prettyText() }
+        if let rawRender { rawTextView.text = rawRender }
         if mode == .tree { rebuildRows() }
         updateStatus()
         view.endEditing(true)
     }
 
     private func documentChanged() {
-        if mode == .tree { rebuildRows() } else { rawTextView.text = document.prettyText() }
+        if mode == .tree {
+            rebuildRows()
+        } else if let text = renderedText(of: document) {
+            // Only overwrite with text the document can actually produce.
+            // `prettyText()` answers "" for one it cannot, which used to wipe
+            // the text view and take the body off screen with it.
+            rawTextView.text = text
+        }
         refreshToolbar()
         updateStatus()
+    }
+
+    /// The document as JSON text, or nil when it holds a value JSON cannot
+    /// express.
+    ///
+    /// **Not a theoretical state.** `JSONSerialization` PARSES a negative
+    /// literal that overflows a `Double` — `{"balance":-2e308}`, valid JSON that
+    /// a backend really can emit — and hands back `-infinity`. JSON has no way
+    /// to write that back, so `JSONTextWriter` throws and `prettyText()`
+    /// answers `""`.
+    ///
+    /// Every path that took that `""` at face value did real damage: Raw mode
+    /// showed an empty document (and then refused to switch back, because `""`
+    /// is not valid JSON), and `onSave` handed `""` to callers that write it
+    /// straight into a mock body or a held request/response — so the host app
+    /// was served an EMPTY body with nothing on screen saying so.
+    ///
+    /// Costs exactly one serialisation, the same one the caller needed anyway.
+    private func renderedText(of document: JSONDocument) -> String? {
+        let text = document.prettyText()
+        return text.isEmpty ? nil : text
+    }
+
+    /// The sentence to show when `renderedText(of:)` came back nil. Only asked
+    /// for on that path, so the extra pass is never on the editing hot path.
+    private func unrepresentableReason(of document: JSONDocument) -> String {
+        document.serializationProblem() ?? "This document holds a value JSON cannot represent."
     }
 
     private func updateStatus() {
@@ -644,7 +694,14 @@ final class JSONEditorViewController: UIViewController {
                 showAlert("Invalid JSON", JSONDocument.validate(rawTextView.text).error ?? "")
                 return
             }
-            rawTextView.text = parsed.prettyText()
+            // Formatting must never be able to empty the editor: text that
+            // parses can still hold a value JSON cannot write back (see
+            // `renderedText(of:)`).
+            guard let formatted = renderedText(of: parsed) else {
+                showAlert("Can't format", unrepresentableReason(of: parsed) + "\n\nYour text is untouched.")
+                return
+            }
+            rawTextView.text = formatted
             updateStatus()
         } else {
             collapsed.removeAll()
@@ -662,6 +719,13 @@ final class JSONEditorViewController: UIViewController {
         }
         guard let parsed = JSONDocument(text: text) else {
             showAlert("Clipboard isn't JSON", JSONDocument.validate(text).error ?? "Could not parse the clipboard.")
+            return
+        }
+        // Parses but cannot be written back: replacing the document with it
+        // would leave nothing to render and nothing to save.
+        guard renderedText(of: parsed) != nil else {
+            showAlert("Clipboard can't be edited",
+                      unrepresentableReason(of: parsed) + "\n\nNothing was replaced.")
             return
         }
         // Fold the Raw text in first, so "you can undo" is true of what is on
@@ -712,6 +776,16 @@ final class JSONEditorViewController: UIViewController {
                 return
             }
             document.setValue(parsed.root, at: [])
+        }
+        // EVERY caller of `onSave` writes `document.prettyText()` somewhere the
+        // host app will read it — a mock body, a held request, a held response.
+        // A document that cannot be written answers "", so saving it delivered
+        // an EMPTY body and said nothing. Refuse, and name the value.
+        guard renderedText(of: document) != nil else {
+            showAlert("Can't save",
+                      unrepresentableReason(of: document)
+                        + "\n\nSaving would replace the body with nothing. Fix that value first.")
+            return
         }
         view.endEditing(true)
         onSave?(document)
@@ -766,11 +840,14 @@ final class JSONEditorViewController: UIViewController {
             }
         }
         if row.isContainer {
-            options.append(.init(title: row.kind == .array ? "Add item" : "Add key",
-                                 subtitle: row.kind == .array ? "Shaped like the existing items" : nil,
-                                 symbol: "plus.circle", tint: DebugTheme.accentColor) { [weak self] in
-                self?.addChild(toContainerAt: path)
-            })
+            if row.kind == .array {
+                appendAddItemOptions(forArrayAt: path, to: &options)
+            } else {
+                options.append(.init(title: "Add key", subtitle: nil,
+                                     symbol: "plus.circle", tint: DebugTheme.accentColor) { [weak self] in
+                    self?.addChild(toContainerAt: path)
+                })
+            }
         }
         if case .key(let k)? = path.last {
             options.append(.init(title: "Rename key", subtitle: k, symbol: "character.cursor.ibeam") { [weak self] in
@@ -790,7 +867,14 @@ final class JSONEditorViewController: UIViewController {
         options.append(.init(title: "Copy value", subtitle: nil, symbol: "doc.on.doc") { [weak self] in
             guard let self else { return }
             let value = self.document.value(at: path) ?? NSNull()
-            UIPasteboard.general.string = JSONDocument(root: value).prettyText()
+            let node = JSONDocument(root: value)
+            // Writing "" to the pasteboard is worse than not writing: the user
+            // pastes an empty body somewhere and has no idea why.
+            guard let text = self.renderedText(of: node) else {
+                self.showAlert("Can't copy this value", self.unrepresentableReason(of: node))
+                return
+            }
+            UIPasteboard.general.string = text
         })
         options.append(.init(title: "Copy path", subtitle: path.display, symbol: "arrow.triangle.branch") {
             UIPasteboard.general.string = path.display
@@ -841,6 +925,60 @@ final class JSONEditorViewController: UIViewController {
             selectedIndex: JSONValueKind.allCases.firstIndex(of: current))
     }
 
+    /// "Add item" for an array, with the type it is about to add spelled out in
+    /// the subtitle, plus an escape hatch.
+    ///
+    /// Both halves matter. Naming the inferred type ("object with 5 keys") is
+    /// what lets you see what you are getting before you tap; the escape hatch is
+    /// there because wanting one object in an array of strings is a normal thing,
+    /// and a menu that can only add what is already there sends you to Raw mode
+    /// to type it by hand.
+    private func appendAddItemOptions(forArrayAt path: JSONPath,
+                                      to options: inout [OptionPickerSheetViewController.Option]) {
+        let template = document.arrayElementTemplate(forArrayAt: path)
+        options.append(.init(title: "Add item", subtitle: template.summary,
+                             symbol: "plus.circle",
+                             // A fallback is not an inference: don't dress a guess
+                             // up in the same accent colour as a real match.
+                             tint: template.isInferred ? DebugTheme.accentColor : nil) { [weak self] in
+            self?.appendItem(template.value, toArrayAt: path)
+        })
+        options.append(.init(title: "Add item of another type\u{2026}",
+                             subtitle: "Pick the type yourself instead",
+                             symbol: "plus.square") { [weak self] in
+            self?.chooseItemType(forArrayAt: path, inferred: template)
+        })
+    }
+
+    private func chooseItemType(forArrayAt path: JSONPath, inferred: JSONArrayElementTemplate) {
+        let suggested = inferred.isInferred ? inferred.kind : nil
+        let options = JSONValueKind.allCases.map { kind in
+            OptionPickerSheetViewController.Option(
+                title: kind.badge,
+                subtitle: kind == suggested ? inferred.summary : nil,
+                symbol: nil,
+                tint: kind == suggested ? DebugTheme.accentColor : .white
+            ) { [weak self] in
+                // The matching type keeps the shape that was read from the
+                // siblings; any other type starts empty, which is the point of
+                // asking for a different one.
+                self?.appendItem(kind == suggested ? inferred.value : kind.emptyValue, toArrayAt: path)
+            }
+        }
+        OptionPickerSheetViewController.present(
+            from: self, title: "Add item", message: path.display, options: options,
+            selectedIndex: suggested.flatMap { JSONValueKind.allCases.firstIndex(of: $0) })
+    }
+
+    /// Appends through the document's path API — the only way in, so the source
+    /// key order and number spelling of everything already there survive.
+    private func appendItem(_ value: Any, toArrayAt path: JSONPath) {
+        // Expand first: appending fires `onChange`, which rebuilds the tree, and
+        // a collapsed array would hide the element that was just added.
+        collapsed.remove(path.display)
+        document.appendElement(value, toArrayAt: path)
+    }
+
     /// Adds a child to an object (asks for a key) or an array (uses a template
     /// shaped like the existing elements).
     private func addChild(toContainerAt path: JSONPath) {
@@ -857,11 +995,7 @@ final class JSONEditorViewController: UIViewController {
                 }
             }
         case .array:
-            let template = document.templateElement(forArrayAt: path)
-            document.appendElement(template, toArrayAt: path)
-            // Expand so the new element is visible.
-            collapsed.remove(path.display)
-            rebuildRows()
+            appendItem(document.templateElement(forArrayAt: path), toArrayAt: path)
         default:
             showAlert("Not a container", "Only objects and arrays can hold children. Change the type first.")
         }

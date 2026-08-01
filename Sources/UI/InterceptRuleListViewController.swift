@@ -7,8 +7,135 @@
 
 import UIKit
 
+/// Makes an independent copy of an intercept rule.
+///
+/// Lives here rather than next to `InterceptRule` only because the three
+/// screens that offer duplication (this list, the App tab's INTERCEPT RULES
+/// section and the rule editor) all reach it from the UI layer. It is PURE
+/// apart from `duplicateAndStore`, which is the one function that touches the
+/// store, so everything that decides what a copy *is* can be unit-tested
+/// without a singleton.
+///
+/// Three things a copy has to get right, all of them reported bug classes in
+/// this project:
+///
+/// 1. **Its own identity.** `id` and `createdAt` are `let`, so a copy is BUILT,
+///    never assigned onto a `var` clone. Sharing an id would make `addOrUpdate`
+///    treat the copy as an edit of the original and the original would vanish.
+///    The nested identities (`KVPair.id`, `ResponseRewrite.id`) are freshly
+///    minted too — the rewrite editor and the rewrite engine both key on
+///    `ResponseRewrite.id`, and two rules matching the same request contribute
+///    their rewrites to ONE composite (`InterceptRuleStore.resolvedRule`), where
+///    a duplicated id would be genuinely ambiguous.
+/// 2. **Everything else carried.** Scope, host pin, headers/params with their
+///    removals, block, redirect, mock (body, headers, delay), breakpoint,
+///    response rewrites with their on/off flags, and the name.
+/// 3. **Switched OFF.** See `duplicate(_:among:)`.
+enum InterceptRuleDuplicator {
+
+    /// The word appended to a copy's name, so two rules with the same scope are
+    /// never two identical rows.
+    static let copyWord = "copy"
+
+    /// An independent, switched-off copy of `rule`.
+    ///
+    /// **Created disabled, deliberately.** A copy has the same scope as its
+    /// original by definition, so an armed copy fires on exactly the same
+    /// requests the moment it exists — before the user has edited the thing they
+    /// duplicated it to edit. That is not a no-op on the wire: response rewrites
+    /// ACCUMULATE across matching rules (see `InterceptRuleStore.resolvedRule`),
+    /// so a duplicated find-and-replace would run twice on the same body, and a
+    /// duplicated mock/breakpoint doubles the rules the composite reports as
+    /// responsible. Off means duplicating never changes what the host app sees;
+    /// the list's own switch arms it when the user is ready.
+    ///
+    /// - Parameter existing: every rule the copy will sit alongside. Used only
+    ///   to pick a name nothing else is already using.
+    static func duplicate(_ rule: InterceptRule, among existing: [InterceptRule]) -> InterceptRule {
+        // Built, not cloned: `id` and `createdAt` are `let`, and this is the only
+        // way to get fresh ones.
+        var copy = InterceptRule(matchEndpoint: rule.matchEndpoint, matchMode: rule.matchMode)
+        copy.matchHosts = rule.matchHosts
+        copy.matchHost = rule.matchHost
+        copy.name = copyName(for: rule, among: existing)
+        copy.isBlocked = rule.isBlocked
+        copy.headerOverrides = rule.headerOverrides.map { KVPair(key: $0.key, value: $0.value) }
+        copy.queryParamOverrides = rule.queryParamOverrides.map { KVPair(key: $0.key, value: $0.value) }
+        copy.removedHeaderKeys = rule.removedHeaderKeys
+        copy.removedQueryParamKeys = rule.removedQueryParamKeys
+        copy.isEnabled = false
+        // `addOrUpdate` re-assigns this — a rule arriving in a bucket it was not
+        // already in goes last — but carrying it keeps the copy meaningful for
+        // any caller that stores it some other way.
+        copy.order = rule.order
+        copy.redirectMode = rule.redirectMode
+        copy.redirectTarget = rule.redirectTarget
+        copy.mock = MockResponse(isEnabled: rule.mock.isEnabled,
+                                 statusCode: rule.mock.statusCode,
+                                 body: rule.mock.body,
+                                 headers: rule.mock.headers.map { KVPair(key: $0.key, value: $0.value) },
+                                 delay: rule.mock.delay)
+        copy.breakpointMode = rule.breakpointMode
+        copy.responseRewrites = rule.responseRewrites.map {
+            ResponseRewrite(pattern: $0.pattern, action: $0.action,
+                            isEnabled: $0.isEnabled, name: $0.name)
+        }
+        return copy
+    }
+
+    /// What to call the copy: the original's row title plus " copy", made unique
+    /// against everything already listed.
+    ///
+    /// A copy MUST carry a name of its own even when the original has none. An
+    /// unnamed rule describes itself from what it does (`armedSummary`), so an
+    /// unnamed rule and its unnamed copy would render as two identical rows with
+    /// identical scope — exactly the confusion the naming work was done to fix.
+    /// Freezing a name here is the lesser evil, and clearing the NAME field in
+    /// the editor puts the copy back on auto-naming.
+    static func copyName(for rule: InterceptRule, among existing: [InterceptRule]) -> String {
+        let taken = Set(existing.map { InterceptRuleRowFormatter.title(for: $0) })
+        let base = baseName(InterceptRuleRowFormatter.title(for: rule))
+        var candidate = base + " " + copyWord
+        var n = 2
+        while taken.contains(candidate) {
+            candidate = base + " " + copyWord + " \(n)"
+            n += 1
+        }
+        return candidate
+    }
+
+    /// Strips one trailing " copy" / " copy 3" so duplicating a copy gives
+    /// "X copy 2" rather than "X copy copy".
+    static func baseName(_ title: String) -> String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let range = trimmed.range(of: " " + copyWord, options: .backwards) else { return trimmed }
+        let tail = trimmed[range.upperBound...].trimmingCharacters(in: .whitespaces)
+        guard tail.isEmpty || Int(tail) != nil else { return trimmed }
+        let base = String(trimmed[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return base.isEmpty ? trimmed : base
+    }
+
+    /// Duplicates `rule` against the store's CURRENT rules and saves the copy.
+    ///
+    /// Reads the store rather than trusting the caller's copy of the rule for
+    /// the same reason `AppInfoViewController.ruleForEnableToggle` does: a row
+    /// can have been drawn before the rule was edited elsewhere, and duplicating
+    /// a stale snapshot silently resurrects the pre-edit version.
+    ///
+    /// Returns nil when the rule is no longer there — there is nothing to copy,
+    /// and re-adding the caller's snapshot would resurrect a deleted rule.
+    @discardableResult
+    static func duplicateAndStore(id: String) -> InterceptRule? {
+        let all = InterceptRuleStore.shared.allRules()
+        guard let current = all.first(where: { $0.id == id }) else { return nil }
+        let copy = duplicate(current, among: all)
+        InterceptRuleStore.shared.addOrUpdate(copy)
+        return copy
+    }
+}
+
 /// Shows all intercept rules that match a given request path (both exact and normalized).
-/// Supports enable/disable, reorder, delete, and creating new rules.
+/// Supports enable/disable, reorder, delete, duplicate, and creating new rules.
 class InterceptRuleListViewController: UITableViewController {
 
     // MARK: - Input
@@ -257,22 +384,68 @@ class InterceptRuleListViewController: UITableViewController {
         editRule(ruleList[indexPath.row])
     }
 
-    // Swipe to delete
+    // Swipe to delete / duplicate
     override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool { true }
+
+    /// Delete and Duplicate, in that order — Delete stays under the thumb where
+    /// it has always been, so adding Duplicate cannot move a destructive action
+    /// under a finger already on its way.
+    override func tableView(_ tableView: UITableView,
+                            trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath)
+    -> UISwipeActionsConfiguration? {
+        guard ruleList.indices.contains(indexPath.row) else { return nil }
+        // The rule's IDENTITY, never the row: both handlers run after the swipe
+        // has settled, by which time a reload may have moved the rows.
+        let ruleId = ruleList[indexPath.row].id
+
+        let delete = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, done in
+            self?.deleteRule(id: ruleId)
+            done(true)
+        }
+        let duplicate = UIContextualAction(style: .normal, title: "Duplicate") { [weak self] _, _, done in
+            self?.duplicateRule(id: ruleId)
+            done(true)
+        }
+        duplicate.backgroundColor = DebugTheme.accentColor
+        duplicate.image = UIImage(systemName: "plus.square.on.square")
+        return UISwipeActionsConfiguration(actions: [delete, duplicate])
+    }
 
     override func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
         guard editingStyle == .delete, ruleList.indices.contains(indexPath.row) else { return }
-        let rule = ruleList[indexPath.row]
-        ruleList.remove(at: indexPath.row)
-        InterceptRuleStore.shared.remove(id: rule.id)
+        deleteRule(id: ruleList[indexPath.row].id)
+    }
+
+    /// The one delete path, shared by the swipe action and the editing-mode
+    /// button. Finds the row by id rather than being handed one.
+    private func deleteRule(id: String) {
+        guard let row = ruleList.firstIndex(where: { $0.id == id }) else { return }
+        ruleList.remove(at: row)
+        InterceptRuleStore.shared.remove(id: id)
         tableView.performBatchUpdates {
-            tableView.deleteRows(at: [indexPath], with: .automatic)
+            tableView.deleteRows(at: [IndexPath(row: row, section: 0)], with: .automatic)
         } completion: { [weak tableView] _ in
             // Every surviving row carries a printed "RULE #n" that `deleteRows`
             // does not rebuild. Reloading afterwards re-runs `cellForRowAt` for
             // the survivors, so no row is left describing a position it no
             // longer occupies.
             tableView?.reloadData()
+        }
+    }
+
+    /// Copies the rule and shows the copy, switched off, in this same list.
+    private func duplicateRule(id: String) {
+        guard let copy = InterceptRuleDuplicator.duplicateAndStore(id: id) else {
+            // Deleted between the swipe and the tap — refresh rather than
+            // resurrecting a rule from a stale row.
+            reloadRules()
+            return
+        }
+        reloadRules()
+        // Scroll to it: a copy created switched off is a quiet change, and a new
+        // row the user never sees is indistinguishable from nothing happening.
+        if let row = ruleList.firstIndex(where: { $0.id == copy.id }) {
+            tableView.scrollToRow(at: IndexPath(row: row, section: 0), at: .middle, animated: true)
         }
     }
 

@@ -46,6 +46,13 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
     // MARK: - Input
 
+    /// The rule this editor was opened from, when it was opened from one. Makes
+    /// attachment unambiguous now that two rules can share scope and host pin.
+    var attachRuleId: String?
+    /// True when the rewrite was attached to a rule that is switched OFF, so the
+    /// confirmation can say so instead of implying it is live.
+    private var attachedToDisabledRule = false
+
     private let sampleBody: Data?
     private let sampleLabel: String?
     private let destination: Destination
@@ -1066,7 +1073,14 @@ final class ResponseRewriteEditorViewController: UITableViewController {
         // any-host one, and only then create a new pinned rule.
         let host = InterceptRule.canonicalHost(url.host ?? "")
         let candidates = InterceptRuleStore.shared.rules(for: key).filter { $0.matchMode == mode }
-        if let existing = candidates.first(where: { $0.matchHost == host })
+        // Prefer the rule this editor was opened FROM. Once rules can be
+        // duplicated, a copy shares scope AND host pin with its original, so
+        // matching on those alone is ambiguous — and it resolved to the original
+        // by sort order, meaning a rewrite armed while editing the copy silently
+        // landed on the rule the user was trying to leave alone.
+        if let attachRuleId, let owned = candidates.first(where: { $0.id == attachRuleId }) {
+            rule = owned
+        } else if let existing = candidates.first(where: { $0.matchHost == host })
             ?? candidates.first(where: { $0.matchHost.isEmpty }) {
             rule = existing
         } else if mode == .host {
@@ -1082,8 +1096,15 @@ final class ResponseRewriteEditorViewController: UITableViewController {
         } else {
             rule.responseRewrites.append(rewrite)
         }
-        // A rule that exists but is switched off would swallow the rewrite.
-        rule.isEnabled = true
+        // A brand-new rule arms itself; an EXISTING one keeps whatever the user
+        // set. Forcing this on silently re-armed a rule they had deliberately
+        // switched off — the same defect already fixed in the rule editor.
+        // `wasDisabled` is reported back so the caller can say so rather than
+        // leaving the rewrite looking armed when its rule is off.
+        if !candidates.contains(where: { $0.id == rule.id }) {
+            rule.isEnabled = true
+        }
+        attachedToDisabledRule = !rule.isEnabled
         InterceptRuleStore.shared.addOrUpdate(rule)
     }
 
@@ -1096,6 +1117,10 @@ final class ResponseRewriteEditorViewController: UITableViewController {
                      "Runs on every response \(Self.scopeSummary(destinationMode, url))."]
         if !rewrite.isEnabled {
             lines.append("It is switched OFF, so nothing happens until you turn it on.")
+        } else if attachedToDisabledRule {
+            // The rewrite is on, but its RULE is not. Saying "armed" here without
+            // this would be a lie.
+            lines.append("Its rule is switched off, so nothing happens until you turn the rule on.")
         } else if preview.changedCount > 0 {
             let subject = preview.changedCount == 1 ? "1 value" : "\(preview.changedCount) values"
             lines.append("\(subject) in the response you were looking at would change.")

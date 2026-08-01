@@ -865,21 +865,55 @@ class AppInfoViewController: UITableViewController {
         }
     }
 
-    // Swipe to delete rules
+    // Swipe to delete / duplicate rules
     override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
         guard Section(rawValue: indexPath.section) == .interceptRules else { return false }
         return indexPath.row < interceptRules.count
     }
 
+    /// Delete and Duplicate on a rule row — and nothing anywhere else, including
+    /// the "Add Rule" row, which is not a rule.
+    ///
+    /// Delete keeps its position, so adding Duplicate never slides a destructive
+    /// action under a finger that was already moving toward the old one.
+    override func tableView(_ tableView: UITableView,
+                            trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath)
+    -> UISwipeActionsConfiguration? {
+        guard Section(rawValue: indexPath.section) == .interceptRules,
+              interceptRules.indices.contains(indexPath.row) else { return nil }
+        // Identity, not row: both handlers run after the swipe settles, and the
+        // section is reloaded in between.
+        let ruleId = interceptRules[indexPath.row].id
+
+        let delete = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, done in
+            self?.deleteRule(id: ruleId)
+            done(true)
+        }
+        let duplicate = UIContextualAction(style: .normal, title: "Duplicate") { [weak self] _, _, done in
+            self?.duplicateRule(id: ruleId)
+            done(true)
+        }
+        duplicate.backgroundColor = DebugTheme.accentColor
+        duplicate.image = UIImage(systemName: "plus.square.on.square")
+        return UISwipeActionsConfiguration(actions: [delete, duplicate])
+    }
+
     override func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
         guard editingStyle == .delete,
               Section(rawValue: indexPath.section) == .interceptRules,
-              indexPath.row < interceptRules.count else { return }
-        let rule = interceptRules[indexPath.row]
-        interceptRules.remove(at: indexPath.row)
-        InterceptRuleStore.shared.remove(id: rule.id)
+              interceptRules.indices.contains(indexPath.row) else { return }
+        deleteRule(id: interceptRules[indexPath.row].id)
+    }
+
+    /// The one delete path, shared by the swipe action and the editing-mode
+    /// button. Finds the row by id rather than being handed one.
+    private func deleteRule(id: String) {
+        guard let row = interceptRules.firstIndex(where: { $0.id == id }) else { return }
+        interceptRules.remove(at: row)
+        InterceptRuleStore.shared.remove(id: id)
         tableView.performBatchUpdates {
-            tableView.deleteRows(at: [indexPath], with: .automatic)
+            tableView.deleteRows(at: [IndexPath(row: row, section: Section.interceptRules.rawValue)],
+                                 with: .automatic)
         } completion: { [weak tableView] _ in
             // The section header carries a live rule count and `deleteRows`
             // does not rebuild headers. Reloading the section afterwards also
@@ -887,6 +921,22 @@ class AppInfoViewController: UITableViewController {
             // section is left describing a row it no longer sits on.
             tableView?.reloadSections(IndexSet(integer: Section.interceptRules.rawValue), with: .none)
         }
+    }
+
+    /// Copies the rule — switched off — and shows the copy in this section.
+    private func duplicateRule(id: String) {
+        // Nil means the rule was deleted between the swipe and the tap; the
+        // refresh below drops the row rather than resurrecting anything.
+        let copy = InterceptRuleDuplicator.duplicateAndStore(id: id)
+        reloadInterceptRules()
+        // Rules are listed oldest-first, so the copy lands at the BOTTOM of a
+        // section that may well be off screen. A new row nobody sees is
+        // indistinguishable from nothing having happened — and this one is
+        // switched off, so it makes no noise of its own either.
+        guard let copyId = copy?.id,
+              let row = interceptRules.firstIndex(where: { $0.id == copyId }) else { return }
+        tableView.scrollToRow(at: IndexPath(row: row, section: Section.interceptRules.rawValue),
+                              at: .middle, animated: true)
     }
 
     // MARK: - Intercept Rule actions

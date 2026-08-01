@@ -128,10 +128,22 @@ final class JSONDocument {
     /// would cost more memory than the body itself. Above the cap serialization
     /// still round-trips numbers losslessly (shortest round-trip formatting) —
     /// only the original key order and exotic literals (`1.0e3`) are lost.
-    private static let maxIndexedSourceBytes = 2 * 1024 * 1024
+    /// `internal` so the coupling with `Data.maxOrderPreservingBytes` can be
+    /// asserted by a test — if the byte ceiling ever exceeds this, the printer
+    /// asks for source order on a body that has no source index and silently
+    /// falls back to sorted keys.
+    static let maxIndexedSourceBytes = 2 * 1024 * 1024
+
+    /// Set by the COPY path only. The index ceiling protects the MAIN THREAD;
+    /// copy runs off it behind a blocking overlay, and a clipboard whose key
+    /// order depends on how big the body happens to be is the defect, not the
+    /// protection.
+    var indexesSourceRegardlessOfSize = false
 
     private lazy var sourceIndex: JSONSourceIndex = {
-        guard let sourceText, sourceText.utf8.count <= Self.maxIndexedSourceBytes else {
+        guard let sourceText else { return JSONSourceIndex() }
+        guard indexesSourceRegardlessOfSize
+                || sourceText.utf8.count <= Self.maxIndexedSourceBytes else {
             return JSONSourceIndex()
         }
         return JSONSourceIndex(scanning: sourceText)
@@ -303,6 +315,17 @@ final class JSONDocument {
     }
 
     /// Appends an element to the array at `path`.
+    ///
+    /// The appended element gets NO recorded key order of its own, so the writer
+    /// spells its keys with `keys.sorted()` while its siblings keep the server's
+    /// order. That is deliberate and pinned by
+    /// `JSONArrayElementTemplateTests.testAppendingTheTemplateAfterAReorderDoesNotBorrowAnyonesKeyOrder`:
+    /// there is no non-arbitrary row to borrow an order from once the array has
+    /// been reordered, and a deterministic order for new rows beats a borrowed
+    /// one. The visible cost is that an added row reads differently from the
+    /// rows above it (`{"created_at":"","email":"","first_name":"","id":0}` next
+    /// to `{"id":…,"first_name":…,"email":…,"created_at":…}`), which is worth
+    /// revisiting if it ever gets reported — but not by borrowing row 0.
     @discardableResult
     func appendElement(_ newValue: Any, toArrayAt path: JSONPath) -> Bool {
         guard var arr = value(at: path) as? [Any] else { return false }
@@ -310,7 +333,8 @@ final class JSONDocument {
         arr.append(newValue)
         // Nothing shifts, but the new slot must not inherit records left behind
         // by a longer array that used to live here (-1 = no previous element).
-        sourceIndex.reindexArray(at: path, elementSources: Array(0..<(arr.count - 1)) + [-1])
+        sourceIndex.reindexArray(at: path,
+                                 elementSources: Array(0..<(arr.count - 1)) + [JSONSourceIndex.newElement])
         applyToParent(arr, at: path)
         return true
     }
@@ -357,31 +381,62 @@ final class JSONDocument {
         return setValue(converted, at: path)
     }
 
-    /// A new element shaped like the array's existing elements: for an array of
-    /// objects it returns an object with the union of sibling keys, each reset to
-    /// an empty value of the same type. This is what makes "Add item" feel smart.
+    /// A new element shaped like the array's existing elements — the value only.
+    ///
+    /// `arrayElementTemplate(forArrayAt:)` returns the same value *and* the words
+    /// for it, which is what a menu needs: "Add item" that guesses silently is
+    /// worse than one that says what it is about to add.
     func templateElement(forArrayAt path: JSONPath) -> Any {
-        guard let arr = value(at: path) as? [Any], !arr.isEmpty else { return "" }
+        arrayElementTemplate(forArrayAt: path).value
+    }
 
-        // Union of keys across object elements, preserving first-seen order.
-        var order: [String] = []
-        var kinds: [String: JSONValueKind] = [:]
-        var sawObject = false
-        for element in arr {
-            guard let dict = element as? [String: Any] else { continue }
-            sawObject = true
-            for key in dict.keys.sorted() where kinds[key] == nil {
-                order.append(key)
-                kinds[key] = JSONValueKind.of(dict[key]!)
+    /// What "Add item" will append to the array at `path`, and how it decided.
+    ///
+    /// An array that says nothing about itself — an empty one — is read from its
+    /// siblings where there are any: an empty `tags` sitting in a list of rows
+    /// whose other `tags` hold strings is a list of strings, and matching them
+    /// beats defaulting to a type nobody asked for. Failing that it falls back to
+    /// an empty string and the summary says so.
+    func arrayElementTemplate(forArrayAt path: JSONPath) -> JSONArrayElementTemplate {
+        guard let array = value(at: path) as? [Any] else { return .emptyArrayFallback }
+        guard array.isEmpty else { return JSONArrayShapeReader.template(forElementsOf: array) }
+        guard let siblings = siblingArrayElements(for: path), !siblings.isEmpty else {
+            return .emptyArrayFallback
+        }
+        return JSONArrayShapeReader.template(forElementsOf: siblings)
+            .adding(note: "this array is empty — matching the other arrays alongside it")
+    }
+
+    /// Elements of the arrays that sit alongside the empty array at `path`: its
+    /// neighbours in an array of arrays, or the same key on the sibling rows of
+    /// an array of objects. Bounded like every other scan here.
+    private func siblingArrayElements(for path: JSONPath) -> [Any]? {
+        let limit = JSONArrayShapeReader.sampleLimit
+        var out: [Any] = []
+        func collect(_ candidate: Any?) {
+            guard out.count < limit, let array = candidate as? [Any] else { return }
+            out.append(contentsOf: array.prefix(limit - out.count))
+        }
+
+        switch path.last {
+        case .index(let index):
+            guard let parent = value(at: Array(path.dropLast())) as? [Any] else { return nil }
+            for (offset, element) in parent.prefix(limit).enumerated() where offset != index {
+                collect(element)
             }
+        case .key(let key):
+            // The object holding this key has to be an array element itself,
+            // otherwise it has no siblings to compare against.
+            let objectPath = Array(path.dropLast())
+            guard case .index(let index)? = objectPath.last,
+                  let parent = value(at: Array(objectPath.dropLast())) as? [Any] else { return nil }
+            for (offset, element) in parent.prefix(limit).enumerated() where offset != index {
+                collect((element as? [String: Any])?[key])
+            }
+        case nil:
+            return nil
         }
-        if sawObject {
-            var template = [String: Any]()
-            for key in order { template[key] = (kinds[key] ?? .string).emptyValue }
-            return template
-        }
-        // Homogeneous scalars/arrays — match the first element's type.
-        return JSONValueKind.of(arr[0]).emptyValue
+        return out
     }
 
     // MARK: - Undo / redo
@@ -492,6 +547,211 @@ final class JSONDocument {
         } catch {
             return (false, (error as NSError).localizedDescription)
         }
+    }
+}
+
+// MARK: - Array element shape
+
+/// What "Add item" is about to append to an array, and how it decided.
+///
+/// The value on its own is not enough for a menu. Adding an item that turns out
+/// to be the wrong type is only obvious once it is in the payload, so the words
+/// travel with the value: `summary` is what the user reads *before* tapping, and
+/// `isInferred` says whether it describes a reading of the existing items or a
+/// fallback the array left no way to avoid.
+struct JSONArrayElementTemplate {
+    /// The element to append.
+    let value: Any
+    /// Its type, so a type picker can preselect it.
+    let kind: JSONValueKind
+    /// One line for a menu subtitle: "string", "object with 5 keys",
+    /// "number (decimal)" — or what it fell back to and why.
+    let summary: String
+    /// True when the existing items agreed on a type. False when there were none
+    /// or they disagreed, in which case the caller should make the escape hatch
+    /// obvious rather than presenting a guess as the answer.
+    let isInferred: Bool
+
+    /// Nothing to read: an empty string is the least surprising thing to add, and
+    /// the summary says that is what happened.
+    static let emptyArrayFallback = JSONArrayElementTemplate(
+        value: "", kind: .string,
+        summary: "empty array · nothing to copy, adding an empty string",
+        isInferred: false)
+
+    func adding(note: String) -> JSONArrayElementTemplate {
+        JSONArrayElementTemplate(value: value, kind: kind,
+                                 summary: summary + " · " + note, isInferred: isInferred)
+    }
+}
+
+/// Reads the element type of an array so a new element can be given the same
+/// shape — the *whole* shape, including nested objects and arrays.
+///
+/// **Bounded on purpose.** At most `sampleLimit` elements are read and at most
+/// `maxDepth` levels are copied, so working out the shape of a 10,000-row
+/// response costs the same as a 64-row one, and a deeply nested body cannot
+/// recurse the stack away. When the sample is shorter than the array the summary
+/// says so, rather than implying the whole thing was read.
+enum JSONArrayShapeReader {
+
+    /// Elements read before the reader stops looking. Far more than enough to
+    /// union the optional fields of a real collection.
+    static let sampleLimit = 64
+
+    /// Levels of nesting copied into the template.
+    static let maxDepth = 12
+
+    /// The element to append to an array holding `array`'s items.
+    static func template(forElementsOf array: [Any]) -> JSONArrayElementTemplate {
+        guard !array.isEmpty else { return .emptyArrayFallback }
+        let reading = read(Array(array.prefix(sampleLimit)), depth: 0)
+        let template = JSONArrayElementTemplate(
+            value: reading.value, kind: reading.kind,
+            summary: ([reading.name] + reading.notes).joined(separator: " · "),
+            isInferred: reading.isInferred)
+        guard array.count > sampleLimit else { return template }
+        return template.adding(note: "read the first \(sampleLimit) of \(array.count) items")
+    }
+
+    // MARK: Reading
+
+    /// A value plus the words for it. Only the top-level reading's words are
+    /// used; nested ones contribute a value (into an object) or a name (into
+    /// "array of …").
+    private struct Reading {
+        let value: Any
+        let kind: JSONValueKind
+        /// "string", "object with 5 keys", "array of number".
+        let name: String
+        let notes: [String]
+        let isInferred: Bool
+    }
+
+    /// `sample` must not be empty.
+    private static func read(_ sample: [Any], depth: Int) -> Reading {
+        // A null item is an absent value, not a type: a field that is null on
+        // the row that happens to come first is an optional string, not a null.
+        let present = sample.filter { !($0 is NSNull) }
+        guard let first = present.first else {
+            return Reading(value: NSNull(), kind: .null, name: "null",
+                           notes: ["every item is null"], isInferred: true)
+        }
+        var kinds: [JSONValueKind] = []
+        for item in present {
+            let kind = JSONValueKind.of(item)
+            if !kinds.contains(kind) { kinds.append(kind) }
+        }
+        let kind = JSONValueKind.of(first)
+        let shaped = shape(kind, from: present, depth: depth)
+        let sawNull = present.count < sample.count
+
+        guard kinds.count == 1 else {
+            var names = kinds.map(\.rawValue)
+            if sawNull { names.append(JSONValueKind.null.rawValue) }
+            return Reading(
+                value: shaped.value, kind: kind,
+                name: "mixed items (\(names.sorted().joined(separator: ", ")))",
+                notes: ["adding \(article(for: shaped.name)) \(shaped.name), like the first one"],
+                isInferred: false)
+        }
+
+        var notes: [String] = []
+        // An array slot is added empty on purpose: a seeded element would have to
+        // be deleted every time. Say so, since "array of number" implies content.
+        if kind == .array { notes.append("adds an empty array") }
+        if sawNull { notes.append("some items are null") }
+        // Anything the shape itself was unsure about — a field the rows
+        // disagree on. Said out loud for the same reason a MIXED array is:
+        // a guess presented as a reading is worse than no guess at all.
+        notes.append(contentsOf: shaped.notes)
+        return Reading(value: shaped.value, kind: kind, name: shaped.name,
+                       notes: notes, isInferred: true)
+    }
+
+    /// The empty value for a run of items that all share `kind`, the words for
+    /// it, and anything it had to guess at. Objects and arrays are shaped from
+    /// what the items actually hold.
+    private static func shape(_ kind: JSONValueKind, from values: [Any],
+                              depth: Int) -> (value: Any, name: String, notes: [String]) {
+        guard depth < maxDepth else { return (kind.emptyValue, kind.rawValue, []) }
+        switch kind {
+        case .string, .bool, .null:
+            return (kind.emptyValue, kind.rawValue, [])
+        case .number:
+            // A column of prices must not hand back an integer 0 and re-type
+            // itself; a column of ids must not hand back 0.0.
+            return hasFraction(values) ? (NSNumber(value: 0.0), "number (decimal)", [])
+                                       : (NSNumber(value: 0), "number", [])
+        case .object:
+            let shaped = object(from: values, depth: depth)
+            let name: String
+            switch shaped.value.count {
+            case 0:  name = "empty object"
+            case 1:  name = "object with 1 key"
+            default: name = "object with \(shaped.value.count) keys"
+            }
+            return (shaped.value, name, disagreementNote(shaped.undecided).map { [$0] } ?? [])
+        case .array:
+            let inner = values.lazy.compactMap { $0 as? [Any] }.flatMap { $0.prefix(sampleLimit) }
+            let sample = Array(inner.prefix(sampleLimit))
+            guard !sample.isEmpty else { return ([Any](), "array", []) }
+            let element = read(sample, depth: depth + 1)
+            guard element.isInferred else { return ([Any](), "array", []) }
+            return ([Any](), "array of \(element.name)", [])
+        }
+    }
+
+    /// The union of the keys these objects hold, each value shaped from every
+    /// value observed for that key — not from whichever object came first —
+    /// plus the keys whose values did NOT agree on a type.
+    ///
+    /// Those keys are a guess: the field takes the type of the first row that
+    /// has one, exactly as a mixed array does, and the caller says so. Without
+    /// this, an array of rows where `"v"` is a number on one row and a string on
+    /// the next was described as a confident "object with 1 key" and silently
+    /// added `"v": 0`.
+    private static func object(from values: [Any],
+                               depth: Int) -> (value: [String: Any], undecided: [String]) {
+        var observed: [String: [Any]] = [:]
+        for value in values {
+            guard let dict = value as? [String: Any] else { continue }
+            for (key, element) in dict { observed[key, default: []].append(element) }
+        }
+        var out = [String: Any]()
+        var undecided: [String] = []
+        for (key, items) in observed where !items.isEmpty {
+            let reading = read(items, depth: depth + 1)
+            out[key] = reading.value
+            if !reading.isInferred { undecided.append(key) }
+        }
+        return (out, undecided)
+    }
+
+    /// One line naming the fields the rows disagree about, or nil when they all
+    /// agree. Capped, because a subtitle listing forty field names is not a
+    /// subtitle.
+    private static func disagreementNote(_ keys: [String]) -> String? {
+        guard !keys.isEmpty else { return nil }
+        let sorted = keys.sorted()
+        let shown = sorted.prefix(3).map { "\u{201C}\($0)\u{201D}" }.joined(separator: ", ")
+        let tail = sorted.count > 3 ? " and \(sorted.count - 3) more" : ""
+        return "the rows disagree about \(shown)\(tail) — taking the first value seen"
+    }
+
+    /// True when any sampled number has a fractional part.
+    private static func hasFraction(_ values: [Any]) -> Bool {
+        for value in values {
+            guard let number = value as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID() else { continue }
+            let double = number.doubleValue
+            if double.isFinite, double != double.rounded(.towardZero) { return true }
+        }
+        return false
+    }
+
+    private static func article(for name: String) -> String {
+        "aeiou".contains(name.lowercased().first ?? " ") ? "an" : "a"
     }
 }
 

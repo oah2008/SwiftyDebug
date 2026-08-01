@@ -538,6 +538,15 @@ enum ResponseRewriteEngine {
         case .null:
             text = "null"
         case .object, .array:
+            // Apple's PARSER accepts a literal that overflows a Double (-1e999)
+            // and hands back -inf; Apple's WRITER then raises
+            // NSInvalidArgumentException, which is an ObjC exception `try?`
+            // cannot catch — so this killed the host app, on the networking
+            // thread, during a rewrite preview.
+            guard JSONSerialization.isValidJSONObject(value) else {
+                text = "(cannot display \u{2014} contains a value JSON cannot represent)"
+                break
+            }
             let data = try? JSONSerialization.data(withJSONObject: value,
                                                    options: [.withoutEscapingSlashes, .fragmentsAllowed])
             text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""

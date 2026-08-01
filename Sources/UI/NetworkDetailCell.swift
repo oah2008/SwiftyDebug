@@ -375,6 +375,16 @@ class NetworkDetailCell: UITableViewCell {
         contentTextView.invalidateIntrinsicContentSize()
     }
 
+    /// The view controller hosting this cell, for presenting the copy overlay.
+    private func owningViewController() -> UIViewController? {
+        var responder: UIResponder? = self
+        while let next = responder?.next {
+            if let vc = next as? UIViewController { return vc }
+            responder = next
+        }
+        return nil
+    }
+
     @objc private func tapCopy() {
         // Copy from rawContent (the original, before display transforms that
         // slash-unescape / re-indent) and produce guaranteed-valid JSON via the
@@ -383,7 +393,11 @@ class NetworkDetailCell: UITableViewCell {
         // added. Non-JSON is copied verbatim (trimmed). (See COPY.)
         let source = detailModel?.rawContent ?? detailModel?.content ?? ""
         guard !source.isEmpty else { return }
-        UIPasteboard.general.string = JSONExporter.clipboardString(from: source)
+        // A multi-megabyte body takes real time to print in the server's key
+        // order. Small ones copy synchronously exactly as before; big ones format
+        // off the main thread behind a blocking overlay that says what is
+        // happening — rather than silently copying a minified version.
+        ClipboardFormatter.copy(source, from: owningViewController())
 
         // Brief visual feedback — flash the icon color
         let config = UIImage.SymbolConfiguration(pointSize: 12, weight: .medium)

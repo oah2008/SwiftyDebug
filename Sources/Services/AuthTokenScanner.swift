@@ -164,8 +164,11 @@ struct DebugJWT {
     private static func prettyJSON(_ dict: [String: Any]) -> String {
         guard !dict.isEmpty,
               JSONSerialization.isValidJSONObject(dict),
+              // The caller already lost the token's claim order by decoding into a
+              // Dictionary, so there is nothing to preserve — sort, so at least the
+              // same token always renders identically.
               let data = try? JSONSerialization.data(
-                withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
+                withJSONObject: dict, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
               let str = String(data: data, encoding: .utf8) else { return "" }
         return str
     }

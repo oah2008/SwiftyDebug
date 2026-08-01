@@ -767,6 +767,9 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     /// cancellation error CFNetwork reports back can be told apart from one we
     /// did not cause. See `isClientInitiatedCancellation`.
     private var didCancelOwnTask = false
+    /// Why an armed breakpoint never paused this request, carried onto the
+    /// stored transaction in `stopLoading`.
+    private var breakpointSkipReason: String?
     private var isHoldingResponse = false
     /// True when the ONLY reason we are holding is response rewrites (no
     /// breakpoint). Such a hold is abandonable: if the body outgrows the rewrite
@@ -1062,6 +1065,15 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             self.resolvedRule = InterceptRuleStore.shared.resolvedRule(forURL: url)
             if let rule = self.resolvedRule {
                 if rule.isBlocked {
+                    // A blocked request never reaches the network, so a breakpoint
+                    // armed on the same rule can never park — exactly the silence
+                    // already fixed for mocks. Say so in both places: the inbox,
+                    // where the developer is waiting, and the request itself.
+                    if rule.breakpointMode != .off {
+                        let reason = Self.blockPreemptedBreakpointMessage(rule.breakpointMode)
+                        self.breakpointSkipReason = reason
+                        BreakpointCenter.shared.note(reason, for: url)
+                    }
                     let error = NSError(
                         domain: NSURLErrorDomain,
                         code: NSURLErrorCancelled,
@@ -1296,6 +1308,10 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         // the inbox stayed empty with nothing anywhere saying why. Say it in the
         // DIDN'T PAUSE section of the inbox they are staring at.
         if let mode = resolvedRule?.breakpointMode, mode != .off {
+            // Recorded in BOTH places on purpose: the inbox is where you are
+            // waiting, the request detail is where you look afterwards asking
+            // why this one behaved oddly.
+            self.breakpointSkipReason = Self.mockPreemptedBreakpointMessage(mode)
             BreakpointCenter.shared.note(Self.mockPreemptedBreakpointMessage(mode), for: request.url)
         }
 
@@ -1323,6 +1339,14 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     ///
     /// Worded for a mock from either source (the rule's own or an active mock
     /// profile), because both short-circuit the same way.
+    /// Why a blocked rule's breakpoint never paused. Pure, so the wording is
+    /// unit-testable and cannot drift from the mock equivalent.
+    static func blockPreemptedBreakpointMessage(_ mode: BreakpointMode) -> String {
+        let stage = mode == .beforeSend ? "before send" : "after response"
+        return "This rule blocks the request, so the \(stage) breakpoint never paused — "
+            + "a blocked request is never sent. Turn off Block Request to use the breakpoint."
+    }
+
     static func mockPreemptedBreakpointMessage(_ mode: BreakpointMode) -> String {
         switch mode {
         case .off:
@@ -1420,6 +1444,7 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         }
 
         model.size = ByteCountFormatter().string(fromByteCount: Int64(self.data?.length ?? 0))
+        model.breakpointSkippedReason = self.breakpointSkipReason
         model.responseData = self.data as Data?  // setter writes to disk, frees NSData
         model.isResponseTruncated = self.responseTruncated
         model.isImage = (self.response?.mimeType?.range(of: "image") != nil)

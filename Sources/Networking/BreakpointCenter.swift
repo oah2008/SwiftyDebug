@@ -53,10 +53,23 @@ final class BreakpointCenter {
         /// How long this request has been held.
         var heldFor: TimeInterval { Date().timeIntervalSince(pausedAt) }
 
-        /// Seconds left before the hold budget runs out, or nil once settled.
+        /// Seconds left before the APP gives up on this request, or nil once
+        /// settled.
+        ///
+        /// Counts against the held request's OWN `timeoutInterval`, not against
+        /// `breakpointHoldSeconds`. Those are the same number only while "Extend
+        /// Request Timeouts" is on — that setting is what raises the app's
+        /// timeout to the hold budget in the first place. With it off (the
+        /// default), the request dies at whatever the app asked for, typically
+        /// 60 s and often much less, while a fixed 600-second countdown happily
+        /// told the developer they had nine minutes to edit a response that was
+        /// already gone.
         var remainingHoldTime: TimeInterval? {
             guard !isSettled else { return nil }
-            return max(0, Settings.shared.breakpointHoldSeconds - heldFor)
+            let deadline = request.timeoutInterval > 0
+                ? request.timeoutInterval
+                : Settings.shared.breakpointHoldSeconds
+            return max(0, deadline - heldFor)
         }
 
         init(stage: BreakpointMode,
