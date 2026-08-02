@@ -68,11 +68,9 @@ final class WebViewStorageService {
     }
 
     private func loadWebStorage(scope: Scope, completion: @escaping ([Item]) -> Void) {
-        guard let webView, let obj = scope.jsObject else { completion([]); return }
-        // Serialize the whole store to a JSON object of key -> value.
-        let js = """
-        (function(){try{var o={};for(var i=0;i<\(obj).length;i++){var k=\(obj).key(i);o[k]=\(obj).getItem(k);}return JSON.stringify(o);}catch(e){return '{}';}})();
-        """
+        guard let webView, let obj = scope.jsObject else { DispatchQueue.main.async { completion([]) }; return }
+        let js = Self.enumerationScript(for: obj)
+
         runOnMain {
             webView.evaluateJavaScript(js) { result, _ in
                 var items: [Item] = []
@@ -117,11 +115,14 @@ final class WebViewStorageService {
     func setItem(scope: Scope, key: String, value: String, completion: @escaping (Bool) -> Void) {
         switch scope {
         case .local, .session:
-            guard let webView, let obj = scope.jsObject else { completion(false); return }
+            guard let webView, let obj = scope.jsObject else { DispatchQueue.main.async { completion(false) }; return }
             let js = "(function(){try{\(obj).setItem(\(jsString(key)),\(jsString(value)));return true;}catch(e){return false;}})();"
             runOnMain {
-                webView.evaluateJavaScript(js) { result, _ in
-                    DispatchQueue.main.async { completion((result as? Bool) ?? true) }
+                webView.evaluateJavaScript(js) { result, error in
+                    // `?? true` fabricated success: a nil result (page navigated away,
+                    // storage disabled for the origin, JS off) reported as written.
+                    // The script returns an explicit true/false, so nil means failure.
+                    DispatchQueue.main.async { completion(error == nil && (result as? Bool) == true) }
                 }
             }
         case .cookies:
@@ -135,19 +136,26 @@ final class WebViewStorageService {
     }
 
     private func setCookie(name: String, value: String, existing: HTTPCookie?, completion: @escaping (Bool) -> Void) {
-        guard let webView else { completion(false); return }
+        guard let webView else { DispatchQueue.main.async { completion(false) }; return }
         let store = webView.configuration.websiteDataStore.httpCookieStore
 
-        var props: [HTTPCookiePropertyKey: Any] = [
-            .name: name,
-            .value: value,
-            .path: existing?.path ?? "/",
-        ]
-        if let domain = existing?.domain ?? webView.url?.host {
-            props[.domain] = domain
+        // Editing an existing cookie goes through the shared, unit-tested mapping so
+        // HttpOnly, SameSite, version and comment survive. Rebuilding the dictionary
+        // by hand dropped them, which silently made an HttpOnly session cookie
+        // readable by page JavaScript — exactly the corruption this screen must not
+        // cause.
+        let props: [HTTPCookiePropertyKey: Any]
+        if let existing {
+            props = WebViewStoragePinScript.cookieProperties(from: existing, newValue: value)
+        } else {
+            var fresh: [HTTPCookiePropertyKey: Any] = [
+                .name: name,
+                .value: value,
+                .path: "/",
+            ]
+            if let domain = webView.url?.host { fresh[.domain] = domain }
+            props = fresh
         }
-        if let expires = existing?.expiresDate { props[.expires] = expires }
-        if existing?.isSecure == true { props[.secure] = "TRUE" }
 
         guard let cookie = HTTPCookie(properties: props) else { completion(false); return }
         runOnMain {
@@ -162,15 +170,18 @@ final class WebViewStorageService {
     func deleteItem(scope: Scope, item: Item, completion: @escaping (Bool) -> Void) {
         switch scope {
         case .local, .session:
-            guard let webView, let obj = scope.jsObject else { completion(false); return }
+            guard let webView, let obj = scope.jsObject else { DispatchQueue.main.async { completion(false) }; return }
             let js = "(function(){try{\(obj).removeItem(\(jsString(item.key)));return true;}catch(e){return false;}})();"
             runOnMain {
-                webView.evaluateJavaScript(js) { result, _ in
-                    DispatchQueue.main.async { completion((result as? Bool) ?? true) }
+                webView.evaluateJavaScript(js) { result, error in
+                    // `?? true` fabricated success: a nil result (page navigated away,
+                    // storage disabled for the origin, JS off) reported as written.
+                    // The script returns an explicit true/false, so nil means failure.
+                    DispatchQueue.main.async { completion(error == nil && (result as? Bool) == true) }
                 }
             }
         case .cookies:
-            guard let webView, let cookie = item.cookie else { completion(false); return }
+            guard let webView, let cookie = item.cookie else { DispatchQueue.main.async { completion(false) }; return }
             let store = webView.configuration.websiteDataStore.httpCookieStore
             runOnMain {
                 store.delete(cookie) {
@@ -182,11 +193,11 @@ final class WebViewStorageService {
 
     /// Clears every entry in a web-storage scope (not applicable to cookies).
     func clearAll(scope: Scope, completion: @escaping (Bool) -> Void) {
-        guard let webView, let obj = scope.jsObject else { completion(false); return }
+        guard let webView, let obj = scope.jsObject else { DispatchQueue.main.async { completion(false) }; return }
         let js = "(function(){try{\(obj).clear();return true;}catch(e){return false;}})();"
         runOnMain {
-            webView.evaluateJavaScript(js) { result, _ in
-                DispatchQueue.main.async { completion((result as? Bool) ?? true) }
+            webView.evaluateJavaScript(js) { result, error in
+                DispatchQueue.main.async { completion(error == nil && (result as? Bool) == true) }
             }
         }
     }
@@ -205,5 +216,30 @@ final class WebViewStorageService {
 
     private func runOnMain(_ block: @escaping () -> Void) {
         if Thread.isMainThread { block() } else { DispatchQueue.main.async(execute: block) }
+    }
+
+    /// The store-enumeration script, `internal` so its per-key isolation can be
+    /// unit-tested without standing up a WKWebView.
+    static func enumerationScript(for jsObject: String) -> String {
+        let obj = jsObject
+        return """
+        (function(){var o=Object.create(null);var n=0;
+        try{n=\(obj).length;}catch(e){return '{}';}
+        for(var i=0;i<n;i++){
+        /* Per-key isolation: ONE value containing a lone surrogate used to make
+           the single JSON.stringify at the end throw, and the catch returned '{}'
+           — so one bad value blanked the ENTIRE storage list. Stringify each value
+           on its own and substitute a marker for the one that cannot be encoded. */
+        var k=null;
+        try{k=\(obj).key(i);var v=\(obj).getItem(k);JSON.stringify(v);o[k]=v;}
+        catch(e){if(k!==null){o[k]='\\u26a0\\ufe0f (value cannot be displayed)';}}}
+        try{return JSON.stringify(o);}catch(e){return '{}';}})();
+        """
+    }
+
+    /// Convenience for tests and callers that have a Scope rather than a name.
+    static func enumerationScriptSource(for scope: Scope) -> String {
+        guard let obj = scope.jsObject else { return "" }
+        return enumerationScript(for: obj)
     }
 }

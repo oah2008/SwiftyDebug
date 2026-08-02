@@ -110,6 +110,12 @@ extension NetworkTransaction {
 
         json["requests"] = expanded
 
+        // Same uncatchable-ObjC-exception hazard as the rewrite preview: the
+        // parser accepts -1e999 as -inf and the writer then raises. Returning nil
+        // falls through to the original body string, which is the existing
+        // no-expansion path.
+        guard JSONSerialization.isValidJSONObject(json) else { return nil }
+
         var options: JSONSerialization.WritingOptions = [.sortedKeys, .withoutEscapingSlashes]
         guard let newData = try? JSONSerialization.data(withJSONObject: json, options: options),
               let result = String(data: newData, encoding: .utf8) else {

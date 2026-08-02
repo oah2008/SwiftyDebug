@@ -462,7 +462,14 @@ final class MockResponseEditorViewController: UITableViewController {
 
     private func useRealResponse() {
         guard let text = currentResponseText, !text.isEmpty else { return }
-        mock.body = JSONDocument(text: text)?.prettyText() ?? text
+        // `?? text` never fired: for a document JSON cannot represent (a value
+        // that overflows a Double), `prettyText()` returns "" rather than nil, so
+        // the mock body became EMPTY and was armed anyway — the host app served a
+        // blank response with nothing on screen saying so. Fall back on empty, not
+        // just on nil.
+        let document = JSONDocument(text: text)
+        let rendered = document?.prettyText()
+        mock.body = (rendered?.isEmpty == false) ? rendered! : text
         mock.isEnabled = true
         tableView.reloadData()
         editBody()

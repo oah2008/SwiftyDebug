@@ -115,24 +115,340 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     // MARK: Shared demux (lazily created once)
 
     private static var sharedDemuxInstance: QNSURLSessionDemux?
+    /// True while SwiftyDebug builds its OWN session configuration. Timeout
+    /// decisions taken during that window are not host-app decisions, so they must
+    /// not count toward "does flipping the setting need a restart?" — otherwise the
+    /// SDK's own 60-second demux config trips the check on the very first request
+    /// and the answer is always "restart required".
+    ///
+    /// Stored per-thread, not in a shared static Bool. It is written on whichever
+    /// thread happens to run `demuxOnce` (a CFNetwork thread, inside swift_once)
+    /// and read by `recordTimeoutDecision` from host-app threads: a plain static
+    /// is a data race Thread Sanitizer reports against the SDK, and it is also
+    /// wrong — a host config built on another thread during that window would be
+    /// misfiled as ours. The flag only ever means "the configuration being built
+    /// on THIS thread, right now, is ours", so that is exactly what it stores.
+    private static let buildingOwnConfigurationKey =
+        "com.swiftydebug.CustomHTTPProtocol.buildingOwnConfiguration"
+
+    private static var isBuildingOwnConfiguration: Bool {
+        get { (Thread.current.threadDictionary[buildingOwnConfigurationKey] as? Bool) ?? false }
+        set {
+            if newValue {
+                Thread.current.threadDictionary[buildingOwnConfigurationKey] = true
+            } else {
+                Thread.current.threadDictionary.removeObject(forKey: buildingOwnConfigurationKey)
+            }
+        }
+    }
+
+    /// The transport settings on the demux session that are, in effect, the
+    /// HOST APP's settings — because every request the app makes is re-issued
+    /// through this one session. Captured so tests can prove SwiftyDebug left
+    /// them exactly as `URLSessionConfiguration.default` produced them.
+    ///
+    /// The same type also carries the settings read back off a HOST session's
+    /// configuration (see `hostTransportSettings(for:)`), because the fix for
+    /// "one shared session speaks for every app session" is to MIRROR the
+    /// originating configuration rather than impose either SwiftyDebug's tuning
+    /// or Foundation's defaults. Same fields, read from the other direction.
+    struct DemuxTransportSettings: Equatable {
+        var httpShouldSetCookies: Bool
+        var httpMaximumConnectionsPerHost: Int
+        var requestCachePolicy: URLRequest.CachePolicy
+        var allowsCellularAccess: Bool
+        var httpShouldUsePipelining: Bool
+        var httpCookieAcceptPolicy: HTTPCookie.AcceptPolicy
+        /// Reference, not value: two configurations pointing at the SAME jar are
+        /// interchangeable, two pointing at different jars never are. `nil` means
+        /// the app turned cookie storage off entirely.
+        var httpCookieStorage: HTTPCookieStorage?
+        var urlCredentialStorage: URLCredentialStorage?
+
+        init(_ config: URLSessionConfiguration) {
+            httpShouldSetCookies = config.httpShouldSetCookies
+            httpMaximumConnectionsPerHost = config.httpMaximumConnectionsPerHost
+            requestCachePolicy = config.requestCachePolicy
+            allowsCellularAccess = config.allowsCellularAccess
+            httpShouldUsePipelining = config.httpShouldUsePipelining
+            httpCookieAcceptPolicy = config.httpCookieAcceptPolicy
+            httpCookieStorage = config.httpCookieStorage
+            urlCredentialStorage = config.urlCredentialStorage
+        }
+
+        static func == (lhs: DemuxTransportSettings, rhs: DemuxTransportSettings) -> Bool {
+            lhs.httpShouldSetCookies == rhs.httpShouldSetCookies
+                && lhs.httpMaximumConnectionsPerHost == rhs.httpMaximumConnectionsPerHost
+                && lhs.requestCachePolicy == rhs.requestCachePolicy
+                && lhs.allowsCellularAccess == rhs.allowsCellularAccess
+                && lhs.httpShouldUsePipelining == rhs.httpShouldUsePipelining
+                && lhs.httpCookieAcceptPolicy == rhs.httpCookieAcceptPolicy
+                && lhs.httpCookieStorage === rhs.httpCookieStorage
+                && lhs.urlCredentialStorage === rhs.urlCredentialStorage
+        }
+
+        /// The subset that CANNOT be expressed on a `URLRequest`, and therefore
+        /// decides WHICH session a request has to be issued on. See
+        /// `DemuxSessionSignature`.
+        var sessionSignature: DemuxSessionSignature {
+            DemuxSessionSignature(
+                httpMaximumConnectionsPerHost: httpMaximumConnectionsPerHost,
+                httpCookieAcceptPolicy: httpCookieAcceptPolicy,
+                cookieStorage: httpCookieStorage.map(ObjectIdentifier.init),
+                credentialStorage: urlCredentialStorage.map(ObjectIdentifier.init))
+        }
+    }
+
+    /// Identity of a demux session.
+    ///
+    /// `URLRequest` can express a cache policy, a cookie opt-out, cellular access
+    /// and pipelining, so those four ride along on each forwarded request. It
+    /// **cannot** express a connection cap, a cookie jar, a credential store or a
+    /// cookie accept policy — those are properties of the connection pool and of
+    /// the session, so the only way to honour the host app's is to issue its
+    /// requests on a session that was built with them. One session per distinct
+    /// signature, created on demand and cached.
+    struct DemuxSessionSignature: Hashable {
+        var httpMaximumConnectionsPerHost: Int
+        var httpCookieAcceptPolicy: HTTPCookie.AcceptPolicy
+        var cookieStorage: ObjectIdentifier?
+        var credentialStorage: ObjectIdentifier?
+    }
+
+    /// What `URLSessionConfiguration.default` handed us, before SwiftyDebug
+    /// touched the configuration at all. nil until `demuxOnce` has run.
+    private(set) static var systemDefaultTransportSettings: DemuxTransportSettings?
+    /// What the demux session was actually built with. Must equal
+    /// `systemDefaultTransportSettings` — see the comment in `demuxOnce`.
+    private(set) static var demuxTransportSettings: DemuxTransportSettings?
+
     private static let demuxOnce: Void = {
+        isBuildingOwnConfiguration = true
+        defer { isBuildingOwnConfiguration = false }
         let config = URLSessionConfiguration.default
-        config.httpShouldSetCookies = false
-        // Disable cache on the demux session - caching is already handled by the original
-        // request's session. Without this, every response gets cached TWICE (doubling memory).
+        systemDefaultTransportSettings = DemuxTransportSettings(config)
+
+        // DO NOT TUNE THIS SESSION.
+        //
+        // Every request the host app makes is re-issued through this one shared
+        // session, so a transport setting here is not SwiftyDebug's setting —
+        // it silently becomes the host app's. Three used to be set here, and all
+        // three were measured regressions in any app that merely LINKS the SDK:
+        //
+        //  • `httpShouldSetCookies = false` stripped Cookie from every request
+        //    and left `HTTPCookieStorage.shared.cookies` empty, so cookie-session
+        //    logins stopped working outright. Its only conceivable purpose was to
+        //    avoid double-applying cookies, but nothing double-applies them: the
+        //    request reaches `startLoading` BEFORE CFNetwork's HTTP protocol has
+        //    attached any, so this session is the only place they can be added.
+        //  • `httpMaximumConnectionsPerHost = 1` serialised all traffic to a host.
+        //    Its comment claimed it "reduced connection overhead"; measured, six
+        //    concurrent 300 ms GETs took 1.87 s instead of 0.31 s.
+        //  • `requestCachePolicy = .reloadIgnoringLocalCacheData` overrode the
+        //    policy the app chose per request, so URLCache was never consulted:
+        //    3x the requests, 3x the data, and `.returnCacheDataDontLoad` (the
+        //    offline read) could not succeed. The app's own policy travels on the
+        //    forwarded request and is now left to govern; cache READS happen
+        //    through `cachedResponseDisposition` before we ever come here.
+        //
+        // Their absence is the fix, so absence is what `SharedDemuxConfigurationTests`
+        // pins — via the two snapshots above, which diverge the moment anyone
+        // assigns one of them again.
+
+        // `urlCache` IS still cleared, and unlike the three above it is
+        // load-bearing rather than a tuning knob. The response is handed to the
+        // host app's loading system through
+        // `client?.urlProtocol(_:didReceive:cacheStoragePolicy:)`, which stores it
+        // in the app's URLCache; a cache on this session would store a second
+        // copy of every response. Clearing it costs no cache reads, because this
+        // session never performs them — see `cachedResponseDisposition`.
         config.urlCache = nil
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        // Limit concurrent connections to reduce connection overhead.
-        config.httpMaximumConnectionsPerHost = 1
+
         // You have to explicitly configure the session to use your own protocol subclass here
         // otherwise you don't see redirects <rdar://problem/17384498>.
         config.protocolClasses = [CustomHTTPProtocol.self]
+        demuxTransportSettings = DemuxTransportSettings(config)
         sharedDemuxInstance = QNSURLSessionDemux(configuration: config)
     }()
 
     @objc class func sharedDemux() -> QNSURLSessionDemux {
         _ = demuxOnce
         return sharedDemuxInstance!
+    }
+
+    // MARK: - Mirroring the ORIGINATING session (see HOST-TRANSPORT)
+
+    /// Reads the transport settings off the session that actually issued this
+    /// request.
+    ///
+    /// Why this is needed at all: `startLoading` re-issues the request on a
+    /// SwiftyDebug session, so every session-level setting on the app's own
+    /// session is dropped on the floor unless it is deliberately carried over.
+    /// Measured on the simulator, NOTHING travels from a configuration onto the
+    /// `URLRequest` a `URLProtocol` is handed — a session with
+    /// `httpShouldSetCookies = false`, `allowsCellularAccess = false`,
+    /// `httpMaximumConnectionsPerHost = 2` and
+    /// `requestCachePolicy = .returnCacheDataElseLoad` produces a request that
+    /// reports `httpShouldHandleCookies == true`, `allowsCellularAccess == true`
+    /// and `cachePolicy == .useProtocolCachePolicy`. So the request cannot be
+    /// asked; the session has to be.
+    ///
+    /// `URLProtocol.task` is public API and is the task the app created. Its
+    /// `session` accessor is not in the headers, so it is called only after
+    /// `responds(to:)` says it exists and only through KVC, and every caller
+    /// treats `nil` as "unknown" and degrades safely (see
+    /// `resolveDemux(for:)` and `upstreamRequest(_:hostSettings:...)`).
+    /// Nothing here is required for correctness of the capture — it exists so
+    /// the host app's own settings are not silently replaced by ours.
+    private static let originatingSessionSelector = NSSelectorFromString("session")
+
+    static func originatingSession(of task: URLSessionTask?) -> URLSession? {
+        guard let task else { return nil }
+        let object = task as AnyObject
+        guard object.responds(to: originatingSessionSelector) else { return nil }
+        return object.value(forKey: "session") as? URLSession
+    }
+
+    /// The originating configuration's transport settings, or nil when the
+    /// session could not be reached (an `NSURLConnection`-era load, or an OS
+    /// where the accessor is gone).
+    static func hostTransportSettings(for task: URLSessionTask?) -> DemuxTransportSettings? {
+        guard let session = originatingSession(of: task) else { return nil }
+        return DemuxTransportSettings(session.configuration)
+    }
+
+    /// Demux sessions built to mirror a host configuration, one per distinct
+    /// `DemuxSessionSignature`.
+    ///
+    /// The signature keys on the ADDRESS of the cookie/credential stores, which
+    /// is only sound because the cached session's configuration holds a strong
+    /// reference to them: a store that is still a key can never be deallocated,
+    /// so its address can never be handed to a different store and collide.
+    private static var dedicatedDemuxes: [DemuxSessionSignature: QNSURLSessionDemux] = [:]
+    private static let dedicatedDemuxLock = NSLock()
+
+    /// A ceiling on how many extra sessions the SDK will stand up. An app with a
+    /// handful of networking stacks has a handful of signatures; a pathological
+    /// one that builds a fresh cookie jar per request would otherwise leak a
+    /// session per request. Past the cap we fall back to the shared session and
+    /// the fallback is the SAFE direction (cookies are switched off rather than
+    /// taken from the wrong jar).
+    static let maxDedicatedDemuxSessions = 8
+
+    /// Where a request carrying `settings` must be issued, and whether that
+    /// session's cookie jar really is the host's.
+    ///
+    /// The `Bool` is not cosmetic: if we hand the request to the shared session
+    /// while the app uses a private per-account jar, automatic cookie handling
+    /// puts the SHARED jar's cookie on the wire — account A's credential on
+    /// account B's session. In that case the caller must switch cookie handling
+    /// off for the request instead.
+    static func resolveDemux(for settings: DemuxTransportSettings?)
+        -> (demux: QNSURLSessionDemux, sessionSharesHostCookieStorage: Bool) {
+        let shared = sharedDemux()
+        guard let settings else {
+            // Unknown originating session: keep today's behaviour exactly.
+            return (shared, true)
+        }
+        guard let sharedSettings = demuxTransportSettings else { return (shared, true) }
+        if settings.sessionSignature == sharedSettings.sessionSignature {
+            return (shared, true)
+        }
+
+        dedicatedDemuxLock.lock()
+        defer { dedicatedDemuxLock.unlock() }
+        let signature = settings.sessionSignature
+        if let existing = dedicatedDemuxes[signature] {
+            return (existing, true)
+        }
+        guard dedicatedDemuxes.count < maxDedicatedDemuxSessions else {
+            return (shared, settings.httpCookieStorage === sharedSettings.httpCookieStorage)
+        }
+        let created = makeDedicatedDemux(mirroring: settings)
+        dedicatedDemuxes[signature] = created
+        return (created, true)
+    }
+
+    /// Builds a demux session that mirrors the host configuration's
+    /// session-only settings. Everything a `URLRequest` can express is
+    /// deliberately NOT set here — it travels per request, so one session can
+    /// still serve many requests that differ only in those.
+    private static func makeDedicatedDemux(mirroring settings: DemuxTransportSettings)
+        -> QNSURLSessionDemux {
+        isBuildingOwnConfiguration = true
+        defer { isBuildingOwnConfiguration = false }
+        let config = URLSessionConfiguration.default
+        // Same two load-bearing lines as `demuxOnce`, for the same reasons.
+        config.urlCache = nil
+        config.protocolClasses = [CustomHTTPProtocol.self]
+        // The host app's, not ours.
+        config.httpMaximumConnectionsPerHost = settings.httpMaximumConnectionsPerHost
+        config.httpCookieStorage = settings.httpCookieStorage
+        config.httpCookieAcceptPolicy = settings.httpCookieAcceptPolicy
+        config.urlCredentialStorage = settings.urlCredentialStorage
+        return QNSURLSessionDemux(configuration: config)
+    }
+
+    /// Applies the originating configuration's transport settings to the request
+    /// SwiftyDebug is about to issue.
+    ///
+    /// Pure, so the whole table is testable without CFNetwork. Each line answers
+    /// a setting the host app chose and the demux session would otherwise
+    /// silently replace:
+    ///
+    ///  • cookies — an app that sets `httpShouldSetCookies = false`, or that uses
+    ///    a private per-account jar we could not give the request a session for,
+    ///    must not have the SHARED jar's `Cookie` put on the wire. Both collapse
+    ///    to "switch cookie handling off for this request".
+    ///  • cellular — `allowsCellularAccess = false` is usually a user-visible
+    ///    "Wi-Fi only" setting. AND-ed, so neither side can turn it back on.
+    ///  • pipelining — OR-ed, matching CFNetwork's own rule that either the
+    ///    session or the request can ask for it.
+    ///  • cache policy — a request that inherits its policy from the session
+    ///    reports `.useProtocolCachePolicy`, so the session's real policy has to
+    ///    be written onto the request or the app's choice is lost. See
+    ///    `effectiveCachePolicy(request:session:)`.
+    static func upstreamRequest(_ request: URLRequest,
+                                hostSettings: DemuxTransportSettings?,
+                                sessionSharesHostCookieStorage: Bool) -> URLRequest {
+        guard let hostSettings else { return request }
+        var result = request
+        let cookieJarIsUsable = sessionSharesHostCookieStorage && hostSettings.httpCookieStorage != nil
+        result.httpShouldHandleCookies =
+            request.httpShouldHandleCookies && hostSettings.httpShouldSetCookies && cookieJarIsUsable
+        result.allowsCellularAccess = request.allowsCellularAccess && hostSettings.allowsCellularAccess
+        result.httpShouldUsePipelining =
+            request.httpShouldUsePipelining || hostSettings.httpShouldUsePipelining
+        result.cachePolicy = effectiveCachePolicy(request: request.cachePolicy,
+                                                  session: hostSettings.requestCachePolicy)
+        return result
+    }
+
+    /// The cache policy that actually governs a request.
+    ///
+    /// `.useProtocolCachePolicy` on a `URLRequest` means "I did not choose one" —
+    /// it is the value a request reports when its policy comes from the session.
+    /// Reading only the request therefore misses `URLSessionConfiguration
+    /// .requestCachePolicy` entirely, which is how most apps set it, and the
+    /// `URLCache` read in `startLoading` never fired for them.
+    static func effectiveCachePolicy(request: URLRequest.CachePolicy,
+                                     session: URLRequest.CachePolicy?) -> URLRequest.CachePolicy {
+        guard request == .useProtocolCachePolicy, let session else { return request }
+        return session
+    }
+
+    /// Test hook: drops the per-signature sessions so one test's host
+    /// configuration cannot decide another test's routing.
+    static func resetDedicatedDemuxesForTesting() {
+        dedicatedDemuxLock.lock()
+        defer { dedicatedDemuxLock.unlock() }
+        dedicatedDemuxes.removeAll()
+    }
+
+    static var dedicatedDemuxCountForTesting: Int {
+        dedicatedDemuxLock.lock()
+        defer { dedicatedDemuxLock.unlock() }
+        return dedicatedDemuxes.count
     }
 
     // MARK: Session configuration swizzling
@@ -204,12 +520,11 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                     let original = unsafeBitCast(orig_protocolClassesGetter!, to: ProtocolClassesGetterFunc.self)
                     let result = original(configObj, protocolClassesSel)
                     let classes = (result as? [AnyClass]) ?? []
-                    let protoCls: AnyClass = CustomHTTPProtocol.self
-                    if classes.contains(where: { $0 == protoCls }) {
+                    // Behind the host app's own protocols, ahead of the system's.
+                    // See `protocolClassesInserting(_:into:)`.
+                    guard let mutable = protocolClassesInserting(CustomHTTPProtocol.self, into: classes) else {
                         return result
                     }
-                    var mutable = classes
-                    mutable.insert(protoCls, at: 0)
                     return mutable as NSArray
                 }
 
@@ -220,9 +535,10 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     }
 
     /// Raises any request timeout the host app sets below the breakpoint hold
-    /// budget.
+    /// budget — **only while `Settings.extendTimeoutsForBreakpoints` is on, which
+    /// it is not by default.**
     ///
-    /// This is what makes breakpoints work at all. `timeoutIntervalForRequest` is
+    /// This is what makes breakpoints usable. `timeoutIntervalForRequest` is
     /// an **idle** timer: it resets only when real bytes reach the client. A
     /// request held at an `.afterResponse` breakpoint delivers nothing until you
     /// tap Deliver, so the timer runs uninterrupted and the app gives up with
@@ -235,6 +551,11 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     /// required because apps typically do `URLSessionConfiguration.default` and
     /// then assign their own timeout, which would overwrite anything we set at
     /// construction. (See BREAKPOINTS.)
+    ///
+    /// While the setting is off this hook is a pure pass-through: it forwards the
+    /// app's value to the original setter byte-for-byte. It stays installed so
+    /// that switching the setting on later needs no re-swizzle (which could not
+    /// be done safely anyway).
     private class func swizzleRequestTimeoutSetter(on configClass: AnyClass) {
         let sel = NSSelectorFromString("setTimeoutIntervalForRequest:")
         guard let method = class_getInstanceMethod(configClass, sel) else { return }
@@ -242,13 +563,18 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
 
         let replaced: @convention(block) (AnyObject, TimeInterval) -> Void = { configObj, value in
             let original = unsafeBitCast(orig_setTimeoutIntervalForRequest!, to: TimeoutSetterFunc.self)
-            original(configObj, sel, Self.effectiveRequestTimeout(value))
+            let applied = Self.effectiveRequestTimeout(value)
+            Self.recordTimeoutDecision(requested: value)
+            original(configObj, sel, applied)
         }
         method_setImplementation(method, imp_implementationWithBlock(replaced))
     }
 
     /// The timeout to actually apply, given what the host app asked for.
     /// Pure and `internal` so it can be unit-tested without CFNetwork.
+    ///
+    /// When `extendTimeoutsForBreakpoints` is off — the default — this returns
+    /// `requested` unchanged, so the host app's own timeout is never touched.
     static func effectiveRequestTimeout(_ requested: TimeInterval) -> TimeInterval {
         guard SwiftyDebugRuntime.isActive,
               Settings.shared.extendTimeoutsForBreakpoints else { return requested }
@@ -257,20 +583,148 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         return max(requested, floor)
     }
 
-    /// Injects `CustomHTTPProtocol` at the front of the given configuration's `protocolClasses`.
-    private class func injectProtocol(into config: URLSessionConfiguration) {
+    // MARK: - Does flipping the setting need an app restart?
+
+    /// What a change to `extendTimeoutsForBreakpoints` can actually reach.
+    enum TimeoutSettingChangeEffect {
+        /// No `URLSessionConfiguration` seen this launch had a timeout that
+        /// depended on the setting, so nothing stale can exist: the next request
+        /// already behaves the new way.
+        case appliesImmediately
+        /// At least one configuration's timeout was decided under the *previous*
+        /// value. `URLSession` copies its configuration at init, so those
+        /// sessions keep the timeout they were built with for their whole life —
+        /// only sessions created from here on pick up the new value.
+        case restartRequiredForExistingSessions
+    }
+
+    private static let timeoutDecisionLock = NSLock()
+    /// Count of timeout decisions whose outcome depended on the setting, i.e.
+    /// where on/off would have produced different values. Only ever grows.
+    private static var _timeoutDecisionsBoundToSetting = 0
+
+    /// Records one `setTimeoutIntervalForRequest:` / config-creation decision.
+    ///
+    /// Only decisions that *depend* on the setting count: a config asking for
+    /// more than the hold budget gets the same number either way, so it can
+    /// never be stale.
+    ///
+    /// `internal` rather than `private` only so the rule can be unit-tested
+    /// without standing up CFNetwork.
+    static func recordTimeoutDecision(requested: TimeInterval) {
+        guard !isBuildingOwnConfiguration else { return }
+        guard requested < Settings.shared.breakpointHoldSeconds else { return }
+        timeoutDecisionLock.lock()
+        _timeoutDecisionsBoundToSetting += 1
+        timeoutDecisionLock.unlock()
+    }
+
+    /// Whether flipping `extendTimeoutsForBreakpoints` right now would leave
+    /// already-built `URLSession`s on the old timeout.
+    ///
+    /// Deliberately conservative: once any setting-dependent decision has been
+    /// made this launch we cannot know which live sessions still hold it (a
+    /// session's configuration is an immutable copy we do not retain), so we
+    /// report that a restart is needed rather than let the UI promise something
+    /// false.
+    static var timeoutSettingChangeEffect: TimeoutSettingChangeEffect {
+        timeoutDecisionLock.lock()
+        let count = _timeoutDecisionsBoundToSetting
+        timeoutDecisionLock.unlock()
+        return count == 0 ? .appliesImmediately : .restartRequiredForExistingSessions
+    }
+
+    /// Test hook: forget every recorded decision, as a fresh launch would.
+    static func resetTimeoutDecisionTrackingForTesting() {
+        timeoutDecisionLock.lock()
+        _timeoutDecisionsBoundToSetting = 0
+        timeoutDecisionLock.unlock()
+    }
+
+    // MARK: - Where SwiftyDebug sits in `protocolClasses`
+
+    /// True for a `URLProtocol` subclass that ships with the system — CFNetwork's
+    /// `_NSURLHTTPProtocol` and friends — as opposed to one the host app
+    /// registered itself.
+    ///
+    /// The test has to be made at runtime against the defining bundle: the class
+    /// names are private and undocumented, but `com.apple.CFNetwork` is stable.
+    /// A class defined in the main bundle is the app's own by definition, so it
+    /// is checked first and never counts as the system's.
+    static func isSystemProvidedProtocolClass(_ cls: AnyClass) -> Bool {
+        let bundle = Bundle(for: cls)
+        guard bundle != Bundle.main else { return false }
+        return bundle.bundleIdentifier?.hasPrefix("com.apple.") == true
+    }
+
+    /// `classes` with SwiftyDebug inserted at the one position that is both
+    /// correct and polite — or nil when it is already present, meaning "leave
+    /// the array alone".
+    ///
+    /// NOT index 0, and NOT the end.
+    ///
+    /// **Index 0** — what this used to do — pre-empts the host app's OWN
+    /// `URLProtocol`s. OHHTTPStubs, Mocker and hand-rolled offline layers all
+    /// register at index 0 expecting to win, so jumping ahead of them meant
+    /// their stubs never fired and a request the test believed was stubbed
+    /// silently went to the live network, with no opt-out.
+    ///
+    /// **The end** is not the answer either, and this is the trap in "just
+    /// append": a stock `URLSessionConfiguration.default` already lists
+    /// CFNetwork's `_NSURLHTTPProtocol` FIRST, and it claims every http/https
+    /// request. Appending parks SwiftyDebug behind it, where `canInit` is never
+    /// called and the SDK captures nothing at all.
+    ///
+    /// So: after every protocol the host app registered, immediately before the
+    /// first system-provided one.
+    static func protocolClassesInserting(_ protoCls: AnyClass,
+                                         into classes: [AnyClass]) -> [AnyClass]? {
+        guard !classes.contains(where: { $0 == protoCls }) else { return nil }
+        var result = classes
+        let index = classes.firstIndex(where: { isSystemProvidedProtocolClass($0) }) ?? classes.count
+        result.insert(protoCls, at: index)
+        return result
+    }
+
+    /// Injects `CustomHTTPProtocol` into the given configuration's
+    /// `protocolClasses`, behind the host app's own protocols and ahead of the
+    /// system's — see `protocolClassesInserting(_:into:)`.
+    ///
+    /// `internal` rather than `private` only so the timeout bookkeeping below can
+    /// be unit-tested without standing up CFNetwork.
+    class func injectProtocol(into config: URLSessionConfiguration) {
         if config.responds(to: #selector(getter: URLSessionConfiguration.protocolClasses)),
            config.responds(to: #selector(setter: URLSessionConfiguration.protocolClasses)) {
-            var urlProtocolClasses = config.protocolClasses ?? []
-            let protoCls: AnyClass = CustomHTTPProtocol.self
-            if !urlProtocolClasses.contains(where: { $0 == protoCls }) {
-                urlProtocolClasses.insert(protoCls, at: 0)
-            }
-            config.protocolClasses = urlProtocolClasses
+            let current = config.protocolClasses ?? []
+            // Written back even when SwiftyDebug is already listed: with the
+            // `protocolClasses` getter swizzled, a read can include us while the
+            // config's own storage does not, and URLSession copies the storage.
+            // That unconditional write is pre-existing behaviour — only the
+            // insertion POSITION changed here.
+            config.protocolClasses = protocolClassesInserting(CustomHTTPProtocol.self, into: current) ?? current
         }
         // Covers configs the app never assigns a timeout to (the setter swizzle
         // covers the ones it does).
-        config.timeoutIntervalForRequest = effectiveRequestTimeout(config.timeoutIntervalForRequest)
+        let requested = config.timeoutIntervalForRequest
+        let applied = effectiveRequestTimeout(requested)
+
+        // Record HERE, against the value the host app actually asked for, and do
+        // it on BOTH branches — including the one that modifies the config.
+        // Delegating the record to the swizzled setter (as this used to) makes it
+        // run with `requested: applied`, i.e. the 600 we just raised the config
+        // to, which can never satisfy `recordTimeoutDecision`'s
+        // `requested < breakpointHoldSeconds` check. The configs we modified —
+        // the only ones that can be holding a stale timeout — were therefore the
+        // only ones never counted, so turning the setting OFF reported
+        // `.appliesImmediately` and the UI never prompted for a restart while
+        // live sessions sat on 600 s.
+        recordTimeoutDecision(requested: requested)
+
+        // The write is skipped when nothing would change, so with the setting off
+        // the config is left literally untouched rather than re-assigned its own
+        // value.
+        guard applied != requested else { return }
+        config.timeoutIntervalForRequest = applied
     }
 
     // MARK: Instance properties
@@ -282,9 +736,19 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     @objc var pendingChallenge: URLAuthenticationChallenge?
     private var pendingChallengeCompletionHandler: ((URLSession.AuthChallengeDisposition, URLCredential?) -> Void)?
     private var response: URLResponse?
+    /// The transport settings of the session the HOST APP issued this request on,
+    /// read once in `startLoading` and mirrored onto the request SwiftyDebug
+    /// re-issues. nil when the originating session could not be reached — every
+    /// use degrades to today's behaviour. See `hostTransportSettings(for:)`.
+    private var hostTransportSettings: DemuxTransportSettings?
     private var data: NSMutableData?
     private var error: Error?
     private var responseTruncated: Bool = false
+
+    /// Cap on the response body SwiftyDebug keeps for the UI — and, while a
+    /// response is being held, the cap on the hold itself. See
+    /// `holdAbandonReason(bufferedBytes:incomingBytes:isHoldingForRewriteOnly:)`.
+    static let maxCapturedResponseBytes = 10 * 1024 * 1024
     /// Request body captured from HTTPBodyStream in startLoading.
     /// self.request.HTTPBody is nil when the body was sent via a stream,
     /// so we must capture it from the recursiveRequest after reading the stream.
@@ -299,6 +763,13 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     /// While an `.afterResponse` breakpoint is armed — or the rule has armed
     /// response rewrites — we buffer the response instead of streaming it to the
     /// client, so the whole body can be edited before the app sees any of it.
+    /// Set when `stopLoading()` cancels our own upstream task, so the
+    /// cancellation error CFNetwork reports back can be told apart from one we
+    /// did not cause. See `isClientInitiatedCancellation`.
+    private var didCancelOwnTask = false
+    /// Why an armed breakpoint never paused this request, carried onto the
+    /// stored transaction in `stopLoading`.
+    private var breakpointSkipReason: String?
     private var isHoldingResponse = false
     /// True when the ONLY reason we are holding is response rewrites (no
     /// breakpoint). Such a hold is abandonable: if the body outgrows the rewrite
@@ -402,6 +873,126 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         // We should have cleared task and pending challenge by now.
     }
 
+    // MARK: - Query-parameter edits (pure, so it can be unit-tested)
+
+    /// Characters SwiftyDebug leaves un-escaped in a query name or value it
+    /// writes itself.
+    ///
+    /// Narrower than `.urlQueryAllowed`, which permits `&`, `=`, `+`, `/`, `?`
+    /// and `#`. `&` and `=` would split one parameter into two; `+` decodes as a
+    /// space on most servers; `/`, `?` and `#` change the byte string without
+    /// changing the meaning, which is enough to invalidate a signature.
+    private static let queryComponentAllowed: CharacterSet = {
+        var set = CharacterSet.urlQueryAllowed
+        set.remove(charactersIn: "&=+/?#")
+        return set
+    }()
+
+    /// Percent-encodes one query name or value that SwiftyDebug is introducing.
+    static func percentEncodedQueryComponent(_ raw: String) -> String {
+        raw.addingPercentEncoding(withAllowedCharacters: queryComponentAllowed) ?? raw
+    }
+
+    /// Applies `rule`'s query-parameter edits to `url`.
+    ///
+    /// Returns **nil** — meaning "leave this URL completely alone" — whenever the
+    /// rule edits no query parameters, and that no-op is the whole point of this
+    /// function existing.
+    ///
+    /// Round-tripping a URL through `URLComponents.queryItems` RE-ENCODES the
+    /// entire query with Foundation's own rules, so `%2B` comes back as `+` and
+    /// `%2F` as `/`:
+    ///
+    ///     in : ...?X-Amz-Signature=ab%2Bcd%2Fef%3D%3D
+    ///     out: ...?X-Amz-Signature=ab+cd/ef%3D%3D
+    ///
+    /// The URL still "works", but it is no longer the byte string the signature
+    /// was computed over, so the server answers 403 SignatureDoesNotMatch. That
+    /// used to happen for every request matched by ANY enabled rule — including a
+    /// rule whose only edit was a header override — because the old code was
+    /// guarded solely by "a rule matched".
+    ///
+    /// When there IS a query edit to make, the work happens in
+    /// `percentEncodedQueryItems`, so every parameter the rule did not name keeps
+    /// its original bytes exactly.
+    static func urlApplyingQueryEdits(of rule: InterceptRule, to url: URL) -> URL? {
+        guard !rule.queryParamOverrides.isEmpty || !rule.removedQueryParamKeys.isEmpty else {
+            return nil
+        }
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+
+        // Names arrive percent-encoded here; the rule stores plain text, so
+        // compare decoded. (`?a%20b=1` is matched by the key "a b".)
+        func decodedName(_ item: URLQueryItem) -> String {
+            item.name.removingPercentEncoding ?? item.name
+        }
+
+        var items = components.percentEncodedQueryItems ?? []
+        items.removeAll { rule.removedQueryParamKeys.contains(decodedName($0)) }
+
+        for pair in rule.queryParamOverrides {
+            let encoded = URLQueryItem(name: percentEncodedQueryComponent(pair.key),
+                                       value: percentEncodedQueryComponent(pair.value))
+            if let idx = items.firstIndex(where: { decodedName($0) == pair.key }) {
+                items[idx] = encoded
+            } else {
+                items.append(encoded)
+            }
+        }
+
+        components.percentEncodedQueryItems = items.isEmpty ? nil : items
+        return components.url
+    }
+
+    // MARK: - The host app's URLCache (see MAJOR 3)
+
+    /// What to do with the cached entry the URL loading system handed this
+    /// protocol.
+    enum CachedResponseDisposition: Equatable {
+        /// Go upstream, as always.
+        case load
+        /// Answer from `cachedResponse` without touching the network.
+        case serveFromCache
+        /// The app asked for cache-only and there is nothing cached. Fail,
+        /// rather than quietly doing the one thing the policy forbids.
+        case failCacheOnlyMiss
+    }
+
+    /// Decides whether a request can be answered from the host app's cache.
+    /// Pure, so the policy table is testable without CFNetwork or a URLCache.
+    ///
+    /// Only the two policies that name the cache *explicitly* are honoured here.
+    /// `.useProtocolCachePolicy` deliberately still loads: deciding whether a
+    /// stored entry is fresh is HTTP revalidation, which CFNetwork does on the
+    /// upstream leg and SwiftyDebug must not attempt to re-implement. Serving a
+    /// stale body because the SDK guessed wrong would be a worse bug than the
+    /// extra request.
+    ///
+    /// An armed breakpoint also forces `.load`. The developer asked to intervene
+    /// in a network exchange; silently short-circuiting to cache would mean the
+    /// pause they armed never fires and nothing anywhere says why.
+    /// `ruleChangesTheRequest` covers every rule that alters WHAT would be
+    /// fetched — a redirect, or a query-param edit. Serving the cache short-
+    /// circuits the network, so an armed redirect silently never happens and the
+    /// list still shows the redirect target as though it had. Only a rule that
+    /// merely observes (or edits the response) can safely be served from cache.
+    static func cachedResponseDisposition(policy: URLRequest.CachePolicy,
+                                          hasCachedResponse: Bool,
+                                          breakpointMode: BreakpointMode,
+                                          ruleChangesTheRequest: Bool = false) -> CachedResponseDisposition {
+        guard breakpointMode == .off, !ruleChangesTheRequest else { return .load }
+        switch policy {
+        case .returnCacheDataDontLoad:
+            return hasCachedResponse ? .serveFromCache : .failCacheOnlyMiss
+        case .returnCacheDataElseLoad:
+            return hasCachedResponse ? .serveFromCache : .load
+        default:
+            return .load
+        }
+    }
+
     override func startLoading() {
         // At this point we kick off the process of loading the URL via NSURLSession.
         // The thread that calls this method becomes the client thread.
@@ -417,6 +1008,21 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             calculatedModes.append(currentMode)
         }
         self.modes = calculatedModes
+
+        // Stamp the clock and latch the client thread BEFORE anything that can
+        // return early. A request blocked by an intercept rule used to return
+        // before `startTime` was ever set, so `stopLoading` computed its duration
+        // against the epoch and the list showed a ~56-year request.
+        self.startTime = Date().timeIntervalSince1970
+        self.data = NSMutableData()
+        // Latch the thread we were called on, primarily for debugging purposes.
+        self.clientThread = Thread.current
+
+        // Read the ORIGINATING session's transport settings before anything else
+        // touches the request. Everything downstream — the URLCache decision, the
+        // session the request is re-issued on, the request itself — has to mirror
+        // the app's own configuration rather than impose the demux session's.
+        self.hostTransportSettings = Self.hostTransportSettings(for: self.task)
 
         // Create new request that's a clone of the request we were initialised with,
         // except that it has our 'recursive request flag' property set on it.
@@ -459,6 +1065,15 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             self.resolvedRule = InterceptRuleStore.shared.resolvedRule(forURL: url)
             if let rule = self.resolvedRule {
                 if rule.isBlocked {
+                    // A blocked request never reaches the network, so a breakpoint
+                    // armed on the same rule can never park — exactly the silence
+                    // already fixed for mocks. Say so in both places: the inbox,
+                    // where the developer is waiting, and the request itself.
+                    if rule.breakpointMode != .off {
+                        let reason = Self.blockPreemptedBreakpointMessage(rule.breakpointMode)
+                        self.breakpointSkipReason = reason
+                        BreakpointCenter.shared.note(reason, for: url)
+                    }
                     let error = NSError(
                         domain: NSURLErrorDomain,
                         code: NSURLErrorCancelled,
@@ -474,21 +1089,13 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                 for key in rule.removedHeaderKeys {
                     recursiveRequest.setValue(nil, forHTTPHeaderField: key)
                 }
-                // Apply query param overrides
-                if var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
-                    var items = components.queryItems ?? []
-                    items.removeAll { rule.removedQueryParamKeys.contains($0.name) }
-                    for pair in rule.queryParamOverrides {
-                        if let idx = items.firstIndex(where: { $0.name == pair.key }) {
-                            items[idx] = URLQueryItem(name: pair.key, value: pair.value)
-                        } else {
-                            items.append(URLQueryItem(name: pair.key, value: pair.value))
-                        }
-                    }
-                    components.queryItems = items.isEmpty ? nil : items
-                    if let newURL = components.url {
-                        recursiveRequest.url = newURL
-                    }
+                // Apply query param overrides.
+                //
+                // NO-OP BY DESIGN: a rule that edits no query parameters must not
+                // reach the URL at all — see `urlApplyingQueryEdits(of:to:)` for
+                // why touching it corrupts signed URLs.
+                if let editedURL = Self.urlApplyingQueryEdits(of: rule, to: url) {
+                    recursiveRequest.url = editedURL
                 }
                 // Apply redirect last, so it rewrites the URL that already has
                 // the rule's query-param edits (the original query is preserved).
@@ -507,12 +1114,6 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                 self.interceptedRequest = recursiveRequest as URLRequest
             }
         }
-
-        self.startTime = Date().timeIntervalSince1970
-        self.data = NSMutableData()
-
-        // Latch the thread we were called on, primarily for debugging purposes.
-        self.clientThread = Thread.current
 
         // Network Link Conditioner simulation (see NETWORK-SIM). Reads the fixed
         // preset chosen on the Info tab and either fails the request (100% loss)
@@ -552,6 +1153,51 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             return
         }
 
+        // --- The host app's URLCache. ---
+        // The loading system already looked the request up and handed us the
+        // entry as `self.cachedResponse`; using it is the protocol's job, and
+        // this protocol used to ignore it completely while ALSO forcing
+        // `.reloadIgnoringLocalCacheData` on the demux session. Between them,
+        // linking SwiftyDebug turned every cache hit into a network round trip
+        // and made `.returnCacheDataDontLoad` — the offline read — impossible to
+        // satisfy. The forced policy is gone (see `demuxOnce`); this restores
+        // the read.
+        let rule = self.resolvedRule
+        let ruleChangesTheRequest = (rule?.redirectMode ?? .none) != .none
+            || !(rule?.queryParamOverrides.isEmpty ?? true)
+            || !(rule?.removedQueryParamKeys.isEmpty ?? true)
+        //
+        // The policy is read through `effectiveCachePolicy`, NOT straight off the
+        // request: a request whose policy comes from the session reports
+        // `.useProtocolCachePolicy`, so reading only the request meant the cache
+        // was never consulted for the most common way of configuring one —
+        // `URLSessionConfiguration.requestCachePolicy`.
+        let effectivePolicy = Self.effectiveCachePolicy(
+            request: (recursiveRequest as URLRequest).cachePolicy,
+            session: self.hostTransportSettings?.requestCachePolicy)
+        switch Self.cachedResponseDisposition(policy: effectivePolicy,
+                                              hasCachedResponse: self.cachedResponse != nil,
+                                              breakpointMode: rule?.breakpointMode ?? .off,
+                                              ruleChangesTheRequest: ruleChangesTheRequest) {
+        case .load:
+            break
+        case .serveFromCache:
+            if let cached = self.cachedResponse {
+                deliverCachedResponse(cached)
+                return
+            }
+        case .failCacheOnlyMiss:
+            // What CFNetwork itself returns for a `.returnCacheDataDontLoad`
+            // miss. Going to the network instead would defeat the whole point
+            // of the policy.
+            self.client?.urlProtocol(self, didFailWithError: NSError(
+                domain: NSURLErrorDomain,
+                code: NSURLErrorResourceUnavailable,
+                userInfo: [NSLocalizedDescriptionKey:
+                            "The request requires cached data, which is not available."]))
+            return
+        }
+
         // --- Breakpoint (before send): park the request for editing. ---
         if self.resolvedRule?.breakpointMode == .beforeSend {
             let paused = BreakpointCenter.PausedRequest(
@@ -560,7 +1206,16 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                 resume: { [weak self] edited in
                     // Continue with whatever the developer changed.
                     self?.performOnThread(self?.clientThread, modes: self?.modes) {
-                        self?.sendUpstream(edited.request)
+                        guard let self else { return }
+                        // The captured transaction has to describe what actually
+                        // went on the wire. Both of these were latched in
+                        // `startLoading`, BEFORE the developer edited the parked
+                        // request, so leaving them would show the Network list —
+                        // and the cURL command copied from it — a method, URL,
+                        // headers and body that were never sent.
+                        self.interceptedRequest = edited.request
+                        self.capturedRequestBody = edited.request.httpBody
+                        self.sendUpstream(edited.request)
                     }
                 },
                 abort: { [weak self] in
@@ -583,8 +1238,19 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     /// Actually issues the (possibly breakpoint-edited) request upstream,
     /// honoring the network-conditioner latency.
     private func sendUpstream(_ request: URLRequest) {
-        self._dataTask = type(of: self).sharedDemux().dataTask(
-            with: request,
+        // MIRROR, do not impose. The session below is SwiftyDebug's, but the
+        // request is the host app's, so the app's transport settings have to be
+        // carried across the hand-off: the ones a URLRequest can express travel
+        // on the request, the ones only a session can express decide WHICH demux
+        // session it goes to. See `resolveDemux(for:)`.
+        let routing = Self.resolveDemux(for: self.hostTransportSettings)
+        let outbound = Self.upstreamRequest(
+            request,
+            hostSettings: self.hostTransportSettings,
+            sessionSharesHostCookieStorage: routing.sessionSharesHostCookieStorage)
+
+        self._dataTask = routing.demux.dataTask(
+            with: outbound,
             delegate: self,
             modes: self.modes
         )
@@ -601,6 +1267,16 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             self._dataTask?.resume()
         }
     }
+
+    /// Test hook: the task SwiftyDebug actually handed to a demux session.
+    ///
+    /// Tests assert against THIS rather than against the pure functions that
+    /// build it, so that reverting the wiring in `sendUpstream` — not just the
+    /// table in `upstreamRequest` — is what makes them fail. `originatingSession`
+    /// turns it back into the session it was issued on, which is the only place
+    /// the settings a `URLRequest` cannot express (the connection cap, the cookie
+    /// jar) are observable.
+    var upstreamTaskForTesting: URLSessionDataTask? { _dataTask }
 
     /// Synthesizes a response from a mock rule and hands it to the client without
     /// any network access. (See MOCK.)
@@ -624,6 +1300,21 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                              + "Edit the mock body instead.")
         }
 
+        // Same conflict, one step earlier: a mock answers without touching the
+        // network, so an armed breakpoint on the same rule can never pause
+        // anything — `startLoading` returns here before it parks, and the
+        // `.afterResponse` stage has no server exchange to hold at all. That was
+        // silent: the developer armed a breakpoint, triggered the request, and
+        // the inbox stayed empty with nothing anywhere saying why. Say it in the
+        // DIDN'T PAUSE section of the inbox they are staring at.
+        if let mode = resolvedRule?.breakpointMode, mode != .off {
+            // Recorded in BOTH places on purpose: the inbox is where you are
+            // waiting, the request detail is where you look afterwards asking
+            // why this one behaved oddly.
+            self.breakpointSkipReason = Self.mockPreemptedBreakpointMessage(mode)
+            BreakpointCenter.shared.note(Self.mockPreemptedBreakpointMessage(mode), for: request.url)
+        }
+
         let deliver = { [weak self] in
             guard let self, let response else { return }
             self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -642,6 +1333,59 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         }
     }
 
+    /// Why an armed breakpoint never paused a request a mock answered. Pure and
+    /// `static` so the wording is pinned by tests — this sentence IS the fix, so
+    /// it has to survive refactoring.
+    ///
+    /// Worded for a mock from either source (the rule's own or an active mock
+    /// profile), because both short-circuit the same way.
+    /// Why a blocked rule's breakpoint never paused. Pure, so the wording is
+    /// unit-testable and cannot drift from the mock equivalent.
+    static func blockPreemptedBreakpointMessage(_ mode: BreakpointMode) -> String {
+        let stage = mode == .beforeSend ? "before send" : "after response"
+        return "This rule blocks the request, so the \(stage) breakpoint never paused — "
+            + "a blocked request is never sent. Turn off Block Request to use the breakpoint."
+    }
+
+    static func mockPreemptedBreakpointMessage(_ mode: BreakpointMode) -> String {
+        switch mode {
+        case .off:
+            return ""
+        case .beforeSend:
+            return "A mock answered this request without touching the network, so the "
+                 + "\u{201C}before send\u{201D} breakpoint never paused it. "
+                 + "Switch the mock off to pause the real request."
+        case .afterResponse:
+            return "A mock answered this request without touching the network, so there was no "
+                 + "server response to pause and the \u{201C}after response\u{201D} breakpoint "
+                 + "was skipped. Edit the mock body instead."
+        }
+    }
+
+    /// Answers the request from the entry the URL loading system found in the
+    /// host app's `URLCache`, with no network access.
+    ///
+    /// The cached response is replayed byte-for-byte, and `.notAllowed` is used
+    /// for the storage policy because it is already stored — re-storing what we
+    /// just read is how a cached entry gets its lifetime silently extended.
+    private func deliverCachedResponse(_ cached: CachedURLResponse) {
+        self.response = cached.response
+        self.data = NSMutableData(data: cached.data)
+
+        // A rewrite armed on a URL that answers from cache would otherwise do
+        // nothing at all, with nothing to read anywhere — the same silent no-op
+        // the mock path reports, for the same reason.
+        if resolvedRule?.hasActiveResponseRewrites == true {
+            self.rewriteReport = RewriteReport(
+                skippedReason: "This response was served from the app's URLCache without a "
+                             + "network request, so response rewrites were skipped.")
+        }
+
+        client?.urlProtocol(self, didReceive: cached.response, cacheStoragePolicy: .notAllowed)
+        if !cached.data.isEmpty { client?.urlProtocol(self, didLoad: cached.data) }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
     override func stopLoading() {
         // The implementation just cancels the current load (if it's still running).
 
@@ -658,6 +1402,7 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         isHoldingForRewriteOnly = false
 
         if let task = self._dataTask {
+            didCancelOwnTask = true
             task.cancel()
             self._dataTask = nil
             // The following ends up calling urlSession(_:task:didCompleteWithError:) with
@@ -699,6 +1444,7 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         }
 
         model.size = ByteCountFormatter().string(fromByteCount: Int64(self.data?.length ?? 0))
+        model.breakpointSkippedReason = self.breakpointSkipReason
         model.responseData = self.data as Data?  // setter writes to disk, frees NSData
         model.isResponseTruncated = self.responseTruncated
         model.isImage = (self.response?.mimeType?.range(of: "image") != nil)
@@ -1161,16 +1907,21 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
     func urlSession(_ session: URLSession,
                     dataTask: URLSessionDataTask,
                     didReceive data: Data) {
-        // A rewrite-only hold is bounded by the engine's own cap. The moment the
-        // body grows past it there is nothing left to rewrite, so stop holding,
-        // flush what was buffered and go back to streaming. Without this, a large
-        // response would be buffered in full and then hit the 10 MB capture cap
-        // below — which TRUNCATES `self.data`, and the app would receive the
-        // truncated bytes. A breakpoint hold is never abandoned: the developer
-        // asked for the pause.
-        if self.isHoldingResponse, self.isHoldingForRewriteOnly,
-           (self.data?.length ?? 0) + data.count > ResponseRewriteEngine.maxBodyBytes {
-            abandonRewriteHold()
+        // WHILE A HOLD IS ON, `self.data` IS NOT JUST SWIFTYDEBUG'S CAPTURE — it
+        // is the only copy of the body the app will ever get, because nothing has
+        // been streamed to the client. Letting the capture cap below truncate it
+        // means `deliverHeldResponse` hands the app a short body behind a
+        // Content-Length that matches the short body: a well-formed response the
+        // app cannot tell from a complete one.
+        //
+        // So a hold is bounded, and reaching the bound GIVES THE HOLD UP rather
+        // than shortening the body: whatever was buffered is flushed, the rest
+        // streams normally, and the reason is recorded on the transaction.
+        if self.isHoldingResponse,
+           let reason = Self.holdAbandonReason(bufferedBytes: self.data?.length ?? 0,
+                                               incomingBytes: data.count,
+                                               isHoldingForRewriteOnly: self.isHoldingForRewriteOnly) {
+            abandonHold(reason)
         }
 
         // While holding for an `.afterResponse` breakpoint, accumulate only —
@@ -1180,9 +1931,11 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
         }
 
         // Only accumulate for SwiftyDebug's capture if under the size cap.
-        // The client always receives the full, unmodified data above.
+        // The client always receives the full, unmodified data above — and the
+        // block above guarantees we are no longer holding by the time this can
+        // truncate anything.
         if !self.responseTruncated {
-            let maxSize = Int(UInt(10 * 1024 * 1024))
+            let maxSize = Self.maxCapturedResponseBytes
             let currentLength = self.data?.length ?? 0
             if currentLength + data.count <= maxSize {
                 self.data?.append(data)
@@ -1210,6 +1963,13 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
             // A failure releases any hold — nothing to edit.
             self.isHoldingResponse = false
             self.isHoldingForRewriteOnly = false
+            // `stopLoading()` cancels the task, and CFNetwork reports that back
+            // here as NSURLErrorCancelled. The client already knows — it is the
+            // one that asked — and calling didFailWithError after stopLoading is
+            // not allowed, so this is swallowed. (The comment in `stopLoading`
+            // has always promised this trap; it just was not here.) Redirects
+            // report the same error for the same reason.
+            guard !Self.isClientInitiatedCancellation(error, didCancel: self.didCancelOwnTask) else { return }
             self.client?.urlProtocol(self, didFailWithError: error)
             self.error = error
             return
@@ -1273,6 +2033,21 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
         BreakpointCenter.shared.park(paused)
     }
 
+    /// True for the completion error CFNetwork reports after our own
+    /// `stopLoading()` cancelled the task. Pure, so it can be unit-tested.
+    ///
+    /// `didCancel` is what makes this safe to swallow. Matching on the error
+    /// alone would swallow EVERY -999 — including one we did not cause — and an
+    /// unconditional early return here delivers no terminal callback at all,
+    /// leaving a host-app request that never resolves. A hang is worse than the
+    /// spurious error the trap exists to avoid, so anything we did not cancel
+    /// ourselves is still reported.
+    static func isClientInitiatedCancellation(_ error: Error, didCancel: Bool) -> Bool {
+        guard didCancel else { return false }
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+    }
+
     // MARK: - Response rewrites (see RESPONSE-REWRITE)
 
     /// Decides — before a single byte is buffered — whether this response is
@@ -1332,15 +2107,80 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
         return rewritten
     }
 
-    /// Gives up a rewrite-only hold mid-stream: flushes the buffered head to the
-    /// client and returns to normal streaming. Only ever called when no
-    /// breakpoint is involved, so nothing is waiting to edit this body.
-    private func abandonRewriteHold() {
+    // MARK: - Bounding a hold (see B3 / truncated deliveries)
+
+    /// Why a hold had to be given up mid-stream.
+    enum HoldAbandonReason: Equatable {
+        /// Rewrite-only hold: the body outgrew the rewrite engine's cap, so
+        /// there is nothing left to rewrite anyway.
+        case rewriteLimitExceeded
+        /// The body outgrew the buffer SwiftyDebug is willing to hold. Keeping
+        /// the hold would mean truncating the only copy of the body the app is
+        /// going to get.
+        case holdBufferExceeded
+    }
+
+    /// Whether the in-flight hold must be given up before `incomingBytes` more
+    /// bytes are buffered. Pure, so the bound can be unit-tested.
+    ///
+    /// A rewrite-only hold is bounded by the engine's own cap — past it there is
+    /// nothing left to rewrite. Every other hold (i.e. one that includes an
+    /// `.afterResponse` breakpoint) is bounded by the capture cap, because that
+    /// buffer is what gets delivered.
+    static func holdAbandonReason(bufferedBytes: Int,
+                                  incomingBytes: Int,
+                                  isHoldingForRewriteOnly: Bool) -> HoldAbandonReason? {
+        let projected = bufferedBytes + incomingBytes
+        if isHoldingForRewriteOnly, projected > ResponseRewriteEngine.maxBodyBytes {
+            return .rewriteLimitExceeded
+        }
+        if projected > maxCapturedResponseBytes {
+            return .holdBufferExceeded
+        }
+        return nil
+    }
+
+    /// The sentence shown on the transaction when a hold is abandoned. Pure so
+    /// the wording is pinned by tests — a hold that silently does nothing is the
+    /// exact failure these limits must not produce.
+    static func holdAbandonedMessage(_ reason: HoldAbandonReason) -> String {
+        switch reason {
+        case .rewriteLimitExceeded:
+            let limit = ResponseRewriteEngine.maxBodyBytes / 1024 / 1024
+            return "The response body grew past the \(limit) MB rewrite limit, so rewrites were skipped."
+        case .holdBufferExceeded:
+            let limit = maxCapturedResponseBytes / 1024 / 1024
+            return "The response body grew past the \(limit) MB hold limit. "
+                 + "The breakpoint was released and the body was streamed to the app "
+                 + "in full, unedited — nothing was truncated."
+        }
+    }
+
+    /// Gives up a hold mid-stream: flushes the buffered head to the client and
+    /// returns to normal streaming, so the app receives the complete body.
+    ///
+    /// For `.holdBufferExceeded` this also means the `.afterResponse` breakpoint
+    /// never fires. Nothing has been parked yet at this point (parking happens in
+    /// `didCompleteWithError`), so there is no inbox row to remove — the reason is
+    /// recorded on the transaction instead, which is where the developer looking
+    /// for their missing pause ends up.
+    private func abandonHold(_ reason: HoldAbandonReason) {
         isHoldingResponse = false
         isHoldingForRewriteOnly = false
-        let limit = ResponseRewriteEngine.maxBodyBytes / 1024 / 1024
-        rewriteReport = RewriteReport(skippedReason:
-            "The response body grew past the \(limit) MB rewrite limit, so rewrites were skipped.")
+        // A reason may already be recorded (e.g. "not JSON, so rewrites were
+        // skipped"). Both are true and both are worth reading, so append rather
+        // than replace — the developer is chasing one missing effect or the other.
+        let message = Self.holdAbandonedMessage(reason)
+        if let existing = rewriteReport?.skippedReason, !existing.isEmpty {
+            rewriteReport?.skippedReason = existing + " " + message
+        } else {
+            rewriteReport = RewriteReport(skippedReason: message)
+        }
+        // A given-up BREAKPOINT hold is not a rewrite fact — surface it where the
+        // developer is waiting for the pause that never came.
+        if reason == .holdBufferExceeded {
+            BreakpointCenter.shared.note(message, for: (self.interceptedRequest ?? self.request).url)
+        }
 
         if let held = heldResponse {
             client?.urlProtocol(self, didReceive: held, cacheStoragePolicy: heldCacheStoragePolicy)

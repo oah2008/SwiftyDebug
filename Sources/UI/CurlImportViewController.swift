@@ -316,28 +316,39 @@ final class CurlImportViewController: UIViewController {
         push(RequestReplayViewController(curl: parsed))
     }
 
+    /// Scope chooser for the rule this cURL becomes. Uses
+    /// `OptionPickerSheetViewController` rather than a system action sheet: an
+    /// imported command's path/host are exactly the long strings an alert row
+    /// truncates, and they are the whole point of the choice. (See INTERCEPT-UX.)
     @objc private func createRuleTapped() {
         guard let parsed else { return }
         view.endEditing(true)
 
-        let sheet = UIAlertController(
+        let path = parsed.url.path
+        let pattern = EndpointNormalizer.normalize(path)
+        let host = parsed.url.host ?? ""
+
+        OptionPickerSheetViewController.present(
+            from: self,
             title: "Match Requests By",
             message: parsed.url.absoluteString,
-            preferredStyle: .actionSheet
+            options: [
+                .init(title: "Exact Path",
+                      subtitle: "This endpoint only — \(path.isEmpty ? "/" : path)",
+                      symbol: "equal.circle",
+                      tint: .systemOrange) { [weak self] in self?.pushRuleEditor(mode: .exact) },
+                .init(title: "Pattern",
+                      subtitle: "Every request matching \(pattern.isEmpty ? "/" : pattern)",
+                      symbol: "point.topleft.down.curvedto.point.bottomright.up",
+                      tint: DebugTheme.accentColor) { [weak self] in self?.pushRuleEditor(mode: .normalized) },
+                .init(title: "Host",
+                      subtitle: host.isEmpty
+                          ? "Every request to this host"
+                          : "Every request to \(host)",
+                      symbol: "network",
+                      tint: .systemPurple) { [weak self] in self?.pushRuleEditor(mode: .host) },
+            ]
         )
-        sheet.addAction(UIAlertAction(title: "Exact Path — \(parsed.url.path)", style: .default) { [weak self] _ in
-            self?.pushRuleEditor(mode: .exact)
-        })
-        sheet.addAction(UIAlertAction(title: "Pattern — \(EndpointNormalizer.normalize(parsed.url.path))", style: .default) { [weak self] _ in
-            self?.pushRuleEditor(mode: .normalized)
-        })
-        sheet.addAction(UIAlertAction(title: "Host — \(parsed.url.host ?? "")", style: .default) { [weak self] _ in
-            self?.pushRuleEditor(mode: .host)
-        })
-        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        sheet.popoverPresentationController?.sourceView = ruleButton
-        sheet.popoverPresentationController?.sourceRect = ruleButton.bounds
-        present(sheet, animated: true)
     }
 
     private func pushRuleEditor(mode: EndpointMatchMode) {

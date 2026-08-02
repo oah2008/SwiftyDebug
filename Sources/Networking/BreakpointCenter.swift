@@ -53,10 +53,23 @@ final class BreakpointCenter {
         /// How long this request has been held.
         var heldFor: TimeInterval { Date().timeIntervalSince(pausedAt) }
 
-        /// Seconds left before the hold budget runs out, or nil once settled.
+        /// Seconds left before the APP gives up on this request, or nil once
+        /// settled.
+        ///
+        /// Counts against the held request's OWN `timeoutInterval`, not against
+        /// `breakpointHoldSeconds`. Those are the same number only while "Extend
+        /// Request Timeouts" is on — that setting is what raises the app's
+        /// timeout to the hold budget in the first place. With it off (the
+        /// default), the request dies at whatever the app asked for, typically
+        /// 60 s and often much less, while a fixed 600-second countdown happily
+        /// told the developer they had nine minutes to edit a response that was
+        /// already gone.
         var remainingHoldTime: TimeInterval? {
             guard !isSettled else { return nil }
-            return max(0, Settings.shared.breakpointHoldSeconds - heldFor)
+            let deadline = request.timeoutInterval > 0
+                ? request.timeoutInterval
+                : Settings.shared.breakpointHoldSeconds
+            return max(0, deadline - heldFor)
         }
 
         init(stage: BreakpointMode,
@@ -97,8 +110,23 @@ final class BreakpointCenter {
         }
     }
 
+    /// A breakpoint that was armed but never actually paused, and why.
+    ///
+    /// Without this, the explanation for a breakpoint that silently did not fire
+    /// was written into the rewrite report — so the developer had to open the
+    /// request's detail screen and read a section headed RESPONSE REWRITES to
+    /// find out why the thing they were staring at never happened.
+    struct Notice: Equatable {
+        let url: String
+        let message: String
+        let at: Date
+    }
+
     private let lock = NSLock()
     private var paused: [PausedRequest] = []
+    private var noticeLog: [Notice] = []
+    /// Bounded — this is a diagnostic aid, not a log.
+    private static let maxNotices = 20
 
     /// Currently paused requests, oldest first.
     var pausedRequests: [PausedRequest] {
@@ -109,6 +137,37 @@ final class BreakpointCenter {
     var count: Int {
         lock.lock(); defer { lock.unlock() }
         return paused.count
+    }
+
+    /// Notices, newest first.
+    var notices: [Notice] {
+        lock.lock(); defer { lock.unlock() }
+        return noticeLog
+    }
+
+    /// Records why an armed breakpoint never paused, so it shows up in the inbox
+    /// the developer is actually looking at.
+    func note(_ message: String, for url: URL?, at date: Date = Date()) {
+        let key = url?.absoluteString ?? "\u{2014}"
+        lock.lock()
+        // De-duplicate on (url, message). An app polling a mocked endpoint that
+        // also has a breakpoint armed produces one of these per request, which
+        // filled all 20 slots with the same sentence and evicted every other
+        // notice. The newest occurrence wins its place at the top.
+        if let existing = noticeLog.firstIndex(where: { $0.url == key && $0.message == message }) {
+            noticeLog.remove(at: existing)
+        }
+        noticeLog.insert(Notice(url: key, message: message, at: date), at: 0)
+        if noticeLog.count > Self.maxNotices { noticeLog.removeLast(noticeLog.count - Self.maxNotices) }
+        lock.unlock()
+        notifyChanged()
+    }
+
+    func clearNotices() {
+        lock.lock()
+        noticeLog.removeAll()
+        lock.unlock()
+        notifyChanged()
     }
 
     // MARK: - Parking

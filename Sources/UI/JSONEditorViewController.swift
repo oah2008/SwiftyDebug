@@ -11,9 +11,11 @@ import UIKit
 ///
 /// **Tree** — every node is a tappable row (key, value preview, type badge).
 /// Containers collapse. Each row has a full action menu: edit, rename, change
-/// type, duplicate, add child, delete, copy. Arrays of objects get first-class
-/// treatment: "Add item" builds an element shaped like its siblings, and
-/// duplicate/reorder are one tap.
+/// type, duplicate, add child, delete, copy. Arrays get first-class treatment:
+/// "Add item" builds an element of the same type as the ones already there —
+/// all the way down for an object — names that type in the menu so you can see
+/// what you are about to get, and offers a different type when the guess isn't
+/// what you wanted. Duplicate/reorder are one tap.
 ///
 /// **Raw** — the whole document as text with live validation, format/minify and
 /// paste, for when you'd rather type or paste a payload wholesale.
@@ -47,16 +49,37 @@ final class JSONEditorViewController: UIViewController {
     private let document: JSONDocument
     private let editorTitle: String
 
-    init(document: JSONDocument, title: String = "Edit JSON") {
+    /// Set when this editor was opened on text that is **not** JSON — a paused
+    /// HTML response, a form body, a stack trace. `JSONDocument` cannot hold it,
+    /// so the editor opens in Raw showing these exact bytes.
+    ///
+    /// The old fallback to `JSONDocument.empty()` meant opening such a body
+    /// replaced it with `{}` before a single key was touched, and Save then
+    /// handed the host app `{}` in place of the real payload. An empty object is
+    /// never a safe stand-in for someone's data.
+    private let unparsedText: String?
+
+    private init(document: JSONDocument, unparsedText: String?, title: String) {
         self.document = document
+        self.unparsedText = unparsedText
         self.editorTitle = title
         super.init(nibName: nil, bundle: nil)
     }
 
-    /// Convenience: start from text (invalid/empty text starts an empty object).
+    convenience init(document: JSONDocument, title: String = "Edit JSON") {
+        self.init(document: document, unparsedText: nil, title: title)
+    }
+
+    /// Convenience: start from text. Empty or absent text starts an empty object
+    /// ("type my own"); text that is real but isn't JSON is kept verbatim and
+    /// opened in Raw.
     convenience init(text: String?, title: String = "Edit JSON") {
-        let doc = text.flatMap { JSONDocument(text: $0) } ?? JSONDocument.empty()
-        self.init(document: doc, title: title)
+        if let text, let parsed = JSONDocument(text: text) {
+            self.init(document: parsed, unparsedText: nil, title: title)
+            return
+        }
+        let isBlank = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        self.init(document: .empty(), unparsedText: isBlank ? nil : text, title: title)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -139,6 +162,7 @@ final class JSONEditorViewController: UIViewController {
         setupStatusBar()
         setupToolbar()
         layout()
+        showUnparsedTextIfAny()
 
         document.onChange = { [weak self] in
             self?.documentChanged()
@@ -157,6 +181,19 @@ final class JSONEditorViewController: UIViewController {
     }
 
     // MARK: - Setup
+
+    /// A body the tree cannot represent opens in Raw, holding the original text.
+    /// Tree stays reachable but `modeChanged` refuses it (with the parse error)
+    /// until the text is valid, and `saveTapped` refuses for the same reason —
+    /// so the app is never handed a document that isn't what's on screen.
+    private func showUnparsedTextIfAny() {
+        guard let unparsedText else { return }
+        mode = .raw
+        modeControl.selectedSegmentIndex = Mode.raw.rawValue
+        rawTextView.text = unparsedText
+        tableView.isHidden = true
+        rawTextView.isHidden = false
+    }
 
     private func setupModeControl() {
         modeControl.selectedSegmentIndex = 0
@@ -290,19 +327,67 @@ final class JSONEditorViewController: UIViewController {
             }
             document.setValue(parsed.root, at: [])
         }
+        // Going to Raw with a document that cannot be written as text would
+        // render an EMPTY text view over a body that is still there — see
+        // `renderedText(of:)`.
+        var rawRender: String?
+        if newMode == .raw {
+            guard let text = renderedText(of: document) else {
+                modeControl.selectedSegmentIndex = Mode.tree.rawValue
+                showAlert("Can't show this as text",
+                          unrepresentableReason(of: document)
+                            + "\n\nRaw mode would show an empty document. Fix that value in the tree first.")
+                return
+            }
+            rawRender = text
+        }
         mode = newMode
         tableView.isHidden = (mode != .tree)
         rawTextView.isHidden = (mode != .raw)
-        if mode == .raw { rawTextView.text = document.prettyText() }
+        if let rawRender { rawTextView.text = rawRender }
         if mode == .tree { rebuildRows() }
         updateStatus()
         view.endEditing(true)
     }
 
     private func documentChanged() {
-        if mode == .tree { rebuildRows() } else { rawTextView.text = document.prettyText() }
+        if mode == .tree {
+            rebuildRows()
+        } else if let text = renderedText(of: document) {
+            // Only overwrite with text the document can actually produce.
+            // `prettyText()` answers "" for one it cannot, which used to wipe
+            // the text view and take the body off screen with it.
+            rawTextView.text = text
+        }
         refreshToolbar()
         updateStatus()
+    }
+
+    /// The document as JSON text, or nil when it holds a value JSON cannot
+    /// express.
+    ///
+    /// **Not a theoretical state.** `JSONSerialization` PARSES a negative
+    /// literal that overflows a `Double` — `{"balance":-2e308}`, valid JSON that
+    /// a backend really can emit — and hands back `-infinity`. JSON has no way
+    /// to write that back, so `JSONTextWriter` throws and `prettyText()`
+    /// answers `""`.
+    ///
+    /// Every path that took that `""` at face value did real damage: Raw mode
+    /// showed an empty document (and then refused to switch back, because `""`
+    /// is not valid JSON), and `onSave` handed `""` to callers that write it
+    /// straight into a mock body or a held request/response — so the host app
+    /// was served an EMPTY body with nothing on screen saying so.
+    ///
+    /// Costs exactly one serialisation, the same one the caller needed anyway.
+    private func renderedText(of document: JSONDocument) -> String? {
+        let text = document.prettyText()
+        return text.isEmpty ? nil : text
+    }
+
+    /// The sentence to show when `renderedText(of:)` came back nil. Only asked
+    /// for on that path, so the extra pass is never on the editing hot path.
+    private func unrepresentableReason(of document: JSONDocument) -> String {
+        document.serializationProblem() ?? "This document holds a value JSON cannot represent."
     }
 
     private func updateStatus() {
@@ -453,7 +538,9 @@ final class JSONEditorViewController: UIViewController {
         // backspace, tap elsewhere" silently destroy a value — discard instead.
         if kind == .number {
             let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard Int(trimmed) != nil || Double(trimmed) != nil else { return false }
+            // Same hole as the rewrite engine: Double("inf") succeeds and then
+            // coerces to 0. The coder returns nil for every non-finite spelling.
+            guard JSONInlineValueCoder.number(from: trimmed) != nil else { return false }
         }
         // A no-op write would still push an undo entry.
         guard !JSONInlineValueCoder.isUnchanged(draft: draft, current: document.value(at: path)) else {
@@ -552,12 +639,53 @@ final class JSONEditorViewController: UIViewController {
         }
     }
 
+    // MARK: - Raw text ↔ document
+
+    /// What happened when an action tried to fold the Raw text view into the
+    /// document.
+    private enum RawCommit { case notNeeded, committed, doesNotParse }
+
+    /// In Raw mode the text view is the truth on screen and `document` is one
+    /// step behind — nothing writes the text back until you switch mode or Save.
+    /// Every toolbar action works on `document` and then re-renders it into the
+    /// text view, so without this each of them silently destroyed everything
+    /// typed since the last sync.
+    @discardableResult
+    private func commitRawText() -> RawCommit {
+        guard mode == .raw, rawTextView.text != document.prettyText() else { return .notNeeded }
+        guard let parsed = JSONDocument(text: rawTextView.text) else { return .doesNotParse }
+        // Goes through the document, so it lands on the undo stack: the typing is
+        // recoverable rather than replaced.
+        document.setValue(parsed.root, at: [])
+        return .committed
+    }
+
+    /// Refusing is the only alternative to throwing text away that cannot be
+    /// folded in. Say which action stopped and why.
+    private func refuseRawAction(_ action: String) {
+        let reason = JSONDocument.validate(rawTextView.text).error ?? "The text isn't valid JSON."
+        showAlert("Invalid JSON",
+                  "\(reason)\n\n\(action) works on the document, so running it would replace what you typed. Your text is untouched — fix the JSON first.")
+    }
+
     // MARK: - Toolbar actions
 
     // Every mutating action commits the inline draft first: each of these
-    // reloads or replaces the tree, which would otherwise strand the edit.
-    @objc private func undoTapped() { commitInlineEdit(); document.undo() }
-    @objc private func redoTapped() { commitInlineEdit(); document.redo() }
+    // reloads or replaces the tree, which would otherwise strand the edit. In
+    // Raw mode the text view is committed for the same reason.
+    @objc private func undoTapped() {
+        commitInlineEdit()
+        guard commitRawText() != .doesNotParse else { refuseRawAction("Undo"); return }
+        document.undo()
+    }
+
+    @objc private func redoTapped() {
+        commitInlineEdit()
+        // Committing clears the redo stack, exactly as typing does in any editor:
+        // the typed text becomes the newest state instead of being discarded.
+        guard commitRawText() != .doesNotParse else { refuseRawAction("Redo"); return }
+        document.redo()
+    }
 
     @objc private func formatTapped() {
         commitInlineEdit()
@@ -566,7 +694,14 @@ final class JSONEditorViewController: UIViewController {
                 showAlert("Invalid JSON", JSONDocument.validate(rawTextView.text).error ?? "")
                 return
             }
-            rawTextView.text = parsed.prettyText()
+            // Formatting must never be able to empty the editor: text that
+            // parses can still hold a value JSON cannot write back (see
+            // `renderedText(of:)`).
+            guard let formatted = renderedText(of: parsed) else {
+                showAlert("Can't format", unrepresentableReason(of: parsed) + "\n\nYour text is untouched.")
+                return
+            }
+            rawTextView.text = formatted
             updateStatus()
         } else {
             collapsed.removeAll()
@@ -586,9 +721,22 @@ final class JSONEditorViewController: UIViewController {
             showAlert("Clipboard isn't JSON", JSONDocument.validate(text).error ?? "Could not parse the clipboard.")
             return
         }
+        // Parses but cannot be written back: replacing the document with it
+        // would leave nothing to render and nothing to save.
+        guard renderedText(of: parsed) != nil else {
+            showAlert("Clipboard can't be edited",
+                      unrepresentableReason(of: parsed) + "\n\nNothing was replaced.")
+            return
+        }
+        // Fold the Raw text in first, so "you can undo" is true of what is on
+        // screen. Text that doesn't parse can't go on the undo stack — say it
+        // will be lost rather than dropping it without a word.
+        let losesTypedText = (commitRawText() == .doesNotParse)
         let confirm = UIAlertController(
             title: "Replace with clipboard?",
-            message: "This replaces the whole document with the JSON on your clipboard. You can undo.",
+            message: losesTypedText
+                ? "This replaces the whole document with the JSON on your clipboard.\n\nThe text you typed isn't valid JSON, so it can't go on the undo stack — it will be lost."
+                : "This replaces the whole document with the JSON on your clipboard. You can undo.",
             preferredStyle: .alert)
         confirm.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         confirm.addAction(UIAlertAction(title: "Replace", style: .destructive) { [weak self] _ in
@@ -602,6 +750,9 @@ final class JSONEditorViewController: UIViewController {
     /// Adds a child to the root container.
     @objc private func addRootChildTapped() {
         commitInlineEdit()
+        // Without this the new key lands in the document you can't see, and the
+        // moment the prompt is answered everything typed in Raw is gone.
+        guard commitRawText() != .doesNotParse else { refuseRawAction("Add"); return }
         addChild(toContainerAt: [])
     }
 
@@ -625,6 +776,16 @@ final class JSONEditorViewController: UIViewController {
                 return
             }
             document.setValue(parsed.root, at: [])
+        }
+        // EVERY caller of `onSave` writes `document.prettyText()` somewhere the
+        // host app will read it — a mock body, a held request, a held response.
+        // A document that cannot be written answers "", so saving it delivered
+        // an EMPTY body and said nothing. Refuse, and name the value.
+        guard renderedText(of: document) != nil else {
+            showAlert("Can't save",
+                      unrepresentableReason(of: document)
+                        + "\n\nSaving would replace the body with nothing. Fix that value first.")
+            return
         }
         view.endEditing(true)
         onSave?(document)
@@ -679,11 +840,14 @@ final class JSONEditorViewController: UIViewController {
             }
         }
         if row.isContainer {
-            options.append(.init(title: row.kind == .array ? "Add item" : "Add key",
-                                 subtitle: row.kind == .array ? "Shaped like the existing items" : nil,
-                                 symbol: "plus.circle", tint: DebugTheme.accentColor) { [weak self] in
-                self?.addChild(toContainerAt: path)
-            })
+            if row.kind == .array {
+                appendAddItemOptions(forArrayAt: path, to: &options)
+            } else {
+                options.append(.init(title: "Add key", subtitle: nil,
+                                     symbol: "plus.circle", tint: DebugTheme.accentColor) { [weak self] in
+                    self?.addChild(toContainerAt: path)
+                })
+            }
         }
         if case .key(let k)? = path.last {
             options.append(.init(title: "Rename key", subtitle: k, symbol: "character.cursor.ibeam") { [weak self] in
@@ -703,7 +867,14 @@ final class JSONEditorViewController: UIViewController {
         options.append(.init(title: "Copy value", subtitle: nil, symbol: "doc.on.doc") { [weak self] in
             guard let self else { return }
             let value = self.document.value(at: path) ?? NSNull()
-            UIPasteboard.general.string = JSONDocument(root: value).prettyText()
+            let node = JSONDocument(root: value)
+            // Writing "" to the pasteboard is worse than not writing: the user
+            // pastes an empty body somewhere and has no idea why.
+            guard let text = self.renderedText(of: node) else {
+                self.showAlert("Can't copy this value", self.unrepresentableReason(of: node))
+                return
+            }
+            UIPasteboard.general.string = text
         })
         options.append(.init(title: "Copy path", subtitle: path.display, symbol: "arrow.triangle.branch") {
             UIPasteboard.general.string = path.display
@@ -754,6 +925,60 @@ final class JSONEditorViewController: UIViewController {
             selectedIndex: JSONValueKind.allCases.firstIndex(of: current))
     }
 
+    /// "Add item" for an array, with the type it is about to add spelled out in
+    /// the subtitle, plus an escape hatch.
+    ///
+    /// Both halves matter. Naming the inferred type ("object with 5 keys") is
+    /// what lets you see what you are getting before you tap; the escape hatch is
+    /// there because wanting one object in an array of strings is a normal thing,
+    /// and a menu that can only add what is already there sends you to Raw mode
+    /// to type it by hand.
+    private func appendAddItemOptions(forArrayAt path: JSONPath,
+                                      to options: inout [OptionPickerSheetViewController.Option]) {
+        let template = document.arrayElementTemplate(forArrayAt: path)
+        options.append(.init(title: "Add item", subtitle: template.summary,
+                             symbol: "plus.circle",
+                             // A fallback is not an inference: don't dress a guess
+                             // up in the same accent colour as a real match.
+                             tint: template.isInferred ? DebugTheme.accentColor : nil) { [weak self] in
+            self?.appendItem(template.value, toArrayAt: path)
+        })
+        options.append(.init(title: "Add item of another type\u{2026}",
+                             subtitle: "Pick the type yourself instead",
+                             symbol: "plus.square") { [weak self] in
+            self?.chooseItemType(forArrayAt: path, inferred: template)
+        })
+    }
+
+    private func chooseItemType(forArrayAt path: JSONPath, inferred: JSONArrayElementTemplate) {
+        let suggested = inferred.isInferred ? inferred.kind : nil
+        let options = JSONValueKind.allCases.map { kind in
+            OptionPickerSheetViewController.Option(
+                title: kind.badge,
+                subtitle: kind == suggested ? inferred.summary : nil,
+                symbol: nil,
+                tint: kind == suggested ? DebugTheme.accentColor : .white
+            ) { [weak self] in
+                // The matching type keeps the shape that was read from the
+                // siblings; any other type starts empty, which is the point of
+                // asking for a different one.
+                self?.appendItem(kind == suggested ? inferred.value : kind.emptyValue, toArrayAt: path)
+            }
+        }
+        OptionPickerSheetViewController.present(
+            from: self, title: "Add item", message: path.display, options: options,
+            selectedIndex: suggested.flatMap { JSONValueKind.allCases.firstIndex(of: $0) })
+    }
+
+    /// Appends through the document's path API — the only way in, so the source
+    /// key order and number spelling of everything already there survive.
+    private func appendItem(_ value: Any, toArrayAt path: JSONPath) {
+        // Expand first: appending fires `onChange`, which rebuilds the tree, and
+        // a collapsed array would hide the element that was just added.
+        collapsed.remove(path.display)
+        document.appendElement(value, toArrayAt: path)
+    }
+
     /// Adds a child to an object (asks for a key) or an array (uses a template
     /// shaped like the existing elements).
     private func addChild(toContainerAt path: JSONPath) {
@@ -770,11 +995,7 @@ final class JSONEditorViewController: UIViewController {
                 }
             }
         case .array:
-            let template = document.templateElement(forArrayAt: path)
-            document.appendElement(template, toArrayAt: path)
-            // Expand so the new element is visible.
-            collapsed.remove(path.display)
-            rebuildRows()
+            appendItem(document.templateElement(forArrayAt: path), toArrayAt: path)
         default:
             showAlert("Not a container", "Only objects and arrays can hold children. Change the type first.")
         }

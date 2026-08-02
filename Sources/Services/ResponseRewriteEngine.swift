@@ -66,6 +66,59 @@ enum ResponseRewriteEngine {
     /// stall would look exactly like a network hang.
     static let maxBodyBytes = 2 * 1024 * 1024
 
+    // MARK: - Regex budget
+
+    /// A time budget for regular-expression matching, shared by every value one
+    /// `apply`/`preview` run touches.
+    ///
+    /// The find/replace pattern is typed by a human and never validated for
+    /// cost — only for syntax — and a perfectly ordinary-looking one such as
+    /// `^https?://([\w.-]+)+$` backtracks catastrophically. Measured on this
+    /// machine against `"https://" + "a"*n + "!"`: 21 chars 0.006 s, 25 chars
+    /// 0.148 s, 29 chars 6.3 s, and it keeps multiplying by ~2.6 per character.
+    /// That runs on the networking thread for every response a rule matches and
+    /// on the main thread for every keystroke in the editor, so it has to be
+    /// bounded — and the bound has to be *reported*, because a rewrite that
+    /// quietly stopped halfway is exactly the failure this feature must not have.
+    final class RegexBudget {
+
+        /// Total matching time one run may spend across every value.
+        static let defaultSeconds: TimeInterval = 0.25
+
+        /// Values longer than this (UTF-16 units) are never handed to a regex.
+        /// Even a well-behaved pattern is linear in the input, and a single JSON
+        /// string inside a 2 MB body can be 2 MB long.
+        static let maxInputLength = 20_000
+
+        private var remaining: TimeInterval
+
+        /// True once the budget is spent. Everything after that is refused with
+        /// `regexTimeoutMessage` instead of being attempted.
+        private(set) var isExhausted: Bool
+
+        init(seconds: TimeInterval = RegexBudget.defaultSeconds) {
+            remaining = seconds
+            isExhausted = seconds <= 0
+        }
+
+        /// Wall-clock deadline for the next match run, or nil when nothing is
+        /// left to spend.
+        fileprivate func nextDeadline() -> CFAbsoluteTime? {
+            guard !isExhausted else { return nil }
+            return CFAbsoluteTimeGetCurrent() + remaining
+        }
+
+        fileprivate func charge(_ elapsed: TimeInterval, timedOut: Bool) {
+            remaining -= elapsed
+            if timedOut || remaining <= 0 { isExhausted = true }
+        }
+    }
+
+    /// Said out loud in the report entry and in the editor's preview rows, so
+    /// "it stopped early" can never look like "it matched nothing".
+    static let regexTimeoutMessage =
+        "the regular expression took too long on this response and was stopped, so the value was left alone"
+
     // MARK: - Apply
 
     /// Applies enabled rewrites in order. Returns the original data untouched
@@ -87,7 +140,10 @@ enum ResponseRewriteEngine {
             return (data, RewriteReport(skippedReason: "The response body is not JSON, so rewrites were skipped."))
         }
 
-        let document = JSONDocument(root: root)
+        // `sourceText` is what lets the writer keep the server's original key
+        // ORDER and number spelling. Without it, every rewritten response came
+        // back alphabetised — a change the server never made.
+        let document = JSONDocument(root: root, sourceText: String(data: data, encoding: .utf8))
         var entries: [RewriteReport.Entry] = []
         var changedCount = 0
 
@@ -136,10 +192,14 @@ enum ResponseRewriteEngine {
 
         var changed = 0
         var errors: [String] = []
+        // One budget for the whole rewrite: a pattern that is slow on one value
+        // is slow on all of them, and 500 matched values must not cost 500
+        // timeouts on the networking thread.
+        let budget = RegexBudget()
 
         for path in ordered {
             guard let current = document.value(at: path) else { continue }
-            switch outcome(of: rewrite.action, on: current, regex: regex) {
+            switch outcome(of: rewrite.action, on: current, regex: regex, budget: budget) {
             case .remove:
                 if path.isEmpty {
                     errors.append("the whole document cannot be removed")
@@ -190,8 +250,13 @@ enum ResponseRewriteEngine {
         case .ready(let compiled):  regex = compiled
         }
 
-        let document = JSONDocument(root: root)
+        let document = JSONDocument(root: root, sourceText: String(data: data, encoding: .utf8))
         var rows: [(path: String, before: String, after: String)] = []
+        // Same bound as `apply`, for the same reason — this one runs while the
+        // user is typing the pattern, which is when a runaway pattern first
+        // exists. See `computePreview()`'s caller: it must not run on the main
+        // thread either.
+        let budget = RegexBudget()
 
         for path in paths {
             guard let current = document.value(at: path) else { continue }
@@ -200,7 +265,7 @@ enum ResponseRewriteEngine {
             if let message = preparationError {
                 after = "(unchanged — \(message))"
             } else {
-                switch outcome(of: rewrite.action, on: current, regex: regex) {
+                switch outcome(of: rewrite.action, on: current, regex: regex, budget: budget) {
                 case .remove:              after = "(removed)"
                 case .newValue(let value): after = isSameJSON(value, current) ? before : displayText(for: value)
                 case .unchanged:           after = before
@@ -257,8 +322,11 @@ enum ResponseRewriteEngine {
         }
     }
 
+    /// - Parameter budget: shared regex time budget for the run. Passing nil
+    ///   gives this one value a fresh budget — never an unbounded one.
     static func outcome(of action: RewriteAction, on value: Any,
-                        regex: NSRegularExpression?) -> ValueOutcome {
+                        regex: NSRegularExpression?,
+                        budget: RegexBudget? = nil) -> ValueOutcome {
         switch action {
         case .replaceHost(let target), .replaceHostAndPath(let target):
             guard let mode = action.redirectMode else { return .unchanged }
@@ -275,9 +343,11 @@ enum ResponseRewriteEngine {
             let out: String
             if isRegex {
                 guard let regex = regex else { return .failed("invalid regular expression") }
-                out = regex.stringByReplacingMatches(in: text,
-                                                     range: NSRange(text.startIndex..., in: text),
-                                                     withTemplate: replace)
+                switch boundedReplacement(regex, in: text, template: replace,
+                                          budget: budget ?? RegexBudget()) {
+                case .replaced(let replaced): out = replaced
+                case .refused(let message):   return .failed(message)
+                }
             } else {
                 out = text.replacingOccurrences(of: find, with: replace)
             }
@@ -286,6 +356,62 @@ enum ResponseRewriteEngine {
         case .removeKey:
             return .remove
         }
+    }
+
+    // MARK: - Bounded regex replacement
+
+    private enum BoundedText {
+        case replaced(String)
+        case refused(String)
+    }
+
+    /// `stringByReplacingMatches`, with a wall-clock bound.
+    ///
+    /// `stringByReplacingMatches` cannot be interrupted: once ICU enters a
+    /// backtracking blow-up it returns when it is finished and not before, which
+    /// is the whole defect. `enumerateMatches` with `.reportProgress` *can* be —
+    /// ICU calls the block periodically from inside the match loop, and setting
+    /// `stop` there aborts mid-backtrack. Measured: the same 29-char input that
+    /// takes 6.3 s unbounded returns in 0.250 s here, and 49 chars (which would
+    /// take hours) also returns in 0.250 s.
+    ///
+    /// On a timeout the value is left EXACTLY as it was and the caller is told
+    /// why. A partially substituted string is worse than no substitution.
+    private static func boundedReplacement(_ regex: NSRegularExpression, in text: String,
+                                           template: String, budget: RegexBudget) -> BoundedText {
+        let ns = text as NSString
+        guard ns.length <= RegexBudget.maxInputLength else {
+            return .refused("this value is longer than \(RegexBudget.maxInputLength) characters, "
+                            + "so the regular expression was not run on it")
+        }
+        guard let deadline = budget.nextDeadline() else { return .refused(regexTimeoutMessage) }
+
+        var out = ""
+        var cursor = 0
+        var timedOut = false
+        let started = CFAbsoluteTimeGetCurrent()
+
+        regex.enumerateMatches(in: text, options: [.reportProgress],
+                               range: NSRange(location: 0, length: ns.length)) { result, _, stop in
+            if CFAbsoluteTimeGetCurrent() > deadline {
+                timedOut = true
+                stop.pointee = true
+                return
+            }
+            // A progress-only callback carries no result; there is nothing to
+            // copy for it, the deadline check above is its entire purpose.
+            guard let result = result else { return }
+            let range = result.range
+            guard range.location != NSNotFound, range.location >= cursor else { return }
+            out += ns.substring(with: NSRange(location: cursor, length: range.location - cursor))
+            out += regex.replacementString(for: result, in: text, offset: 0, template: template)
+            cursor = range.location + range.length
+        }
+
+        budget.charge(CFAbsoluteTimeGetCurrent() - started, timedOut: timedOut)
+        guard !timedOut else { return .refused(regexTimeoutMessage) }
+        out += ns.substring(from: cursor)
+        return .replaced(out)
     }
 
     // MARK: - URL rewriting
@@ -363,7 +489,10 @@ enum ResponseRewriteEngine {
 
         case .number:
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard Int(trimmed) != nil || Double(trimmed) != nil else {
+            // Double("inf") SUCCEEDS, so the old guard let infinity through and
+            // the coercion below wrote 0 into the app's response body, reporting
+            // changed=1 with no error. The coder rejects every non-finite spelling.
+            guard JSONInlineValueCoder.number(from: trimmed) != nil else {
                 // Not a number: keep the user's text rather than writing 0.
                 return .newValue(text)
             }
@@ -409,6 +538,15 @@ enum ResponseRewriteEngine {
         case .null:
             text = "null"
         case .object, .array:
+            // Apple's PARSER accepts a literal that overflows a Double (-1e999)
+            // and hands back -inf; Apple's WRITER then raises
+            // NSInvalidArgumentException, which is an ObjC exception `try?`
+            // cannot catch — so this killed the host app, on the networking
+            // thread, during a rewrite preview.
+            guard JSONSerialization.isValidJSONObject(value) else {
+                text = "(cannot display \u{2014} contains a value JSON cannot represent)"
+                break
+            }
             let data = try? JSONSerialization.data(withJSONObject: value,
                                                    options: [.withoutEscapingSlashes, .fragmentsAllowed])
             text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""

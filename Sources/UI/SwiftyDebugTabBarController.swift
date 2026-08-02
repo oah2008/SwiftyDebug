@@ -36,6 +36,9 @@ class SwiftyDebugTabBarController: UITabBarController {
             .first?.endEditing(true)
 
         overrideUserInterfaceStyle = .dark
+        // As in SwiftyDebugNavigationController: the guarantee is the window
+        // (SwiftyDebugHostingWindow). This just settles the bar before its first
+        // layout so the tabs never flash right-aligned in an RTL host.
         view.semanticContentAttribute = .forceLeftToRight
         tabBar.semanticContentAttribute = .forceLeftToRight
         view.forceLTR()

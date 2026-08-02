@@ -386,7 +386,11 @@ final class FileContentViewerViewController: UIViewController {
                 showToast("Copied")
             }
         case .text(let string, _, let isJSON)?:
-            UIPasteboard.general.string = isJSON ? string : JSONExporter.clipboardString(from: string)
+            if isJSON {
+                UIPasteboard.general.string = string
+            } else {
+                ClipboardFormatter.copy(string, from: self)
+            }
             showToast("Copied")
         case .hex(let dump)?:
             UIPasteboard.general.string = dump

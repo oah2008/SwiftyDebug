@@ -70,8 +70,8 @@ final class BreakpointOverlay {
             w.windowLevel = .alert - 2
             w.backgroundColor = .clear
             w.isHidden = false
-            // The SDK is always LTR, even in an RTL host app.
-            w.semanticContentAttribute = .forceLeftToRight
+            // LTR is enforced by PassthroughWindow's base class, for the banner
+            // and every subview it grows later — not set here.
 
             let host = UIViewController()
             host.view.backgroundColor = .clear
@@ -114,19 +114,68 @@ final class BreakpointOverlay {
     }
 
     /// Opens the debug UI straight on the paused-requests inbox.
-    private func openInbox() {
+    ///
+    /// `DebugWindowPresenter.displayedList` is not a display flag — it is what
+    /// opens `SwiftyDebugWindow.point(inside:)` to *every* point on screen. Set
+    /// it for a presentation that then silently fails (a host view controller
+    /// with no window: UIKit logs and does nothing) and the debug window eats
+    /// every touch in the host app forever, with only the 25x25 bubble left to
+    /// tap. So: never set it before the host is known to be presentable, and
+    /// always take it back when the presentation did not actually happen.
+    func openInbox() {
         let presenter = DebugWindowPresenter.shared
-        // If the debug UI isn't up yet, bring it up first.
-        if !Settings.shared.debugUIVisible {
-            presenter.displayedList = true
-            let tabs = SwiftyDebugTabBarController()
-            tabs.modalPresentationStyle = .fullScreen
-            tabs.pendingInitialScreen = .breakpointInbox
-            presenter.vc.present(tabs, animated: true)
-        } else if let tabs = presenter.vc.presentedViewController as? SwiftyDebugTabBarController {
+
+        // Already up — just switch to the inbox tab; the flag is already true
+        // and there is genuinely something presented to justify it.
+        if let tabs = presenter.vc.presentedViewController as? SwiftyDebugTabBarController {
             tabs.showBreakpointInbox()
+            hide()
+            return
+        }
+
+        guard Self.canPresentInbox(from: presenter.vc) else {
+            // Nothing was presented, so nothing may be swallowing touches:
+            // if an earlier attempt left the flag set, this takes it back.
+            // The banner stays on screen — tapping again once the app has a
+            // live window is the whole recovery path.
+            releaseTouchesIfNothingPresented()
+            return
+        }
+
+        let tabs = SwiftyDebugTabBarController()
+        tabs.modalPresentationStyle = .fullScreen
+        tabs.pendingInitialScreen = .breakpointInbox
+
+        presenter.displayedList = true
+        presenter.vc.present(tabs, animated: true) { [weak self] in
+            self?.releaseTouchesIfNothingPresented()
+        }
+        // Belt and braces: `present`'s completion is not guaranteed to run if
+        // the transition never starts, so the flag is re-checked out of band.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.releaseTouchesIfNothingPresented()
         }
         hide()
+    }
+
+    /// Clears the touch-swallowing flag whenever nothing is actually presented,
+    /// so it can never be left stuck by a presentation that did not take.
+    private func releaseTouchesIfNothingPresented() {
+        let presenter = DebugWindowPresenter.shared
+        guard presenter.displayedList,
+              presenter.vc.presentedViewController == nil else { return }
+        presenter.displayedList = false
+        Settings.shared.debugUIVisible = false
+        refresh()
+    }
+
+    /// `true` only when `vc` can actually put a modal on screen: it has to be in
+    /// a visible window and not already busy presenting or being dismissed.
+    static func canPresentInbox(from vc: UIViewController) -> Bool {
+        guard vc.isViewLoaded, let window = vc.view.window, !window.isHidden else { return false }
+        guard vc.presentedViewController == nil else { return false }
+        guard !vc.isBeingPresented, !vc.isBeingDismissed else { return false }
+        return true
     }
 }
 
@@ -134,7 +183,13 @@ final class BreakpointOverlay {
 
 /// A window that lets every touch through to the host app except those landing
 /// on `passthroughExcept` — so the banner never blocks the app underneath.
-private final class PassthroughWindow: UIWindow {
+///
+/// Inherits forced left-to-right from `SwiftyDebugHostingWindow`. It used to be a
+/// plain `UIWindow` with a single `semanticContentAttribute` on the window
+/// itself, which an RTL host's `UIView.appearance()` proxy then overrode on every
+/// banner subview as it entered the window — the chevron and icon came out
+/// mirrored.
+final class PassthroughWindow: SwiftyDebugHostingWindow {
     weak var passthroughExcept: UIView?
 
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {

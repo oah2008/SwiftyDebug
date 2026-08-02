@@ -57,10 +57,16 @@ class NetworkTransaction: NSObject {
     /// re-encoding failed. Shown verbatim so "my rewrite did nothing" always has
     /// an answer.
     var rewriteSkippedReason: String?
+    /// Why an ARMED breakpoint never paused this request. Separate from the
+    /// rewrite reason because they are different promises, and a developer
+    /// chasing a pause that never came should not have to read a section headed
+    /// RESPONSE REWRITES to find out why.
+    var breakpointSkippedReason: String?
 
     /// True when this transaction has anything to say about rewrites.
     var hasRewriteInfo: Bool {
         !rewriteNotes.isEmpty || (rewriteSkippedReason?.isEmpty == false)
+            || (breakpointSkippedReason?.isEmpty == false)
     }
 
     /// Copies a `RewriteReport` onto this transaction, resolving each entry's
@@ -175,6 +181,7 @@ class NetworkTransaction: NSObject {
         // is the only place a transaction outlives the process, so this is the
         // only persistence the badge needs.
         dict["isResponseRewritten"] = isResponseRewritten
+        if let breakpointSkippedReason { dict["breakpointSkippedReason"] = breakpointSkippedReason }
         dict["rewrittenValueCount"] = rewrittenValueCount
         dict["rewriteNotes"] = rewriteNotes
         dict["rewriteSkippedReason"] = rewriteSkippedReason
@@ -247,6 +254,7 @@ class NetworkTransaction: NSObject {
             model.errorLocalizedDescription = dict["errorLocalizedDescription"] as? String
             model.size = dict["size"] as? String
             model.isResponseRewritten = dict["isResponseRewritten"] as? Bool ?? false
+            model.breakpointSkippedReason = dict["breakpointSkippedReason"] as? String
             model.rewrittenValueCount = dict["rewrittenValueCount"] as? Int ?? 0
             model.rewriteNotes = dict["rewriteNotes"] as? [String] ?? []
             model.rewriteSkippedReason = dict["rewriteSkippedReason"] as? String

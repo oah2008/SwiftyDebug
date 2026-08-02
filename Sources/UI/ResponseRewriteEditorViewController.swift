@@ -46,6 +46,13 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
     // MARK: - Input
 
+    /// The rule this editor was opened from, when it was opened from one. Makes
+    /// attachment unambiguous now that two rules can share scope and host pin.
+    var attachRuleId: String?
+    /// True when the rewrite was attached to a rule that is switched OFF, so the
+    /// confirmation can say so instead of implying it is live.
+    private var attachedToDisabledRule = false
+
     private let sampleBody: Data?
     private let sampleLabel: String?
     private let destination: Destination
@@ -84,6 +91,10 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
     /// The response parsed once. Every match count and every preview runs
     /// against this, so the numbers on screen are about the body in hand.
+    /// The sample body as text, used as `JSONDocument`'s source so key order and
+    /// number spelling match what the server actually sent.
+    private lazy var sampleBodyText: String? = sampleBody.flatMap { String(data: $0, encoding: .utf8) }
+
     private lazy var sampleRoot: Any? = {
         guard let body = sampleBody, !body.isEmpty,
               body.count <= ResponseRewriteEngine.maxBodyBytes else { return nil }
@@ -286,7 +297,7 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
     private func valueInSample(at path: JSONPath) -> Any? {
         guard let root = sampleRoot else { return nil }
-        return JSONDocument(root: root).value(at: path)
+        return JSONDocument(root: root, sourceText: sampleBodyText).value(at: path)
     }
 
     /// Leads with the action that fits what the value looks like: a URL becomes
@@ -877,7 +888,8 @@ final class ResponseRewriteEditorViewController: UITableViewController {
                       "There is no JSON response captured for this rule yet. Type the path below instead.")
             return
         }
-        let document = JSONDocument(root: root)
+        // Carry the source bytes so the picker shows the server's own key order.
+        let document = JSONDocument(root: root, sourceText: sampleBodyText)
         let picker = JSONEditorViewController(document: document, title: "Choose a value")
         picker.onPickPath = { [weak self] path in
             guard let self else { return }
@@ -1055,14 +1067,28 @@ final class ResponseRewriteEditorViewController: UITableViewController {
         let mode = destinationMode
         let key = Self.ruleKey(for: mode, url: url)
         var rule: InterceptRule
-        if let existing = InterceptRuleStore.shared.rules(for: key).first(where: { $0.matchMode == mode }) {
+        // `rules(for:)` deliberately returns EVERY host-pinned variant of an
+        // endpoint, so `.first` would happily attach this rewrite to a rule
+        // pinned to a different host. Prefer this host's rule, then a legacy
+        // any-host one, and only then create a new pinned rule.
+        let host = InterceptRule.canonicalHost(url.host ?? "")
+        let candidates = InterceptRuleStore.shared.rules(for: key).filter { $0.matchMode == mode }
+        // Prefer the rule this editor was opened FROM. Once rules can be
+        // duplicated, a copy shares scope AND host pin with its original, so
+        // matching on those alone is ambiguous — and it resolved to the original
+        // by sort order, meaning a rewrite armed while editing the copy silently
+        // landed on the rule the user was trying to leave alone.
+        if let attachRuleId, let owned = candidates.first(where: { $0.id == attachRuleId }) {
+            rule = owned
+        } else if let existing = candidates.first(where: { $0.matchHost == host })
+            ?? candidates.first(where: { $0.matchHost.isEmpty }) {
             rule = existing
         } else if mode == .host {
             rule = InterceptRule.hostRule(hosts: [(url.host ?? "").lowercased()])
         } else if mode == .global {
             rule = InterceptRule.globalRule()
         } else {
-            rule = InterceptRule(matchEndpoint: key, matchMode: mode)
+            rule = InterceptRule.endpointRule(path: key, mode: mode, host: url.host)
         }
 
         if let index = rule.responseRewrites.firstIndex(where: { $0.id == rewrite.id }) {
@@ -1070,8 +1096,15 @@ final class ResponseRewriteEditorViewController: UITableViewController {
         } else {
             rule.responseRewrites.append(rewrite)
         }
-        // A rule that exists but is switched off would swallow the rewrite.
-        rule.isEnabled = true
+        // A brand-new rule arms itself; an EXISTING one keeps whatever the user
+        // set. Forcing this on silently re-armed a rule they had deliberately
+        // switched off — the same defect already fixed in the rule editor.
+        // `wasDisabled` is reported back so the caller can say so rather than
+        // leaving the rewrite looking armed when its rule is off.
+        if !candidates.contains(where: { $0.id == rule.id }) {
+            rule.isEnabled = true
+        }
+        attachedToDisabledRule = !rule.isEnabled
         InterceptRuleStore.shared.addOrUpdate(rule)
     }
 
@@ -1084,6 +1117,10 @@ final class ResponseRewriteEditorViewController: UITableViewController {
                      "Runs on every response \(Self.scopeSummary(destinationMode, url))."]
         if !rewrite.isEnabled {
             lines.append("It is switched OFF, so nothing happens until you turn it on.")
+        } else if attachedToDisabledRule {
+            // The rewrite is on, but its RULE is not. Saying "armed" here without
+            // this would be a lie.
+            lines.append("Its rule is switched off, so nothing happens until you turn the rule on.")
         } else if preview.changedCount > 0 {
             let subject = preview.changedCount == 1 ? "1 value" : "\(preview.changedCount) values"
             lines.append("\(subject) in the response you were looking at would change.")

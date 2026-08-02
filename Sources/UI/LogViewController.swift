@@ -160,6 +160,18 @@ class LogViewController: UIViewController {
 
     private var currentSearchWord: String?
 
+    /// The block-based notification observers registered in `viewDidLoad`.
+    ///
+    /// Block observers are unregistered by token only — `removeObserver(self)`
+    /// does nothing for them — so the bag holds every token and drops them all
+    /// when this screen goes away. Same bag as `NetworkViewController`.
+    private let observers = NotificationObserverBag()
+
+    /// The notification centre this screen registers on. `.default` in the app;
+    /// tests inject their own so the registrations (and their removal) can be
+    /// observed. Must be set before the view loads.
+    var notificationCenter: NotificationCenter = .default
+
     // MARK: - viewDidLoad
 
     override func viewDidLoad() {
@@ -270,18 +282,22 @@ class LogViewController: UIViewController {
         toolbar.items?.last?.tintColor = UIColor(white: 0.6, alpha: 1)
         tf.inputAccessoryView = toolbar
 
-        // Notifications
-        NotificationCenter.default.addObserver(
-            forName: .consoleOutputReceived,
-            object: nil, queue: .main
-        ) { [weak self] note in
+        // Notifications.
+        // The tokens go in the bag and are removed when this screen is released:
+        // `removeObserver(self)` does NOT unregister block-based observers —
+        // those are owned by the returned token, not by `self` — so discarding
+        // them leaked one live observer per open of the debug UI, each still
+        // doing main-thread work on every log line for the rest of the host
+        // app's life.
+        observers.add(notificationCenter,
+                      forName: .consoleOutputReceived,
+                      queue: .main) { [weak self] note in
             self?.handleConsoleOutput(note)
         }
 
-        NotificationCenter.default.addObserver(
-            forName: .logEntriesUpdated,
-            object: nil, queue: .main
-        ) { [weak self] _ in
+        observers.add(notificationCenter,
+                      forName: .logEntriesUpdated,
+                      queue: .main) { [weak self] _ in
             guard let self = self, !self.isConsoleTab else { return }
             self.handleDefaultLogUpdate()
         }
@@ -627,7 +643,11 @@ class LogViewController: UIViewController {
         highlightQueue.cancelAllOperations()
         entryCache.removeAllObjects()
         defaultEntryCache.removeAllObjects()
+        // Selector-based observers (if any are ever added).
         NotificationCenter.default.removeObserver(self)
+        // Block-based observers: only the token can unregister these, and only
+        // the bag has the tokens.
+        observers.removeAll()
     }
 
     // MARK: - Visibility
@@ -695,15 +715,27 @@ class LogViewController: UIViewController {
         consoleTotalCount = totalCount
 
         let newRows = totalCount - previousCount
+        if newRows < 0 {
+            // Rows disappeared under us — Clear (the DB's deleteAll callback
+            // reports 0) or any other shrink. Swallowing this left the table's
+            // cached row count ahead of the data source, and the *next* insert
+            // was then an invalid batch update: "the number of rows contained in
+            // an existing section after the update must be equal to the number
+            // before, plus or minus the number inserted or deleted". That is the
+            // Clear-then-print crash. Resync with a full reload.
+            entryCache.removeAllObjects()
+            highlightQueue.cancelAllOperations()
+            dismissSelection()
+            consoleTableView.reloadData()
+            return
+        }
         guard newRows > 0 else { return }
 
         if newRows > 500 {
             consoleTableView.reloadData()
         } else {
             let indexPaths = (previousCount..<totalCount).map { IndexPath(row: $0, section: 0) }
-            UIView.performWithoutAnimation {
-                self.consoleTableView.insertRows(at: indexPaths, with: .none)
-            }
+            insertConsoleRows(at: indexPaths, expectedExistingRows: previousCount)
         }
 
         // Update match count if search is active
@@ -714,6 +746,57 @@ class LogViewController: UIViewController {
         if isAutoFollowing && totalCount > 0 {
             scrollToConsoleBottom(animated: false)
         }
+    }
+
+    // MARK: - Guarded batch updates
+    //
+    // Both tables are virtual: the row count comes from a count the SQLite
+    // store hands us, not from an array we own, so it can move for reasons the
+    // table view never saw (Clear, a toggle, a store trim). Every partial
+    // update therefore states the row count it believes the table is holding,
+    // and falls back to `reloadData()` when that belief is wrong — an incorrect
+    // partial update is an immediate UIKit assertion, a redundant reload is not.
+
+    private func insertConsoleRows(at indexPaths: [IndexPath], expectedExistingRows: Int) {
+        guard !indexPaths.isEmpty else { return }
+        guard consoleTableView.numberOfSections == 1,
+              consoleTableView.numberOfRows(inSection: 0) == expectedExistingRows else {
+            entryCache.removeAllObjects()
+            consoleTableView.reloadData()
+            return
+        }
+        UIView.performWithoutAnimation {
+            self.consoleTableView.insertRows(at: indexPaths, with: .none)
+        }
+    }
+
+    private func insertDefaultRows(at indexPaths: [IndexPath], expectedExistingRows: Int) {
+        guard !indexPaths.isEmpty else { return }
+        guard defaultTableView.numberOfSections == 1,
+              defaultTableView.numberOfRows(inSection: 0) == expectedExistingRows else {
+            defaultEntryCache.removeAllObjects()
+            defaultTableView.reloadData()
+            return
+        }
+        UIView.performWithoutAnimation {
+            self.defaultTableView.insertRows(at: indexPaths, with: .none)
+        }
+    }
+
+    /// `reloadRows` is a batch update too: a path past the end, or a table whose
+    /// cached count no longer matches the data source, traps exactly the same
+    /// way an insert does.
+    private func reloadConsoleRows(at indexPaths: [IndexPath]) {
+        guard !indexPaths.isEmpty else { return }
+        let rowCount = consoleRowCount
+        guard consoleTableView.numberOfSections == 1,
+              consoleTableView.numberOfRows(inSection: 0) == rowCount else {
+            consoleTableView.reloadData()
+            return
+        }
+        let valid = indexPaths.filter { $0.section == 0 && $0.row >= 0 && $0.row < rowCount }
+        guard !valid.isEmpty else { return }
+        consoleTableView.reloadRows(at: valid, with: .none)
     }
 
     /// Rebuild console from DB (tab switch, search change, initial load)
@@ -833,9 +916,7 @@ class LogViewController: UIViewController {
             }
         }
 
-        if !reloadPaths.isEmpty {
-            consoleTableView.reloadRows(at: reloadPaths, with: .none)
-        }
+        reloadConsoleRows(at: reloadPaths)
     }
 
     // MARK: - Console search (jump-to-match, no filtering)
@@ -873,7 +954,7 @@ class LogViewController: UIViewController {
 
     private func reloadVisibleConsoleCells() {
         guard let visible = consoleTableView.indexPathsForVisibleRows, !visible.isEmpty else { return }
-        consoleTableView.reloadRows(at: visible, with: .none)
+        reloadConsoleRows(at: visible)
     }
 
     /// Re-query match count when new entries arrive during active search
@@ -945,7 +1026,7 @@ class LogViewController: UIViewController {
                 reloadPaths.append(IndexPath(row: prevRow, section: 0))
             }
         }
-        consoleTableView.reloadRows(at: reloadPaths, with: .none)
+        reloadConsoleRows(at: reloadPaths)
     }
 
     // MARK: - Table data (Third Party & Web — virtual scrolling from LogModelDB)
@@ -989,9 +1070,7 @@ class LogViewController: UIViewController {
             defaultTableView.reloadData()
         } else {
             let indexPaths = (previousCount..<newCount).map { IndexPath(row: $0, section: 0) }
-            UIView.performWithoutAnimation {
-                self.defaultTableView.insertRows(at: indexPaths, with: .none)
-            }
+            insertDefaultRows(at: indexPaths, expectedExistingRows: previousCount)
         }
 
         if isDefaultAutoFollowing && newCount > 0 {

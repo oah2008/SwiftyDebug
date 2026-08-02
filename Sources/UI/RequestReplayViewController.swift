@@ -45,10 +45,22 @@ final class RequestReplayViewController: UITableViewController {
     private var params: [KV] = []
     private var headers: [KV] = []
     private var bodyText: String = ""
-    /// True once the developer types in the body field. Until then an imported
-    /// cURL body is sent as its original bytes rather than re-encoded from the
-    /// pretty-printed text.
+    /// True once the developer actually changes the body — by typing in the
+    /// field, or by saving out of the tree editor. Until then `originalBody` is
+    /// sent as-is.
     private var bodyWasEdited = false
+
+    /// The body exactly as it arrived: the captured request's bytes, or the ones
+    /// the cURL command carried.
+    ///
+    /// `bodyText` is a *display* of this, and displaying costs fidelity —
+    /// pretty-printing runs through `JSONSerialization`, which reorders every
+    /// object key, adds whitespace and respells numbers (`19.99` comes back as
+    /// `19.989999999999998`). Re-encoding the display text therefore replays a
+    /// request the app never made, and breaks any endpoint that signs or hashes
+    /// the raw payload. It also covers a body that is not UTF-8 at all, which
+    /// has no text form to re-encode and used to be dropped entirely.
+    private let originalBody: Data?
 
     /// The request as captured, before any edits — the most relevant source of
     /// header names to offer back after the user deletes one.
@@ -128,7 +140,11 @@ final class RequestReplayViewController: UITableViewController {
                 headers.append(KV(key: k, value: "\(v)"))
             }
         }
-        if let data = model.requestData, let s = String(data: data, encoding: .utf8) {
+        // Read the (disk-backed) body once and keep it: it is what actually goes
+        // back on the wire, and `bodyText` below is only its editable rendering.
+        let capturedBody = model.requestData
+        originalBody = capturedBody
+        if let data = capturedBody, let s = String(data: data, encoding: .utf8) {
             // Pretty-print JSON bodies so they're editable on a phone.
             bodyText = JSONExporter.prettyJSONString(from: s) ?? s
         }
@@ -163,6 +179,7 @@ final class RequestReplayViewController: UITableViewController {
         // A binary body (`--data-binary @file`) has no text form. Leave the field
         // empty rather than pretending there is nothing to send — `sendTapped`
         // still transmits the original bytes, and `importedSummary` says so.
+        originalBody = curl.body
         if let body = curl.bodyString {
             bodyText = JSONExporter.prettyJSONString(from: body) ?? body
         }
@@ -269,14 +286,16 @@ final class RequestReplayViewController: UITableViewController {
             return
         }
 
-        // An imported binary body has no text form, and a JSON one was
-        // pretty-printed for display — re-encoding either would change the bytes
-        // on the wire and break anything signing the raw payload. Send the
-        // original unless the developer actually edited the text.
+        // A binary body has no text form, and a JSON one was pretty-printed for
+        // display — re-encoding either would change the bytes on the wire and
+        // break anything signing the raw payload. Send the original unless the
+        // developer actually edited it. This applies to a captured request just
+        // as much as to an imported command: replaying a request has to send the
+        // request, not a re-serialisation of how it was displayed.
         let body: Data?
         if !methodSupportsBody {
             body = nil
-        } else if let original = curlImport?.body, !bodyWasEdited {
+        } else if let original = originalBody, !original.isEmpty, !bodyWasEdited {
             body = original
         } else {
             body = bodyText.isEmpty ? nil : bodyText.data(using: .utf8)
@@ -683,6 +702,16 @@ final class RequestReplayViewController: UITableViewController {
         return c
     }
 
+    /// A captured body that isn't UTF-8 has no text form, so the field stays
+    /// empty while `sendTapped` still transmits the original bytes. Say so, or
+    /// an empty field reads as "there is nothing to send". An imported command
+    /// says the same thing on its own provenance row, so it isn't repeated here.
+    private var binaryBodyNotice: String? {
+        guard curlImport == nil, !bodyWasEdited, bodyText.isEmpty,
+              let body = originalBody, !body.isEmpty else { return nil }
+        return "Binary body (\(body.count) bytes) — no text form, replayed unchanged"
+    }
+
     /// Raw editing stays exactly as it was — the shared JSON card sits above it
     /// and appears only while the text parses, so a JSON body can be reshaped in
     /// the tree editor without giving up free-form typing.
@@ -707,6 +736,14 @@ final class RequestReplayViewController: UITableViewController {
         tv.tag = 901
 
         let stack = UIStackView(arrangedSubviews: [jsonCard, tv])
+        if let notice = binaryBodyNotice {
+            let label = UILabel()
+            label.text = notice
+            label.font = .systemFont(ofSize: 11, weight: .semibold)
+            label.textColor = .systemOrange
+            label.numberOfLines = 0
+            stack.insertArrangedSubview(label, at: 1)
+        }
         stack.axis = .vertical
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -718,6 +755,9 @@ final class RequestReplayViewController: UITableViewController {
             stack.bottomAnchor.constraint(equalTo: c.contentView.bottomAnchor, constant: -2),
             tv.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
         ])
+        // `card()` sweeps before these subviews exist, so sweep again once the
+        // cell is fully assembled.
+        c.forceLTR()
         return c
     }
 
@@ -729,6 +769,10 @@ final class RequestReplayViewController: UITableViewController {
         editor.onSave = { [weak self] doc in
             guard let self else { return }
             self.bodyText = doc.prettyText()
+            // Saving out of the tree editor IS an edit. Without this the original
+            // bytes would keep winning in `sendTapped` and the whole tree edit
+            // would be thrown away without a word.
+            self.bodyWasEdited = true
             // The row is rebuilt rather than patched: the text view has to regrow
             // to the new content and the card's summary has to follow it.
             self.tableView.reloadSections(IndexSet(integer: Section.body.rawValue), with: .none)

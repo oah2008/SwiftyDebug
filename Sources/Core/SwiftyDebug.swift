@@ -63,20 +63,93 @@ public class SwiftyDebug {
     public static var enableConsoleLog = true
 
     /// Whether SwiftyDebug raises the host app's request timeouts while it is
-    /// enabled (default `true`).
+    /// enabled. **Default `false`** — enabling the SDK no longer changes your
+    /// app's networking behaviour.
     ///
-    /// A request paused at a breakpoint delivers no bytes, so the app's own
-    /// `timeoutIntervalForRequest` — an *idle* timer — would kill it long before
-    /// anyone could read it. To prevent that, the SDK raises request timeouts to
-    /// cover the hold budget (10 minutes) app-wide, for every request, whether or
-    /// not breakpoints are in use.
+    /// While `false`, every `timeoutIntervalForRequest` your app sets is passed
+    /// through untouched, and a request paused at a breakpoint survives only as
+    /// long as your app is willing to wait for it.
     ///
-    /// That is a real change to the host app's networking behaviour, so it is
-    /// switchable. Set it to `false` if your app depends on its own timeouts —
-    /// breakpoints then only survive as long as the app is willing to wait.
+    /// What turning it on costs: `timeoutIntervalForRequest` is an *idle* timer,
+    /// and a paused request delivers no bytes, so a short app timeout kills the
+    /// request before you can finish editing it. To prevent that, the SDK raises
+    /// request timeouts app-wide to the breakpoint hold budget
+    /// (`Settings.breakpointHoldSeconds`, 10 minutes by default) — **for every
+    /// request, whether or not breakpoints are in use**. Any code of yours that
+    /// depends on a request failing fast (retry ladders, "poor connection"
+    /// banners, watchdogs) will stop firing. It is a debugging aid; leave it off
+    /// unless you are actually pausing requests.
+    ///
+    /// Setting this does not retroactively change `URLSession`s that already
+    /// exist — see `setExtendTimeoutsForBreakpoints(_:)` and
+    /// `extendTimeoutsChangeEffect`.
     public static var extendTimeoutsForBreakpoints: Bool {
         get { Settings.shared.extendTimeoutsForBreakpoints }
         set { Settings.shared.extendTimeoutsForBreakpoints = newValue }
+    }
+
+    /// How far a change to `extendTimeoutsForBreakpoints` can reach right now.
+    ///
+    /// A `URLSession` copies its `URLSessionConfiguration` when it is created, so
+    /// the request timeout is frozen into every session at *its* creation time.
+    /// Flipping the setting therefore only governs sessions built afterwards.
+    public enum TimeoutChangeEffect: Equatable {
+
+        /// Nothing was built under the old value, so the next request already
+        /// behaves the new way. No restart, no prompt.
+        case appliesImmediately
+
+        /// At least one `URLSessionConfiguration` already had its timeout decided
+        /// under the old value. Sessions built from it — typically the app's
+        /// long-lived API session, created at launch — keep that timeout until
+        /// the process restarts. Sessions created from now on use the new value.
+        case restartRequiredForExistingSessions
+
+        /// `true` when the UI should offer a restart prompt.
+        public var requiresRestart: Bool { self == .restartRequiredForExistingSessions }
+
+        /// Ready-to-display explanation, so callers don't have to invent one.
+        public var message: String {
+            switch self {
+            case .appliesImmediately:
+                return "This takes effect right away."
+            case .restartRequiredForExistingSessions:
+                return "New network sessions use this immediately. Sessions your app "
+                     + "already created keep the timeout they were built with — "
+                     + "restart the app to apply it everywhere."
+            }
+        }
+    }
+
+    /// What would happen if `extendTimeoutsForBreakpoints` were changed right
+    /// now, without changing it. Use this to decide whether to warn *before*
+    /// showing a confirmation.
+    public static var extendTimeoutsChangeEffect: TimeoutChangeEffect {
+        return effect(from: CustomHTTPProtocol.timeoutSettingChangeEffect)
+    }
+
+    /// Sets `extendTimeoutsForBreakpoints` and reports how far the change
+    /// reached, so a "restart the app?" prompt is only shown when a restart is
+    /// genuinely required.
+    ///
+    /// Setting it to the value it already has is a no-op and always reports
+    /// `.appliesImmediately`.
+    @discardableResult
+    public static func setExtendTimeoutsForBreakpoints(_ enabled: Bool) -> TimeoutChangeEffect {
+        guard Settings.shared.extendTimeoutsForBreakpoints != enabled else {
+            return .appliesImmediately
+        }
+        Settings.shared.extendTimeoutsForBreakpoints = enabled
+        return extendTimeoutsChangeEffect
+    }
+
+    private static func effect(
+        from internalEffect: CustomHTTPProtocol.TimeoutSettingChangeEffect
+    ) -> TimeoutChangeEffect {
+        switch internalEffect {
+        case .appliesImmediately: return .appliesImmediately
+        case .restartRequiredForExistingSessions: return .restartRequiredForExistingSessions
+        }
     }
 
     public static func enable() {

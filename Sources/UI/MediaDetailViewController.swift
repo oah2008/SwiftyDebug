@@ -623,8 +623,18 @@ enum MediaAssetProbe {
                 finish(nil)
                 return
             }
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 20
+            // CRITICAL: `config.protocolClasses = []` above is NOT enough — the
+            // SDK swizzles the `protocolClasses` *getter*, which re-inserts
+            // CustomHTTPProtocol on every read, so the probe went out through
+            // SwiftyDebug's own protocol and was captured as if the host app had
+            // made it. That capture posts `.networkRequestCompleted`, which
+            // reloads the Media tab — the same shape as the media request loop
+            // fixed before. The recursive-request flag is what makes `canInit`
+            // bail; `ImageLoader` sets it for exactly this reason.
+            let mutable = NSMutableURLRequest(url: url)
+            mutable.timeoutInterval = 20
+            URLProtocol.setProperty(true, forKey: CustomHTTPProtocol.recursiveRequestFlagProperty, in: mutable)
+            let request = mutable as URLRequest
             session.dataTask(with: request) { data, _, _ in finish(data) }.resume()
         }
     }

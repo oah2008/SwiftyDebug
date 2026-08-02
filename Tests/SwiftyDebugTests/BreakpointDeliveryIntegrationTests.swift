@@ -158,6 +158,10 @@ final class BreakpointDeliveryIntegrationTests: XCTestCase {
         // The timeout clamp that keeps a held request alive lives in the session
         // swizzle, so it must be installed exactly as an app installs it.
         CustomHTTPProtocol.swizzleSessionConfiguration()
+        // `Settings` writes straight through to UserDefaults, which the test host and
+        // the app share — restoring a literal `true` here would permanently flip the
+        // shipped default ON for anyone who ran the suite once.
+        savedExtendTimeouts = Settings.shared.extendTimeoutsForBreakpoints
         Settings.shared.extendTimeoutsForBreakpoints = true
         Settings.shared.breakpointHoldSeconds = 600
 
@@ -170,7 +174,11 @@ final class BreakpointDeliveryIntegrationTests: XCTestCase {
         XCTAssertGreaterThan(server.port, 0, "server did not bind an ephemeral port")
     }
 
+    /// The persisted value before this test touched it, restored in tearDown.
+    private var savedExtendTimeouts = false
+
     override func tearDownWithError() throws {
+        Settings.shared.extendTimeoutsForBreakpoints = savedExtendTimeouts
         for p in BreakpointCenter.shared.pausedRequests { BreakpointCenter.shared.expire(p) }
         InterceptRuleStore.shared.removeAll()
         NetworkMonitor.shared.disable()
@@ -374,7 +382,7 @@ final class BreakpointDeliveryIntegrationTests: XCTestCase {
     /// OFF here on purpose so the raw CFNetwork behaviour is still pinned down.
     func testClientTimeoutExpiresTheParkedRowAndMakesDeliverFail() {
         Settings.shared.extendTimeoutsForBreakpoints = false
-        defer { Settings.shared.extendTimeoutsForBreakpoints = true }
+        defer { Settings.shared.extendTimeoutsForBreakpoints = savedExtendTimeouts }
         armBreakpoint(onPath: "/expire")
 
         let config = URLSessionConfiguration.default
@@ -455,7 +463,7 @@ final class BreakpointDeliveryIntegrationTests: XCTestCase {
 
     func testHostTimeoutIsUntouchedWhenTheExtensionIsOff() {
         Settings.shared.extendTimeoutsForBreakpoints = false
-        defer { Settings.shared.extendTimeoutsForBreakpoints = true }
+        defer { Settings.shared.extendTimeoutsForBreakpoints = savedExtendTimeouts }
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10

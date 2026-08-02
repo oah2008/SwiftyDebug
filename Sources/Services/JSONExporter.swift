@@ -23,17 +23,51 @@ enum JSONExporter {
     }
 
     /// Pretty-prints JSON data if it parses; nil otherwise.
+    ///
+    /// Shares one implementation with the preview — `Data.prettyPrintedJSONString()`
+    /// — for three reasons, all of which were live defects on the copy button:
+    ///
+    ///  • ORDER. A Swift dictionary is unordered, so a `JSONSerialization`
+    ///    round-trip re-emits the server's keys in hash order and respells its
+    ///    numbers. The preview and the clipboard then disagreed about the same
+    ///    body. `JSONDocument` keeps a source index of the original key order and
+    ///    number spelling and writes through it.
+    ///  • A CRASH. This function read with `.fragmentsAllowed` and wrote WITHOUT
+    ///    it, so a top-level fragment — a body of `"OK"` or `42` or `true` —
+    ///    parsed and then raised `NSInvalidArgumentException` ("Invalid top-level
+    ///    type in JSON write"). That is an ObjC exception, so `try?` does not
+    ///    catch it: tapping COPY terminated the host app.
+    ///  • AGREEMENT AT SCALE. Calling `JSONDocument` here directly, with no
+    ///    ceiling, made the clipboard contradict the screen for exactly the
+    ///    bodies that most need copying. COPY is handed the RENDERED text
+    ///    (`NetworkDetailCell` copies `rawContent`, which is the preview), and
+    ///    indenting inflates it: a 1.83 MB response renders as 2.51 MB, which is
+    ///    over `JSONDocument`'s 2 MB indexing cap, so the writer had no recorded
+    ///    order and emitted `keys.sorted()`. The screen said
+    ///    `zulu, alpha, mike, bravo`; the clipboard said `alpha, bravo, mike, zulu`.
+    ///    It also spent 1.8 s of main thread on a 10 MB body doing it.
+    ///
+    /// So: re-print while re-printing is affordable AND order-preserving;
+    /// otherwise ship the bytes we were given. Above the ceiling those bytes are
+    /// already valid JSON in the server's order — they are the preview — and
+    /// returning them is both instant and, by construction, identical to what is
+    /// on screen. The only thing given up is re-indenting a body that came in
+    /// minified and over the ceiling; it is still copied as valid JSON.
     static func prettyJSONString(from data: Data) -> String? {
-        // `.fragmentsAllowed` lets top-level strings/numbers/bools through too.
-        guard let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
-            return nil
-        }
-        let options: JSONSerialization.WritingOptions = [.prettyPrinted, .withoutEscapingSlashes]
-        guard let pretty = try? JSONSerialization.data(withJSONObject: object, options: options),
-              let string = String(data: pretty, encoding: .utf8) else {
-            return nil
-        }
-        return string
+        // NO minified shortcut here any more. Copy is the feature the maintainer
+        // cares about most, and returning the un-formatted original above a
+        // ceiling meant a big body copied differently from the small one beside
+        // it, silently. The cost is real, so `ClipboardFormatter` moves it off the
+        // main thread behind an overlay that says what is happening — which is
+        // the honest trade, rather than quietly copying less than was asked for.
+        //
+        // Callers that must NOT block (a preview being rendered, a cell) go
+        // through `Data.dataToPrettyPrintString()`, which keeps its own ceiling.
+        // Everything else, including the one case the branch above cannot serve:
+        // JSON that is not UTF-8 at all. A UTF-16 body is valid JSON that only
+        // Foundation's parser can read, and returning nil for it was a copy that
+        // silently did nothing.
+        return data.prettyPrintedJSONString(ignoringSizeCeiling: true)
     }
 
     /// Returns a clipboard-ready string for arbitrary content: valid pretty JSON

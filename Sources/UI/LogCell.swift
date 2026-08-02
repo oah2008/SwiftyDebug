@@ -448,15 +448,23 @@ class LogCell: UITableViewCell {
         return nil
     }
 
+    /// Above this, a log line is shown as-is: it is truncated for display anyway,
+    /// so re-printing it is work spent on characters nobody sees.
+    private static let jsonPrettyPrintCeiling = 8_000
+
     /// Pretty-print JSON string
     private static func prettyPrint(_ json: String) -> String? {
-        guard let data = json.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data, options: []),
-              let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
-              let result = String(data: pretty, encoding: .utf8) else {
-            return nil
-        }
-        return result
+        // Source order, via the canonical printer. A JSONSerialization round-trip
+        // here would emit HASH order — nondeterministic between runs, and worse
+        // than the sorted order it replaced.
+        // Per-cell main-thread work: `model` has a didSet that reconfigures, and
+        // the controller assigns it in cellForRowAt. Only the first
+        // `jsonTruncateLength` characters are ever displayed, so pretty-printing
+        // a 39 KB line in full cost a third of a frame to throw almost all of it
+        // away.
+        guard let data = json.data(using: .utf8) else { return nil }
+        guard json.count <= Self.jsonPrettyPrintCeiling else { return json }
+        return data.dataToPrettyPrintString()
     }
 
     private static func sourceLabel(_ source: SwiftyDebugLogSource) -> String {

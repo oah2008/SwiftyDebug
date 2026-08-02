@@ -15,6 +15,19 @@ import Foundation
 /// captured request list must **not** erase this, so the intercept editor can
 /// still offer (and pre-populate) real headers/params afterwards. Persisted to
 /// disk so it also survives app restarts. (See INTERCEPT-UX.)
+///
+/// ## What is NOT written to disk
+///
+/// This SDK is embedded in other people's apps and is not `#if DEBUG`-gated, so
+/// a host app that forgets to guard `SwiftyDebug.enable()` ships whatever this
+/// file contains. It used to contain every `Authorization: Bearer …` and
+/// `Cookie` the app had ever sent, verbatim, in Caches, forever. The **name**
+/// of a credential header is still remembered (that is what the suggestion
+/// list needs); its **value** is kept in memory for the current session only
+/// and is written out empty. See `isSensitiveName(_:)`.
+///
+/// Everything here is also bounded — see `Limits` — and `clear()` throws the
+/// whole thing away, disk included.
 final class RequestMetadataStore {
 
     static let shared = RequestMetadataStore()
@@ -23,6 +36,19 @@ final class RequestMetadataStore {
     struct Entry: Equatable {
         let name: String       // canonical casing as first seen
         var value: String      // most recent non-empty value seen
+    }
+
+    /// Hard ceilings. Nothing here expires on its own and the file lives in
+    /// Caches across launches, so every dimension it can grow along is capped.
+    enum Limits {
+        /// Longer values are truncated before being remembered.
+        static let maxValueLength = 512
+        /// Distinct names remembered per bucket.
+        static let maxNamesPerBucket = 60
+        /// Hosts tracked; least-recently-seen is evicted first.
+        static let maxHosts = 40
+        /// Normalized endpoints tracked; least-recently-seen is evicted first.
+        static let maxEndpoints = 120
     }
 
     private let lock = NSLock()
@@ -37,8 +63,23 @@ final class RequestMetadataStore {
     private var headersByEndpoint: [String: [String: Entry]] = [:]
     private var paramsByEndpoint: [String: [String: Entry]] = [:]
 
+    /// Least-recently-seen first. Drives eviction of whole host/endpoint buckets.
+    private var hostOrder: [String] = []
+    private var endpointOrder: [String] = []
+
+    /// Number of remembered names across every bucket. Maintained rather than
+    /// counted so the UI can show it from `cellForRowAt` without walking the
+    /// whole store.
+    private var entryCount = 0
+
     private init() {
         loadFromDisk()
+    }
+
+    /// Total remembered names, for display. O(1).
+    var rememberedCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return entryCount
     }
 
     // MARK: - Recording (called once per captured request)
@@ -65,12 +106,26 @@ final class RequestMetadataStore {
         guard !headerPairs.isEmpty || !paramPairs.isEmpty else { return }
 
         lock.lock()
+        if !host.isEmpty {
+            for dead in Self.evictionsAfterTouching(&hostOrder, host, cap: Limits.maxHosts) {
+                drop(&headersByHost, dead)
+                drop(&paramsByHost, dead)
+            }
+        }
+        if !endpoint.isEmpty {
+            for dead in Self.evictionsAfterTouching(&endpointOrder, endpoint, cap: Limits.maxEndpoints) {
+                drop(&headersByEndpoint, dead)
+                drop(&paramsByEndpoint, dead)
+            }
+        }
         for (k, v) in headerPairs {
+            let v = Self.bounded(v)
             merge(&globalHeaders, k, v)
             if !host.isEmpty { merge(&headersByHost[host, default: [:]], k, v) }
             if !endpoint.isEmpty { merge(&headersByEndpoint[endpoint, default: [:]], k, v) }
         }
         for (k, v) in paramPairs {
+            let v = Self.bounded(v)
             merge(&globalParams, k, v)
             if !host.isEmpty { merge(&paramsByHost[host, default: [:]], k, v) }
             if !endpoint.isEmpty { merge(&paramsByEndpoint[endpoint, default: [:]], k, v) }
@@ -80,13 +135,99 @@ final class RequestMetadataStore {
     }
 
     /// Keeps first-seen canonical casing, updates to the most recent non-empty value.
+    ///
+    /// NO-OP ON PURPOSE when the bucket is full and the name is new: refusing an
+    /// unseen name keeps everything already learned intact, which is the better
+    /// trade for a suggestion list. Values of names already present keep
+    /// updating regardless.
     private func merge(_ bucket: inout [String: Entry], _ name: String, _ value: String) {
+        if Self.mergeEntry(into: &bucket, name: name, value: value) { entryCount += 1 }
+    }
+
+    /// The bucket merge itself, with no instance state — `static` so the cap and
+    /// the casing rule can be tested without a singleton or a Caches directory.
+    /// - Returns: true when a NEW name was inserted (the caller's count changes).
+    @discardableResult
+    static func mergeEntry(into bucket: inout [String: Entry], name: String, value: String) -> Bool {
         let key = name.lowercased()
         if var existing = bucket[key] {
             if !value.isEmpty { existing.value = value; bucket[key] = existing }
-        } else {
-            bucket[key] = Entry(name: name, value: value)
+            return false
         }
+        guard bucket.count < Limits.maxNamesPerBucket else { return false }
+        bucket[key] = Entry(name: name, value: value)
+        return true
+    }
+
+    /// Truncates a value to `Limits.maxValueLength`.
+    static func bounded(_ value: String) -> String {
+        value.count <= Limits.maxValueLength ? value : String(value.prefix(Limits.maxValueLength))
+    }
+
+    /// Moves `key` to the most-recently-seen end of `order` and returns whatever
+    /// had to be evicted to stay under `cap`.
+    static func evictionsAfterTouching(_ order: inout [String], _ key: String, cap: Int) -> [String] {
+        if let idx = order.firstIndex(of: key) { order.remove(at: idx) }
+        order.append(key)
+        var evicted: [String] = []
+        while order.count > cap { evicted.append(order.removeFirst()) }
+        return evicted
+    }
+
+    /// Removes a whole host/endpoint bucket, keeping `entryCount` honest.
+    private func drop(_ map: inout [String: [String: Entry]], _ key: String) {
+        if let removed = map.removeValue(forKey: key) { entryCount -= removed.count }
+    }
+
+    // MARK: - Redaction
+
+    /// True when a header or query-parameter NAME identifies a credential, i.e.
+    /// something whose value must never be written to disk.
+    ///
+    /// Deliberately errs toward redacting: a false positive costs one
+    /// pre-filled suggestion, a false negative writes a live bearer token into
+    /// Caches on a stranger's phone.
+    static func isSensitiveName(_ rawName: String) -> Bool {
+        let name = rawName.lowercased()
+        // Unambiguous wherever they appear inside the name.
+        for needle in ["authorization", "authentication", "cookie", "token",
+                       "secret", "password", "passwd", "credential", "signature",
+                       "apikey", "api-key", "api_key", "session", "bearer"] {
+            if name.contains(needle) { return true }
+        }
+        // Too short or too common to match as substrings — "key" would redact
+        // `Keyboard-Locale`, "sig" would redact `X-Design-Id` — so these only
+        // count as a whole `-`/`_`/`.`-separated component.
+        let sensitiveComponents: Set<String> = [
+            "auth", "key", "keys", "sig", "pwd", "pass", "jwt", "otp",
+            "csrf", "xsrf", "nonce", "assertion", "code",
+        ]
+        return name.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .contains { sensitiveComponents.contains(String($0)) }
+    }
+
+    // MARK: - Clearing
+
+    /// Forgets every remembered name and value and deletes the file.
+    ///
+    /// The store had no reset path at all: it survived Clear, survived
+    /// `fullStop()`, and outlived the requests it was learned from. Reachable
+    /// from App ▸ Actions ▸ "Clear Remembered Headers".
+    func clear() {
+        lock.lock()
+        globalHeaders.removeAll()
+        globalParams.removeAll()
+        headersByHost.removeAll()
+        paramsByHost.removeAll()
+        headersByEndpoint.removeAll()
+        paramsByEndpoint.removeAll()
+        hostOrder.removeAll()
+        endpointOrder.removeAll()
+        entryCount = 0
+        lock.unlock()
+        // A save may already be queued; it would simply write the empty state
+        // back out, so there is nothing to cancel.
+        try? FileManager.default.removeItem(at: fileURL)
     }
 
     // MARK: - Lookup
@@ -234,13 +375,36 @@ final class RequestMetadataStore {
         }
     }
 
+    /// Serializes a bucket, **dropping the value of anything credential-shaped**.
+    ///
+    /// The name still goes out, because that is what the suggestion list is
+    /// built from; only the secret itself is withheld. Nothing else in this
+    /// class writes to the file, so this is the single choke point for
+    /// "what ends up at rest".
     private func encode(_ bucket: [String: Entry]) -> [String: [String]] {
-        bucket.mapValues { [$0.name, $0.value] }
+        var out: [String: [String]] = [:]
+        out.reserveCapacity(bucket.count)
+        for (key, entry) in bucket {
+            out[key] = Self.persistedPair(for: entry)
+        }
+        return out
     }
+
+    /// Exactly what one entry looks like on disk: the name always, the value
+    /// only when it is not a credential.
+    static func persistedPair(for entry: Entry) -> [String] {
+        [entry.name, isSensitiveName(entry.name) ? "" : entry.value]
+    }
+
+    /// Reads a bucket back, applying the same caps as the live path so a file
+    /// written by an older, unbounded build cannot reintroduce unbounded state.
+    /// Returns nil values dropped and the bucket truncated to the cap.
     private func decode(_ raw: [String: [String]]) -> [String: Entry] {
         var out: [String: Entry] = [:]
-        for (k, arr) in raw where arr.count == 2 {
-            out[k] = Entry(name: arr[0], value: arr[1])
+        for k in raw.keys.sorted() {
+            guard out.count < Limits.maxNamesPerBucket,
+                  let arr = raw[k], arr.count == 2 else { continue }
+            out[k] = Entry(name: arr[0], value: Self.bounded(arr[1]))
         }
         return out
     }
@@ -268,15 +432,46 @@ final class RequestMetadataStore {
             guard let raw = root[key] as? [String: [String]] else { return [:] }
             return decode(raw)
         }
-        func nested(_ key: String) -> [String: [String: Entry]] {
+        /// Caps the number of host/endpoint buckets too. Which ones survive is
+        /// arbitrary (the file records no recency), so it is at least stable.
+        func nested(_ key: String, cap: Int) -> [String: [String: Entry]] {
             guard let raw = root[key] as? [String: [String: [String]]] else { return [:] }
-            return raw.mapValues { decode($0) }
+            var out: [String: [String: Entry]] = [:]
+            for k in raw.keys.sorted() {
+                guard out.count < cap, let inner = raw[k] else { continue }
+                out[k] = decode(inner)
+            }
+            return out
         }
         globalHeaders = bucket("globalHeaders")
         globalParams = bucket("globalParams")
-        headersByHost = nested("headersByHost")
-        paramsByHost = nested("paramsByHost")
-        headersByEndpoint = nested("headersByEndpoint")
-        paramsByEndpoint = nested("paramsByEndpoint")
+        headersByHost = nested("headersByHost", cap: Limits.maxHosts)
+        paramsByHost = nested("paramsByHost", cap: Limits.maxHosts)
+        headersByEndpoint = nested("headersByEndpoint", cap: Limits.maxEndpoints)
+        paramsByEndpoint = nested("paramsByEndpoint", cap: Limits.maxEndpoints)
+
+        hostOrder = Array(Set(headersByHost.keys).union(paramsByHost.keys)).sorted()
+        endpointOrder = Array(Set(headersByEndpoint.keys).union(paramsByEndpoint.keys)).sorted()
+
+        entryCount = globalHeaders.count + globalParams.count
+            + headersByHost.values.reduce(0) { $0 + $1.count }
+            + paramsByHost.values.reduce(0) { $0 + $1.count }
+            + headersByEndpoint.values.reduce(0) { $0 + $1.count }
+            + paramsByEndpoint.values.reduce(0) { $0 + $1.count }
+
+        // A file written by a build that predates redaction still holds live
+        // bearer tokens and cookies. Rewrite it now — redacted, by `encode` —
+        // instead of waiting for the next request to happen to trigger a save.
+        // The values stay in memory for this session; only the disk copy loses
+        // them.
+        var allBuckets: [[String: Entry]] = [globalHeaders, globalParams]
+        allBuckets.append(contentsOf: headersByHost.values)
+        allBuckets.append(contentsOf: paramsByHost.values)
+        allBuckets.append(contentsOf: headersByEndpoint.values)
+        allBuckets.append(contentsOf: paramsByEndpoint.values)
+        let hasLegacySecretsAtRest = allBuckets.contains { bucket in
+            bucket.values.contains { !$0.value.isEmpty && Self.isSensitiveName($0.name) }
+        }
+        if hasLegacySecretsAtRest { scheduleSave() }
     }
 }

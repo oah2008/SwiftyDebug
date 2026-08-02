@@ -306,14 +306,57 @@ private final class MediaThumbCell: UICollectionViewCell {
 final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UIGestureRecognizerDelegate {
 
     private let imageURLs: [String]
+    /// The page the user is on. Also the centre of the live window.
     private var startIndex: Int
     private let pageScroll = UIScrollView()
-    private var pages: [UIScrollView] = []
+
+    /// The pages that currently exist, keyed by index — **not** one per URL.
+    ///
+    /// Every page used to be built up front and loaded at `maxPixel: 0`, i.e.
+    /// decoded at full resolution. A 12 MP asset is ~48 MB decoded, so opening a
+    /// gallery of large images asked for hundreds of megabytes at once and got
+    /// the host app jetsammed instead. Only the visible page and its two
+    /// neighbours are alive now, and they are downsampled to the screen.
+    private var pages: [Int: UIScrollView] = [:]
+    /// In-flight image loads, so a page leaving the window cancels its download
+    /// instead of decoding into a view that is already gone.
+    private var tokens: [Int: ImageLoader.Token] = [:]
+
     private let closeButton = UIButton(type: .system)
     private let counterLabel = UILabel()
 
     /// 44pt hit target, per HIG minimum.
     private static let closeButtonSize: CGFloat = 44
+
+    /// Tag of the `UIImageView` inside each zoom page.
+    private static let imageViewTag = 100
+
+    /// Which pages exist at once: the current one and its immediate neighbours,
+    /// so a swipe never lands on an empty page and the count never grows with
+    /// the size of the gallery.
+    ///
+    /// Pure, and clamped to `count`, so the window is testable without a screen.
+    static func windowedIndices(around index: Int, count: Int) -> Set<Int> {
+        guard count > 0 else { return [] }
+        let current = max(0, min(index, count - 1))
+        var window: Set<Int> = [current]
+        if current - 1 >= 0 { window.insert(current - 1) }
+        if current + 1 < count { window.insert(current + 1) }
+        return window
+    }
+
+    /// Longest side, in device pixels, a full-screen page is decoded to.
+    ///
+    /// Never 0: `ImageLoader` reads 0 as "decode at full resolution", which is
+    /// the defect this replaced. Sharpness past 1x zoom is the price; being
+    /// killed by the OS is the alternative.
+    static func pageMaxPixel(forScreenSize size: CGSize, scale: CGFloat) -> CGFloat {
+        let longest = max(size.width, size.height)
+        return max(640, (longest * max(1, scale)).rounded())
+    }
+
+    /// Test hook: the pages that are actually built right now.
+    var loadedPageIndices: Set<Int> { Set(pages.keys) }
 
     init(imageURLs: [String], startIndex: Int) {
         self.imageURLs = imageURLs
@@ -400,47 +443,79 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
     }
 
     private var didInitialScroll = false
+
     private func layoutPages() {
         let pageWidth = view.bounds.width
-        let pageHeight = view.bounds.height
         pageScroll.frame = view.bounds
+        pageScroll.contentSize = CGSize(width: pageWidth * CGFloat(imageURLs.count),
+                                        height: view.bounds.height)
 
-        if pages.isEmpty {
-            for urlString in imageURLs {
-                let zoom = UIScrollView()
-                zoom.minimumZoomScale = 1
-                zoom.maximumZoomScale = 4
-                zoom.delegate = self
-                zoom.showsHorizontalScrollIndicator = false
-                zoom.showsVerticalScrollIndicator = false
-
-                let iv = UIImageView()
-                iv.contentMode = .scaleAspectFit
-                iv.tag = 100
-                zoom.addSubview(iv)
-                pageScroll.addSubview(zoom)
-                pages.append(zoom)
-
-                // Full-size load (maxPixel 0) for the pager.
-                ImageLoader.shared.loadImage(urlString: urlString, maxPixel: 0) { [weak iv] image in
-                    iv?.image = image
-                }
-            }
-        }
-
-        pageScroll.contentSize = CGSize(width: pageWidth * CGFloat(pages.count), height: pageHeight)
-        for (i, zoom) in pages.enumerated() {
-            zoom.frame = CGRect(x: pageWidth * CGFloat(i), y: 0, width: pageWidth, height: pageHeight)
-            zoom.zoomScale = 1
-            if let iv = zoom.viewWithTag(100) {
-                iv.frame = zoom.bounds
-            }
-        }
-
-        if !didInitialScroll {
+        // Before building the window, so the window is centred on the page the
+        // caller asked for rather than on page 0.
+        if !didInitialScroll, pageWidth > 0 {
             didInitialScroll = true
             pageScroll.setContentOffset(CGPoint(x: pageWidth * CGFloat(startIndex), y: 0), animated: false)
         }
+
+        // A layout pass means the geometry changed (rotation, safe area), so the
+        // zoom the user had no longer maps to anything.
+        refreshWindow(resettingZoom: true)
+    }
+
+    /// Builds the pages inside the window, throws away the ones outside it, and
+    /// frames what is left. The single place that decides which bitmaps exist.
+    private func refreshWindow(resettingZoom: Bool) {
+        let pageWidth = view.bounds.width
+        let pageHeight = view.bounds.height
+        let wanted = Self.windowedIndices(around: startIndex, count: imageURLs.count)
+
+        for index in Array(pages.keys) where !wanted.contains(index) { discardPage(at: index) }
+
+        for index in wanted {
+            let existing = pages[index]
+            let page = existing ?? makePage(at: index)
+            page.frame = CGRect(x: pageWidth * CGFloat(index), y: 0, width: pageWidth, height: pageHeight)
+            if resettingZoom || existing == nil { page.zoomScale = 1 }
+            page.viewWithTag(Self.imageViewTag)?.frame = page.bounds
+        }
+    }
+
+    private func makePage(at index: Int) -> UIScrollView {
+        let zoom = UIScrollView()
+        zoom.minimumZoomScale = 1
+        zoom.maximumZoomScale = 4
+        zoom.delegate = self
+        zoom.showsHorizontalScrollIndicator = false
+        zoom.showsVerticalScrollIndicator = false
+
+        let iv = UIImageView()
+        iv.contentMode = .scaleAspectFit
+        iv.tag = Self.imageViewTag
+        zoom.addSubview(iv)
+        pageScroll.addSubview(zoom)
+        pages[index] = zoom
+        // Pages are built throughout the pager's life now, so each one forces its
+        // own direction — `viewDidLoad`'s recursive pass cannot reach them.
+        zoom.forceLTR()
+
+        guard imageURLs.indices.contains(index) else { return zoom }
+        let maxPixel = Self.pageMaxPixel(forScreenSize: UIScreen.main.bounds.size,
+                                         scale: UIScreen.main.scale)
+        tokens[index] = ImageLoader.shared.loadImage(urlString: imageURLs[index],
+                                                     maxPixel: maxPixel) { [weak iv] image in
+            iv?.image = image
+        }
+        return zoom
+    }
+
+    private func discardPage(at index: Int) {
+        tokens[index]?.cancel()
+        tokens[index] = nil
+        if let page = pages[index] {
+            (page.viewWithTag(Self.imageViewTag) as? UIImageView)?.image = nil
+            page.removeFromSuperview()
+        }
+        pages[index] = nil
     }
 
     private func updateCounter() {
@@ -451,7 +526,7 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
     // MARK: - UIScrollViewDelegate
 
     func viewForZooming(in scrollView: UIScrollView) -> UIView? {
-        return scrollView.viewWithTag(100)
+        return scrollView.viewWithTag(Self.imageViewTag)
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -461,6 +536,9 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
         if clamped != startIndex {
             startIndex = clamped
             updateCounter()
+            // The window follows the user: the page they just left is dropped and
+            // the one they are heading for is built, one swipe ahead of the swipe.
+            refreshWindow(resettingZoom: false)
         }
     }
 
@@ -474,7 +552,7 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         // Don't hijack a swipe while the user is panning a zoomed-in image.
         guard gestureRecognizer is UISwipeGestureRecognizer else { return true }
-        let zoomed = pages.contains { $0.zoomScale > 1.01 }
+        let zoomed = pages.values.contains { $0.zoomScale > 1.01 }
         return !zoomed
     }
 

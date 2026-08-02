@@ -5,8 +5,8 @@ An in-app debugging tool for iOS. Shake your device to inspect every network req
 No external dependencies. UIKit. iOS 15+.
 
 ```swift
-SwiftyDebug.monitorAllUrls = true
-SwiftyDebug.enable()
+SwiftyDebug.monitorAllUrls = true   // configure first…
+SwiftyDebug.enable()                // …then enable
 ```
 
 ---
@@ -79,7 +79,7 @@ func application(_ application: UIApplication,
 
     #if DEBUG
     SwiftyDebug.monitorAllUrls = true      // capture everything
-    SwiftyDebug.monitorMedia   = false     // skip images/video/audio/fonts
+    SwiftyDebug.monitorMedia   = true      // include images/video/audio/fonts
     SwiftyDebug.enableConsoleLog = true
 
     SwiftyDebug.addTag(keyword: "algolia", label: "Search")
@@ -91,6 +91,8 @@ func application(_ application: UIApplication,
     return true
 }
 ```
+
+**Configure before `enable()`.** `enable()` reads these properties, so everything you assign above it takes effect on every launch — including relaunches after somebody has been flipping the App tab's toggles. See [Things to know](#things-to-know-before-you-integrate) for the one edge that assignment cannot express.
 
 To capture only certain hosts, leave `monitorAllUrls` off and list them:
 
@@ -349,15 +351,18 @@ SwiftyDebug.monitorAllUrls: Bool            // default false
 SwiftyDebug.monitorMedia: Bool              // default false
 SwiftyDebug.enableConsoleLog: Bool          // default true
 
-// Raises host-app request timeouts so paused requests survive. Default true.
+// Raises host-app request timeouts so paused requests survive. Default FALSE.
 SwiftyDebug.extendTimeoutsForBreakpoints: Bool
+SwiftyDebug.extendTimeoutsChangeEffect: TimeoutChangeEffect          // preview, changes nothing
+SwiftyDebug.setExtendTimeoutsForBreakpoints(_:) -> TimeoutChangeEffect
 
 // Tags — a URL substring becomes a labelled pill in the list
 SwiftyDebug.addTag(keyword: String, label: String)
 SwiftyDebug.removeTag(keyword: String)
 SwiftyDebug.removeAllTags()
 
-// Lifecycle — main thread only
+// Lifecycle — main thread only. Assign the properties above BEFORE enable().
+// enable() is safe to call more than once and also reverses a full stop.
 SwiftyDebug.enable()
 SwiftyDebug.disable()
 
@@ -375,15 +380,23 @@ print(_ message: T, color: UIColor = .white)
 
 ## Things to know before you integrate
 
-**It raises your app's request timeouts.** While the SDK is enabled, `timeoutIntervalForRequest` is raised to the breakpoint hold budget — **600 seconds by default** — app-wide, whether or not you use breakpoints. A held request delivers no bytes, so an idle timer would kill it before you could look. This is a real change to your app's networking behaviour. Turn it off with `SwiftyDebug.extendTimeoutsForBreakpoints = false` if your app depends on its own timeouts — breakpoints then only survive as long as the app is willing to wait.
+**Request timeouts are left alone unless you opt in.** A request paused at a breakpoint delivers no bytes, so your app's own idle timeout would kill it before you could edit it. Turning on **Extend Request Timeouts** (App tab, or `SwiftyDebug.extendTimeoutsForBreakpoints = true`) raises request timeouts app-wide to the hold budget — ~10 minutes, for *every* request, not just paused ones — so retry ladders, watchdogs and "poor connection" banners stop firing while it's on. It is **off by default**; the SDK never touches your timeouts until you ask.
 
-**`monitorAllUrls` and `monitorMedia` set before `enable()` are overwritten** by the persisted values of the App tab toggles from the previous launch. Set them from the App tab, or reassign after `enable()`.
+`URLSession` copies its configuration at init, so sessions your app has already built keep their old timeout either way. Use `SwiftyDebug.setExtendTimeoutsForBreakpoints(_:)`, which returns a `TimeoutChangeEffect` telling you whether a relaunch is needed; the App tab toggle prompts you automatically.
+
+**`monitorAllUrls` and `monitorMedia` set to `true` before `enable()` always win.** The matching App tab toggles are persisted across launches, and `enable()` reconciles the two: if your code asked for capture, capture happens and the toggle is switched on to match, so the App tab never shows an OFF switch sitting over a live capture. If your code left the flag alone, last launch's toggle decides — so a toggle somebody switched on in the app is still on after a relaunch.
+
+The one thing assignment cannot express is *off*: `SwiftyDebug.monitorMedia = false` is indistinguishable from never assigning it, because both leave a `public static var` at its default. It declines to force media capture on; it does not force off a toggle the user switched on from the App tab. Switch it off from the App tab.
 
 **The "Network Requests" toggle only hides the list.** Capture continues. To actually stop, shake with **Full Stop on Disable** on.
 
 **`disable()` is a partial stop.** It hides the overlay, unregisters the URLProtocol and mutes `print` capture, but leaves OSLog polling, WebView capture and installed swizzles running. The complete stop is the shake gesture with **Full Stop on Disable** enabled, which flips an atomic kill switch, releases held requests, tears down the log hooks and disables WebView capture. A handful of one-way swizzles stay installed and pass straight through.
 
-**Captured requests are never evicted.** The list grows for the lifetime of the process until you clear it. Bodies live under `Caches`, so iOS may purge them under storage pressure.
+**`enable()` reverses a full stop.** Clearing the kill switch is the first thing it does, so calling it again after a full stop restores network capture, log capture and WebView capture rather than handing you a UI that records nothing.
+
+**The list holds the most recent 1500 requests.** Past that, the oldest *unpinned* ones are evicted and their bodies deleted from disk. Pinned requests are never evicted, so a list that is entirely pinned deliberately grows past the limit. Bodies live under `Caches`, so iOS may also purge them under storage pressure.
+
+**Bodies captured by a previous run are deleted once, at the first `enable()`.** Calling `enable()` again in the same process — a re-entrant setup, a second scene — does not re-sweep, so it never deletes what the session has already captured.
 
 **The debug UI is always left-to-right**, even inside an RTL host app. Your app is unaffected.
 

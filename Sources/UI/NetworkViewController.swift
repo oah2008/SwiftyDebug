@@ -118,6 +118,16 @@ class NetworkViewController: UIViewController {
     private var layoutToggleButton: UIButton!
     /// Arms body search (BODY-SEARCH). Default OFF.
 
+    /// Every block-based notification registration this controller makes.
+    ///
+    /// `NotificationCenter.removeObserver(self)` in `deinit` does **not**
+    /// unregister these: the observer of a block registration is the opaque token
+    /// the call returns, not `self`. Discarding the token leaks the registration —
+    /// one more per debug-UI open, each doing main-thread work on every single
+    /// request for the rest of the process's life. The bag holds the tokens and
+    /// hands them back on dealloc. (See OBSERVER-LEAK.)
+    private let observers = NotificationObserverBag()
+
     // Body search UI + scan bookkeeping (BODY-SEARCH)
     private var scanBanner: BodySearchProgressBanner?
     private var activeScanToken: BodySearchCancellationToken?
@@ -1107,7 +1117,11 @@ class NetworkViewController: UIViewController {
 
     //MARK: - private
     func reloadHttp() {
-        self.models = (NetworkRequestStore.shared.httpModels as NSArray as? [NetworkTransaction])
+        // `snapshot()` copies under the store's lock. Bridging the store's live
+        // NSMutableArray here instead enumerated it on the main thread while the
+        // URLProtocol threads were still adding to it — "Collection was mutated
+        // while being enumerated", in the host app, just for having this screen open.
+        self.models = NetworkRequestStore.shared.snapshot()
         self.cacheModels = self.models
 
         applyFilter()
@@ -1170,9 +1184,7 @@ class NetworkViewController: UIViewController {
         // Paused-requests button — only visible while something is actually on
         // hold at a breakpoint, so held requests are impossible to miss.
         // (See BREAKPOINTS.)
-        NotificationCenter.default.addObserver(
-            forName: .breakpointsDidChange, object: nil, queue: .main
-        ) { [weak self] _ in
+        observers.add(forName: .breakpointsDidChange) { [weak self] _ in
             self?.refreshBreakpointBadge()
         }
         refreshBreakpointBadge()
@@ -1233,14 +1245,23 @@ class NetworkViewController: UIViewController {
         updateAdvancedSearchButton()
 
         //notification
-        NotificationCenter.default.addObserver(forName: .networkRequestCompleted, object: nil, queue: OperationQueue.main) { [weak self] _ in
+        observers.add(forName: .networkRequestCompleted) { [weak self] _ in
             self?.reloadHttp()
         }
 
         // A clear wipes every transaction id the body-search results point at, so
         // drop the parked results (the shared BodySearchCache clears itself too).
-        NotificationCenter.default.addObserver(forName: .allLogsCleared, object: nil, queue: OperationQueue.main) { [weak self] _ in
-            self?.discardAllBodyResults()
+        observers.add(forName: .allLogsCleared) { [weak self] _ in
+            guard let self = self else { return }
+            self.discardAllBodyResults()
+            // ...and then re-read the store. A clear performed anywhere else —
+            // the App tab's "Clear Pinned Requests", which deletes the pinned
+            // models AND their files — otherwise left `cacheModels` holding them,
+            // so the Pinned tab kept rendering rows for requests that no longer
+            // existed in memory or on disk, and tapping one opened a detail
+            // screen for an already-erased body. Nothing corrected it until an
+            // unrelated request happened to complete.
+            self.reloadHttp()
         }
 
         tableView.tableFooterView = UIView()
@@ -1530,6 +1551,8 @@ class NetworkViewController: UIViewController {
     deinit {
         activeScanToken?.cancel()
         scanDebounceTimer?.invalidate()
+        // Selector-based registrations only. The block-based ones are the bag's,
+        // and it unregisters them when it deallocates with this controller.
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -1628,7 +1651,7 @@ class NetworkViewController: UIViewController {
         NetworkRequestStore.shared.reset()
 
         // Reload from store so pinned requests remain visible
-        let remaining = (NetworkRequestStore.shared.httpModels as NSArray as? [NetworkTransaction]) ?? []
+        let remaining = NetworkRequestStore.shared.snapshot()
         cacheModels = remaining
         groupedModels = []
         // DO NOT clear filters — they persist across clears
@@ -2056,3 +2079,42 @@ private final class BodySearchProgressBanner: UIView {
     @objc private func cancelTapped() { onCancel?() }
 }
 
+// MARK: - Block-observer ownership
+
+/// Holds block-based `NotificationCenter` registrations and takes them back when
+/// it deallocates.
+///
+/// `addObserver(forName:object:queue:using:)` registers the *token it returns*,
+/// not the object that called it, so the usual `removeObserver(self)` in `deinit`
+/// silently unregisters nothing and the block outlives its owner. Inside an SDK
+/// embedded in someone else's app that is not a slow leak — the debug UI can be
+/// opened and closed dozens of times in a session, and every leaked registration
+/// keeps hopping onto the main queue for every request forever after.
+///
+/// Any view controller in this SDK that registers a block observer should own one
+/// of these instead of holding the tokens by hand.
+final class NotificationObserverBag {
+
+    private var tokens: [(center: NotificationCenter, token: NSObjectProtocol)] = []
+
+    /// Live registrations. Read by tests; there is no other reason to look.
+    var count: Int { tokens.count }
+
+    @discardableResult
+    func add(_ center: NotificationCenter = .default,
+             forName name: Notification.Name,
+             object: Any? = nil,
+             queue: OperationQueue? = .main,
+             using block: @escaping (Notification) -> Void) -> NSObjectProtocol {
+        let token = center.addObserver(forName: name, object: object, queue: queue, using: block)
+        tokens.append((center, token))
+        return token
+    }
+
+    func removeAll() {
+        for entry in tokens { entry.center.removeObserver(entry.token) }
+        tokens.removeAll()
+    }
+
+    deinit { removeAll() }
+}
