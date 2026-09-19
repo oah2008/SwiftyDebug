@@ -242,7 +242,7 @@ class RequestDiffViewController: UIViewController {
         var text = "A: \(leftSnapshot.displayTitle)  [\(leftSnapshot.statusCode)]\n"
         text += "B: \(rightSnapshot.displayTitle)  [\(rightSnapshot.statusCode)]\n\n"
         text += RequestDiff.plainText(result, changesOnly: changesOnly)
-        UIPasteboard.general.string = text
+        ClipboardFormatter.copyVerbatim(text)
 
         let checkIcon = UIImage(systemName: "checkmark",
                                 withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .medium))
@@ -327,11 +327,11 @@ extension RequestDiffViewController: UITableViewDelegate {
         // Copying the value is the reason you found the row in the first place.
         switch row.change {
         case .added, .same:
-            UIPasteboard.general.string = row.newValue ?? row.oldValue ?? ""
+            ClipboardFormatter.copyVerbatim(row.newValue ?? row.oldValue ?? "")
         case .removed:
-            UIPasteboard.general.string = row.oldValue ?? ""
+            ClipboardFormatter.copyVerbatim(row.oldValue ?? "")
         case .changed:
-            UIPasteboard.general.string = "\(row.label)\n- \(row.oldValue ?? "")\n+ \(row.newValue ?? "")"
+            ClipboardFormatter.copyVerbatim("\(row.label)\n- \(row.oldValue ?? "")\n+ \(row.newValue ?? "")")
         }
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }

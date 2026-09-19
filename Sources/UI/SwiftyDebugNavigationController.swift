@@ -9,30 +9,83 @@ import UIKit
 
 class SwiftyDebugNavigationController: UINavigationController {
 
-    /// A back arrow that cannot mirror itself, whatever direction UIKit resolves
-    /// where it draws it.
+    /// UIKit's back indicator, kept only so the bar reserves the same metrics and
+    /// so a screen that somehow escapes the custom button below still shows a
+    /// left-pointing glyph in LTR.
     ///
-    /// UIKit's own back indicator is `chevron.backward`, and that glyph flips two
-    /// independent ways: its image asset carries a right-to-left variant, and
-    /// UIKit hands the button the image with `flipsForRightToLeftLayoutDirection`
-    /// turned on, so `UIImageView` mirrors it as well. Both are decided at draw
-    /// time from the resolved direction of UIKit's *private* image view — never
-    /// from the bar's `semanticContentAttribute`, which is why forcing that moved
-    /// the button to the left edge but left the arrow pointing right.
-    ///
-    /// Measured on a pushed bar: that private image view is created on push, long
-    /// after `viewDidLoad`, with `semanticContentAttribute == .unspecified` and no
-    /// trait override of its own — so it inherits its direction and nothing else.
-    /// The chain it inherits through is the SDK window's `traitOverrides` pin,
-    /// which does not exist before iOS 17 and is compiled out entirely on an
-    /// iOS 15/16 host. One broken link and the arrow comes back mirrored.
-    ///
-    /// `chevron.left` is geometric rather than semantic: its asset resolves to the
-    /// same left-pointing image under an RTL trait collection, and its
-    /// `flipsForRightToLeftLayoutDirection` is false. Both mirroring paths are
-    /// disarmed at the source, on every iOS version. It renders pixel-identically
-    /// to the default indicator in LTR, so nothing about the bar looks different.
+    /// It is NOT the guarantee, and the comment that used to stand here claiming
+    /// it was is wrong: handing UIKit a glyph whose
+    /// `flipsForRightToLeftLayoutDirection` is false does not stop the mirroring,
+    /// because UIKit installs a copy made with
+    /// `imageFlippedForRightToLeftLayoutDirection()` regardless — measured on a
+    /// pushed bar, the bar's image view reports `flips == true` either way. The
+    /// arrow's direction then rests entirely on a private image view created on
+    /// push, which is exactly the link that breaks. `SwiftyDebugBackButton` owns
+    /// the control instead.
     private static let nonMirroringBackIndicator = UIImage(systemName: "chevron.left")
+
+    /// Installs SwiftyDebug's own back button on every pushed screen, so no screen
+    /// depends on UIKit's indicator. The root has no back button, and gets the
+    /// close control from `SwiftyDebugTabBarController`.
+    ///
+    /// The button is ADDED to `leftBarButtonItems` rather than assigned over
+    /// `leftBarButtonItem`. Several SDK screens set their own left item in
+    /// `viewDidLoad` — which runs after a push-time assignment — and an assignment
+    /// here would be overwritten while `hidesBackButton` stayed true, leaving a
+    /// screen with no way back at all. Installing from `willShow` (after
+    /// `viewDidLoad`) and inserting at the front makes both survive.
+    private func installBackButton(on controller: UIViewController) {
+        guard !viewControllers.isEmpty else { return }
+        guard controller !== viewControllers.first else { return }   // the root has no back
+
+        var items = controller.navigationItem.leftBarButtonItems ?? []
+        if items.contains(where: { $0.customView is SwiftyDebugBackButton }) { return }
+
+        let button = SwiftyDebugBackButton(title: "Back", target: self, action: #selector(popFromBackButton))
+        items.insert(UIBarButtonItem(customView: button), at: 0)
+        controller.navigationItem.leftBarButtonItems = items
+        controller.navigationItem.hidesBackButton = true
+    }
+
+    @objc private func popFromBackButton() {
+        popViewController(animated: true)
+    }
+
+    override func pushViewController(_ viewController: UIViewController, animated: Bool) {
+        applyForcedLTR(to: viewController)
+        super.pushViewController(viewController, animated: animated)
+        installBackButton(on: viewController)
+    }
+
+    override func setViewControllers(_ viewControllers: [UIViewController], animated: Bool) {
+        viewControllers.forEach { applyForcedLTR(to: $0) }
+        super.setViewControllers(viewControllers, animated: animated)
+        viewControllers.dropFirst().forEach { installBackButton(on: $0) }
+    }
+
+    /// Pre-iOS-17 there is no `traitOverrides`, and the window's `traitCollection`
+    /// override is not a supported propagation mechanism. `setOverrideTraitCollection`
+    /// IS, and it is the only way a child controller on iOS 15/16 inherits the
+    /// pinned direction — which is what direction-aware images resolve from.
+    ///
+    /// Deliberately does NOT touch `controller.view`: that would force `loadView`
+    /// and run `viewDidLoad` while `navigationController` is still nil, which at
+    /// least one SDK screen (`AppContainerBrowserViewController`, which installs a
+    /// `navigationItem.searchController` there) does not survive. The window's
+    /// sweep covers the view once it is on screen.
+    private func applyForcedLTR(to controller: UIViewController) {
+        if #unavailable(iOS 17.0) {
+            setOverrideTraitCollection(UITraitCollection(layoutDirection: .leftToRight),
+                                       forChild: controller)
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        // The bar's internals are rebuilt on every push and pop; re-assert rather
+        // than relying on a one-time stamp.
+        navigationBar.pinLeftToRight()
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -87,5 +140,39 @@ class SwiftyDebugNavigationController: UINavigationController {
         navigationBar.backIndicatorTransitionMaskImage = backIndicator
 
         view.forceLTR()
+
+        // `willShow` runs after the pushed screen's `viewDidLoad`, which is the
+        // only point at which the back button cannot be overwritten by a screen
+        // that sets its own left item.
+        if delegate == nil { delegate = self }
+
+        // Hiding UIKit's back button disables the interactive pop gesture, and a
+        // swipe-back that silently stops working is a worse regression than a
+        // mirrored arrow. Own the recognizer too.
+        interactivePopGestureRecognizer?.delegate = self
+    }
+}
+
+// MARK: - Keeping swipe-back alive
+
+extension SwiftyDebugNavigationController: UINavigationControllerDelegate, UIGestureRecognizerDelegate {
+
+    func navigationController(_ navigationController: UINavigationController,
+                              willShow viewController: UIViewController,
+                              animated: Bool) {
+        installBackButton(on: viewController)
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === interactivePopGestureRecognizer else { return true }
+        // UIKit disables its own pop gesture once `hidesBackButton` is set, and
+        // replacing the delegate to re-arm it also replaces the checks UIKit's own
+        // delegate performed. Two of those matter:
+        //  • there has to be somewhere to go back to, or the gesture wedges the
+        //    navigation controller on its root, and
+        //  • no push or pop may already be running, or an interactive pop starts
+        //    on top of a transition and corrupts the stack.
+        guard viewControllers.count > 1 else { return false }
+        return transitionCoordinator == nil
     }
 }

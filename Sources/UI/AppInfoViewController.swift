@@ -321,36 +321,10 @@ class AppInfoViewController: UITableViewController {
     // MARK: - Tag Detection
 
     private static func detectHostTag(urlString: String, host: String, path: String, isWebView: Bool) -> (label: String, color: UIColor)? {
-        // Custom tags — check full URL first, then host
-        if !SwiftyDebug._tags.isEmpty {
-            let lowerURL = urlString.lowercased()
-            for (keyword, label) in SwiftyDebug._tags {
-                let lowerKeyword = keyword.lowercased()
-                if lowerURL.contains(lowerKeyword) || host.contains(lowerKeyword) {
-                    return (label, colorForTag(keyword))
-                }
-            }
-        }
-
-        // WebView
-        if isWebView {
-            return ("web", colorForTag("web"))
-        }
-
-        // Known third-party
-        let knownTags: [(keyword: String, label: String)] = [
-            ("algolia",   "algolia"),
-            ("onesignal", "one signal"),
-            ("jitsu",     "jitsu"),
-        ]
-        for tag in knownTags {
-            if host.contains(tag.keyword) {
-                return (tag.label, colorForTag(tag.keyword))
-            }
-        }
-
-        // Unknown third-party: abbreviated host
-        return (abbreviateHost(host), colorForTag(host))
+        // Delegates to the one resolver so this screen's tag agrees with the
+        // network list's pill and the filter sheet's row. (See TAGS-FILTER.)
+        guard let tag = TagResolver.tag(forURLString: urlString) else { return nil }
+        return (tag.label, NetworkCell.colorForTag(tag.key))
     }
 
     private static func detectVersion(path: String) -> String? {
@@ -362,36 +336,6 @@ class AppInfoViewController: UITableViewController {
             return nil
         }
         return "v\(path[range])"
-    }
-
-    /// Deterministic color from a string key (djb2 hash → hue)
-    private static func colorForTag(_ key: String) -> UIColor {
-        var hash: UInt64 = 5381
-        for byte in key.lowercased().utf8 {
-            hash = ((hash &<< 5) &+ hash) &+ UInt64(byte)
-        }
-        let hue = CGFloat(hash % 360) / 360.0
-        return UIColor(hue: hue, saturation: 0.6, brightness: 0.85, alpha: 1)
-    }
-
-    private static func abbreviateHost(_ host: String) -> String {
-        var short = host
-        for prefix in ["www.", "api.", "cdn.", "m."] {
-            if short.hasPrefix(prefix) {
-                short = String(short.dropFirst(prefix.count))
-                break
-            }
-        }
-        for suffix in [".com", ".io", ".net", ".org", ".co"] {
-            if short.hasSuffix(suffix) {
-                short = String(short.dropLast(suffix.count))
-                break
-            }
-        }
-        if short.count > 12 {
-            short = String(short.prefix(10)) + ".."
-        }
-        return short
     }
 
     // MARK: - Toggle actions
@@ -742,7 +686,7 @@ class AppInfoViewController: UITableViewController {
                 cell.textLabel?.text = row.title
                 cell.textLabel?.font = .systemFont(ofSize: 14, weight: .medium)
                 cell.textLabel?.textColor = .white
-                cell.textLabel?.textAlignment = .natural
+                cell.textLabel?.textAlignment = .left  // `.natural` resolves RIGHT in an RTL host; the SDK is always LTR. (See FORCED-LTR.)
                 cell.detailTextLabel?.text = row.subtitle?()
                 cell.detailTextLabel?.font = .systemFont(ofSize: 11)
                 cell.detailTextLabel?.textColor = UIColor(white: 0.55, alpha: 1)
@@ -854,7 +798,7 @@ class AppInfoViewController: UITableViewController {
         case .urls:
             guard indexPath.row < capturedURLs.count else { return }
             let text = capturedURLs[indexPath.row].url
-            UIPasteboard.general.string = text
+            ClipboardFormatter.copyVerbatim(text)
 
             let alert = UIAlertController(title: "Copied to clipboard", message: text, preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "OK", style: .cancel))

@@ -23,17 +23,25 @@ class NetworkFilterSheetController: UIViewController, UITableViewDataSource, UIT
 
     enum Page { case hosts, endpoints }
 
+    /// One tag row. `tag.key` is the selection identity and `tag.label` is what
+    /// the row reads — the same two values the request cell's pill uses, so the
+    /// sheet cannot name a tag differently from the list. (See TAGS-FILTER.)
+    struct Row {
+        let tag: NetworkTag
+        let count: Int
+        let isWeb: Bool
+    }
+
     // Data
     var initialPage: Page = .hosts
     var page: Page = .hosts
-    var entries: [(display: String, filterKeys: [(key: String, isPathFilter: Bool)], isWeb: Bool)] = []
-    var tempPathFilters = Set<String>()
-    var tempHostFilters = Set<String>()
+    var entries: [Row] = []
+    var tempTagKeys = Set<String>()
     var tempEndpoints = Set<String>()
     var endpointProvider: (() -> [FilterableEndpoint])?
 
     // Callbacks
-    var onApply: ((Set<String>, Set<String>, Set<String>) -> Void)?
+    var onApply: ((Set<String>, Set<String>) -> Void)?
 
     // UI
     private let topBar = UIView()
@@ -122,10 +130,20 @@ class NetworkFilterSheetController: UIViewController, UITableViewDataSource, UIT
         ])
     }
 
+    /// What a row matched, spelled out under its name.
+    static func subtitle(for row: Row) -> String {
+        switch row.tag.origin {
+        case .userTag:      return row.tag.matchedKeyword
+        case .allowListURL: return row.tag.matchedKeyword + " \u{00B7} monitored URL"
+        case .knownAPI:     return row.tag.matchedKeyword + " \u{00B7} known API"
+        case .derivedHost:  return row.tag.matchedKeyword
+        }
+    }
+
     private func updateTopBar() {
         switch page {
         case .hosts:
-            titleLabel.text = "Filter by Host"
+            titleLabel.text = "Filter by Tag"
             leftButton.setTitle("Clear", for: .normal)
             leftButton.setTitleColor(.systemRed, for: .normal)
         case .endpoints:
@@ -151,16 +169,15 @@ class NetworkFilterSheetController: UIViewController, UITableViewDataSource, UIT
         switch page {
         case .hosts:
             // Clear all
-            tempPathFilters.removeAll()
-            tempHostFilters.removeAll()
+            tempTagKeys.removeAll()
             tempEndpoints.removeAll()
-            onApply?(tempPathFilters, tempHostFilters, tempEndpoints)
+            onApply?(tempTagKeys, tempEndpoints)
             dismiss(animated: true)
         case .endpoints:
             if initialPage == .endpoints {
                 // Clear endpoints (no hosts page to go back to)
                 tempEndpoints.removeAll()
-                onApply?(tempPathFilters, tempHostFilters, tempEndpoints)
+                onApply?(tempTagKeys, tempEndpoints)
                 dismiss(animated: true)
             } else {
                 // Back to hosts
@@ -172,7 +189,7 @@ class NetworkFilterSheetController: UIViewController, UITableViewDataSource, UIT
     }
 
     @objc private func didTapApply() {
-        onApply?(tempPathFilters, tempHostFilters, tempEndpoints)
+        onApply?(tempTagKeys, tempEndpoints)
         dismiss(animated: true)
     }
 
@@ -181,8 +198,7 @@ class NetworkFilterSheetController: UIViewController, UITableViewDataSource, UIT
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch page {
         case .hosts:
-            let hasSelectedHosts = !tempPathFilters.isEmpty || !tempHostFilters.isEmpty
-            return entries.count + (hasSelectedHosts ? 1 : 0) // +1 for "Filter Endpoints..."
+            return entries.count + (tempTagKeys.isEmpty ? 0 : 1) // +1 for "Filter Endpoints..."
         case .endpoints:
             return endpoints.count
         }
@@ -202,19 +218,17 @@ class NetworkFilterSheetController: UIViewController, UITableViewDataSource, UIT
             cell.detailTextLabel?.numberOfLines = 2
             if indexPath.row < entries.count {
                 let entry = entries[indexPath.row]
-                let isSelected = entry.filterKeys.contains { pair in
-                    pair.isPathFilter ? tempPathFilters.contains(pair.key) : tempHostFilters.contains(pair.key)
-                }
-                cell.textLabel?.text = entry.display
+                cell.textLabel?.text = entry.count > 0
+                    ? "\(entry.tag.label)  (\(entry.count))"
+                    : entry.tag.label
                 cell.textLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
-                // Show underlying URL/host as subtitle
-                if let firstKey = entry.filterKeys.first {
-                    let webSuffix = entry.isWeb ? " \u{00B7} web" : ""
-                    cell.detailTextLabel?.text = firstKey.key + webSuffix
-                    cell.detailTextLabel?.textColor = UIColor(white: 0.45, alpha: 1)
-                    cell.detailTextLabel?.font = .systemFont(ofSize: 12)
-                }
-                cell.accessoryType = isSelected ? .checkmark : .none
+                // Subtitle names what the tag actually matched, so a row is never
+                // ambiguous when two tags share a host.
+                let webSuffix = entry.isWeb ? " \u{00B7} web" : ""
+                cell.detailTextLabel?.text = Self.subtitle(for: entry) + webSuffix
+                cell.detailTextLabel?.textColor = UIColor(white: 0.45, alpha: 1)
+                cell.detailTextLabel?.font = .systemFont(ofSize: 12)
+                cell.accessoryType = tempTagKeys.contains(entry.tag.key) ? .checkmark : .none
             } else {
                 // "Filter Endpoints..." row
                 cell.textLabel?.text = "Filter Endpoints..."
@@ -241,17 +255,8 @@ class NetworkFilterSheetController: UIViewController, UITableViewDataSource, UIT
         switch page {
         case .hosts:
             if indexPath.row < entries.count {
-                let entry = entries[indexPath.row]
-                let isSelected = entry.filterKeys.contains { pair in
-                    pair.isPathFilter ? tempPathFilters.contains(pair.key) : tempHostFilters.contains(pair.key)
-                }
-                for pair in entry.filterKeys {
-                    if pair.isPathFilter {
-                        if isSelected { tempPathFilters.remove(pair.key) } else { tempPathFilters.insert(pair.key) }
-                    } else {
-                        if isSelected { tempHostFilters.remove(pair.key) } else { tempHostFilters.insert(pair.key) }
-                    }
-                }
+                let key = entries[indexPath.row].tag.key
+                if tempTagKeys.contains(key) { tempTagKeys.remove(key) } else { tempTagKeys.insert(key) }
                 tempEndpoints.removeAll()
                 refreshEndpoints()
                 tableView.reloadData()

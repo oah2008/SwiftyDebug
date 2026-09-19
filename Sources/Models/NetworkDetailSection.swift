@@ -10,7 +10,22 @@ import UIKit
 
 struct NetworkDetailSection {
     var title: String?
-    var content: String?
+
+    /// The text the section renders.
+    ///
+    /// Assigning it after construction also refreshes `rawContent`. Without that
+    /// the invariant "copy reads `rawContent`, display reads `content`" was only
+    /// held by the two sections that happened to set `rawContent` by hand: every
+    /// other one (REQUEST PARAMETERS, JWT, ERROR DETAILS, CACHE, REWRITES) is
+    /// built by `init(content: nil)` and then assigned, so its `rawContent`
+    /// stayed nil and `NetworkDetailCell.tapCopy` silently fell back to the
+    /// display string. A post-init assignment is never the `\/`-substituted
+    /// form — that transform only happens inside `init` — so the assigned value
+    /// IS the raw content. (Property observers do not run during `init`, so the
+    /// initialiser's own transformed assignment cannot clobber it.) (See COPY.)
+    var content: String? {
+        didSet { rawContent = content }
+    }
     var url: String?
     var image: UIImage?
     var blankContent: String?

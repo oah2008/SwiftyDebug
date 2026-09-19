@@ -385,15 +385,16 @@ final class FileContentViewerViewController: UIViewController {
                 UIPasteboard.general.image = image
                 showToast("Copied")
             }
-        case .text(let string, _, let isJSON)?:
-            if isJSON {
-                UIPasteboard.general.string = string
-            } else {
-                ClipboardFormatter.copy(string, from: self)
-            }
+        case .text(let string, _, _)?:
+            // Both arms go through the one formatter. The branch used to be
+            // inverted — JSON was copied raw (so a `.json` file saved with a BOM
+            // or a leading blank line copied them intact) while only non-JSON was
+            // handed to the JSON producer. `ClipboardFormatter` already does the
+            // right thing for either kind. (See COPY.)
+            ClipboardFormatter.copy(string, from: self)
             showToast("Copied")
         case .hex(let dump)?:
-            UIPasteboard.general.string = dump
+            ClipboardFormatter.copyVerbatim(dump)
             showToast("Copied")
         default:
             UIPasteboard.general.string = fileURL.path

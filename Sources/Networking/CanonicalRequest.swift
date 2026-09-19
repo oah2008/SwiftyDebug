@@ -145,9 +145,11 @@ private func FixEmptyPath(_ url: URL, _ urlData: NSMutableData, _ bytesInserted:
 /// Canonicalize the request headers.
 ///
 /// Historically this force-added default `Content-Type`, `Accept`,
-/// `Accept-Encoding` and `Accept-Language` headers. `Accept-Language` is no
-/// longer among them at all — see the note at the bottom of this function; the
-/// hardwired `en-us` overrode the device language for the whole host app.
+/// `Accept-Encoding` and `Accept-Language` headers. Neither `Accept-Encoding`
+/// nor `Accept-Language` is among them any more — see the notes at the bottom of
+/// this function. Both overrode a value CFNetwork fills in better: the hardwired
+/// `en-us` overrode the device language for the whole host app, and
+/// `gzip, deflate` stripped brotli from every request it touched.
 ///
 /// Force-adding the rest defeats intercept
 /// rules that try to *remove* one of those headers: canonicalization runs first
@@ -185,11 +187,17 @@ private func CanonicaliseHeaders(_ request: NSMutableURLRequest) {
         request.setValue("*/*", forHTTPHeaderField: "Accept")
     }
 
-    // If there's no "Accept-Encoding" header, add a default.
-
-    if request.value(forHTTPHeaderField: "Accept-Encoding") == nil && shouldAddDefault("Accept-Encoding") {
-        request.setValue("gzip, deflate", forHTTPHeaderField: "Accept-Encoding")
-    }
+    // NO DEFAULT "Accept-Encoding" IS ADDED HERE, DELIBERATELY — same reason as
+    // Accept-Language below.
+    //
+    // This used to force `gzip, deflate` onto every request that did not already
+    // carry the header. CFNetwork's own default on iOS is
+    // `br;q=1.0, gzip;q=0.9, deflate;q=0.8`, so writing ours in stripped brotli
+    // from every request the host app makes the moment SwiftyDebug was linked:
+    // a brotli-capable CDN silently started returning larger bodies, and the
+    // traffic the developer was inspecting was no longer the traffic the app
+    // sends without the SDK. A debugger that changes what it observes is worse
+    // than no debugger. Leaving the header off is what makes the two identical.
 
     // NO DEFAULT "Accept-Language" IS ADDED HERE, DELIBERATELY.
     //

@@ -1282,7 +1282,7 @@ class LogViewController: UIViewController {
             lines = consoleDB.fetchRange(offset: range.lowerBound, limit: range.count).map(\.text)
         }
 
-        UIPasteboard.general.string = lines.joined(separator: "\n")
+        ClipboardFormatter.copyVerbatim(lines.joined(separator: "\n"))
         dismissSelection()
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
@@ -1431,7 +1431,7 @@ extension LogViewController: UITableViewDataSource {
             } else {
                 text = logModel.content ?? ""
             }
-            UIPasteboard.general.string = text
+            ClipboardFormatter.copyVerbatim(text)
         }
 
         return cell
@@ -1529,7 +1529,7 @@ extension LogViewController: UITableViewDelegate {
 
             let key = NSNumber(value: indexPath.row)
             guard let entry = entryCache.object(forKey: key) else { return }
-            UIPasteboard.general.string = entry.text.trimmingCharacters(in: .newlines)
+            ClipboardFormatter.copyVerbatim(entry.text.trimmingCharacters(in: .newlines))
 
             // Brief flash feedback
             if let cell = tableView.cellForRow(at: indexPath) {

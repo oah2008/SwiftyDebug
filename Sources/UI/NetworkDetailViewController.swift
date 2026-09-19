@@ -778,7 +778,7 @@ class NetworkDetailViewController: UITableViewController {
             guard let self = self else { return }
             // Use rawCurlString — NOT detailModel.content which has \/ replaced
             let curl = self.rawCurlString
-            UIPasteboard.general.string = curl
+            ClipboardFormatter.copyVerbatim(curl)
 
             let activity = UIActivityViewController(activityItems: [curl], applicationActivities: nil)
             if UIDevice.current.userInterfaceIdiom == .pad {
@@ -983,7 +983,7 @@ class NetworkDetailViewController: UITableViewController {
         })
 
         alert.addAction(UIAlertAction(title: "Copy cURL", style: .default) { [weak self] _ in
-            UIPasteboard.general.string = self?.rawCurlString
+            ClipboardFormatter.copyVerbatim(self?.rawCurlString)
         })
 
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
@@ -1028,13 +1028,13 @@ class NetworkDetailViewController: UITableViewController {
         let alert = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
 
         alert.addAction(UIAlertAction(title: "copy to clipboard", style: .default) { [weak self] _ in
-            UIPasteboard.general.string = self?.messageBody
+            ClipboardFormatter.copyVerbatim(self?.messageBody)
         })
 
         alert.addAction(UIAlertAction(title: "copy cURL to clipboard", style: .default) { [weak self] _ in
             if let httpModel = self?.httpModel {
                 let curl = httpModel.cURLDescription()
-                UIPasteboard.general.string = curl
+                ClipboardFormatter.copyVerbatim(curl)
             }
         })
 
@@ -1363,7 +1363,13 @@ private final class ClipboardMessageHandler: NSObject, WKScriptMessageHandler {
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
         guard let text = message.body as? String else { return }
-        UIPasteboard.general.string = text
+        // The string arriving here is produced by a THIRD-PARTY web component
+        // rendering the body, not by SwiftyDebug — so it is the one copy path in
+        // the SDK whose exact bytes we do not control, and it landed on the
+        // pasteboard verbatim. That is how a copied request body acquired a
+        // leading invisible character and stopped pasting into Algolia. Route it
+        // through the same normaliser as every native copy. (See COPY.)
+        ClipboardFormatter.copyVerbatim(JSONExporter.clipboardString(from: text))
     }
 }
 
@@ -1376,7 +1382,7 @@ final class JSONViewerViewController: UIViewController, WKNavigationDelegate {
 
     private let initialHTML: String = """
     <!doctype html>
-    <html lang="ar" dir="auto">
+    <html lang="en" dir="ltr">
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -1387,7 +1393,15 @@ final class JSONViewerViewController: UIViewController, WKNavigationDelegate {
           "Noto Sans", sans-serif; }
         #root { height:100%; display:grid; }
         andypf-json-viewer { height:100%; width:100%; }
-        :root { unicode-bidi: plaintext; }
+        /* Web content is its own direction system that no UIKit mechanism in the
+           SDK reaches. The document used to declare `lang="ar" dir="auto"` with
+           `unicode-bidi: plaintext`, which makes every block re-derive its
+           direction from its own first strong character — so a JSON body holding
+           Arabic values flipped rows, key/value order and punctuation. `isolate`
+           keeps each Arabic *string* rendering correctly inside its own run while
+           the document and the tree stay left-to-right. (See FORCED-LTR.) */
+        :root { direction: ltr; unicode-bidi: isolate; }
+        body, #root, andypf-json-viewer { direction: ltr; text-align: left; }
       </style>
       <script defer src="https://pfau-software.de/json-viewer/dist/iife/index.js"></script>
     </head>
@@ -1747,7 +1761,7 @@ final class CurlPreviewViewController: UIViewController {
     }
 
     @objc private func copyTapped() {
-        UIPasteboard.general.string = curlString
+        ClipboardFormatter.copyVerbatim(curlString)
 
         let originalTitle = copyButton.title(for: .normal)
         copyButton.setTitle("Copied!", for: .normal)

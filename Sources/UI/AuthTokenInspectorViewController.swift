@@ -496,7 +496,7 @@ extension AuthTokenInspectorViewController: UITableViewDataSource, UITableViewDe
             tableView?.reloadRows(at: [indexPath], with: .fade)
         }
         cell.onCopy = { [weak self] in
-            UIPasteboard.general.string = credential.rawValue
+            ClipboardFormatter.copyExactly(credential.rawValue)
             self?.presentAuthToast("Copied token")
         }
         return cell
@@ -921,7 +921,7 @@ private final class AuthTokenDetailViewController: UITableViewController {
     }
 
     @objc private func copyAllTapped() {
-        UIPasteboard.general.string = credential.rawValue
+        ClipboardFormatter.copyExactly(credential.rawValue)
         presentAuthToast("Copied token")
     }
 
@@ -1034,7 +1034,7 @@ private final class AuthTokenDetailViewController: UITableViewController {
                 tableView?.reloadRows(at: [indexPath], with: .fade)
             }
             cell.onCopy = { [weak self] in
-                UIPasteboard.general.string = copy
+                ClipboardFormatter.copyVerbatim(copy)
                 self?.presentAuthToast("Copied")
             }
             return cell
@@ -1050,7 +1050,7 @@ private final class AuthTokenDetailViewController: UITableViewController {
                 withIdentifier: AuthCodeCell.reuseID, for: indexPath) as! AuthCodeCell
             cell.configure(text: text)
             cell.onCopy = { [weak self] in
-                UIPasteboard.general.string = text
+                ClipboardFormatter.copyVerbatim(text)
                 self?.presentAuthToast("Copied JSON")
             }
             return cell

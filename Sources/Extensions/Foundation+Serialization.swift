@@ -216,6 +216,16 @@ extension Data {
     /// The single implementation behind both the preview and COPY. It returns
     /// JSON or nothing — never a fragment of one, never non-JSON text — so a
     /// caller that needs "valid JSON or say so" can trust the nil.
+    /// `self` without a leading UTF-8 byte-order mark. Returns `self` unchanged
+    /// when there is none, so the common path copies no bytes.
+    func strippingLeadingUTF8BOM() -> Data {
+        let bom: [UInt8] = [0xEF, 0xBB, 0xBF]
+        guard count >= 3, self[startIndex] == bom[0],
+              self[index(startIndex, offsetBy: 1)] == bom[1],
+              self[index(startIndex, offsetBy: 2)] == bom[2] else { return self }
+        return Data(self.dropFirst(3))
+    }
+
     /// `ignoringSizeCeiling` is for the COPY path only. The ceiling exists to
     /// protect the MAIN THREAD; copy now runs off it behind a blocking overlay,
     /// so the ceiling would only make a large body copy in a different key order
@@ -237,8 +247,14 @@ extension Data {
         //  One parse per call, no caching: the callers are one-shot (building a
         //  detail screen, a copy tap, an export tap), never per-cell and never
         //  per-keystroke.
+        //  A leading UTF-8 BOM has to come off FIRST. `JSONSerialization` accepts
+        //  it, so the body parses either way — but `JSONDocument`'s source index
+        //  does not, so it records no key order and the writer falls back to
+        //  `keys.sorted()`. The result was a BOM-prefixed body copying in
+        //  alphabetical order while the identical body without the BOM copied in
+        //  the server's. Only the BOM is removed; the rest is untouched.
         if ignoringSizeCeiling || canPrettyPrintInSourceOrder,
-           let document = JSONDocument(data: self) {
+           let document = JSONDocument(data: self.strippingLeadingUTF8BOM()) {
             // Lifting the printer's ceiling without lifting the DOCUMENT's index
             // ceiling would still hand back sorted keys — the two must move
             // together, which is what the coupling test pins.

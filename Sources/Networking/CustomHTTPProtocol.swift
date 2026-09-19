@@ -806,7 +806,13 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
 
     // MARK: Skipped file extensions
 
-    private static let skippedExtensions: Set<String> = {
+    /// Path extensions that mean "this is a streamed asset, not a document".
+    ///
+    /// Used by `canInit` to stay out of media entirely when `monitorMedia` is
+    /// off, and by `responseIsHoldable` to refuse to buffer a body whose server
+    /// sent no Content-Type. Not `private` so the hold gate and its tests can
+    /// see it. (See STREAMING-PROGRESS.)
+    static let skippedExtensions: Set<String> = {
         return Set([
             "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "tiff", "heic", "heif",
             "mp4", "mov", "avi", "m4v", "m4a", "mp3", "wav", "aac",
@@ -1079,6 +1085,7 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                         code: NSURLErrorCancelled,
                         userInfo: [NSLocalizedDescriptionKey: "Blocked by SwiftyDebug intercept rule"]
                     )
+                    markTerminated()
                     self.client?.urlProtocol(self, didFailWithError: error)
                     return
                 }
@@ -1126,6 +1133,7 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                 code: NSURLErrorNotConnectedToInternet,
                 userInfo: [NSLocalizedDescriptionKey: "Dropped by SwiftyDebug network simulation (100% Loss)"]
             )
+            markTerminated()
             self.client?.urlProtocol(self, didFailWithError: error)
             return
         }
@@ -1190,6 +1198,7 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             // What CFNetwork itself returns for a `.returnCacheDataDontLoad`
             // miss. Going to the network instead would defeat the whole point
             // of the policy.
+            markTerminated()
             self.client?.urlProtocol(self, didFailWithError: NSError(
                 domain: NSURLErrorDomain,
                 code: NSURLErrorResourceUnavailable,
@@ -1221,6 +1230,7 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                 abort: { [weak self] in
                     guard let self else { return }
                     self.performOnThread(self.clientThread, modes: self.modes) {
+                        self.markTerminated()
                         self.client?.urlProtocol(self, didFailWithError: NSError(
                             domain: NSURLErrorDomain, code: NSURLErrorCancelled,
                             userInfo: [NSLocalizedDescriptionKey: "Aborted at breakpoint"]))
@@ -1318,8 +1328,10 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         let deliver = { [weak self] in
             guard let self, let response else { return }
             self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            if !body.isEmpty { self.client?.urlProtocol(self, didLoad: body) }
-            self.client?.urlProtocolDidFinishLoading(self)
+            self.deliverBodyInChunks(body) { [weak self] in
+                guard let self else { return }
+                self.client?.urlProtocolDidFinishLoading(self)
+            }
         }
 
         let delay = max(mock.delay, Settings.shared.networkConditionerPreset.addedLatency)
@@ -1382,13 +1394,31 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         }
 
         client?.urlProtocol(self, didReceive: cached.response, cacheStoragePolicy: .notAllowed)
-        if !cached.data.isEmpty { client?.urlProtocol(self, didLoad: cached.data) }
-        client?.urlProtocolDidFinishLoading(self)
+        deliverBodyInChunks(cached.data) { [weak self] in
+            guard let self else { return }
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
     }
+
+    /// Set once this load has reached a terminal state — cancelled by the app, or
+    /// failed. Scheduled work, notably the chunked body delivery in
+    /// `deliverBodyInChunks`, must check it before touching `client`: between two
+    /// scheduled chunks the request can be cancelled or fail, and delivering into
+    /// a finished loading context is a use of something already torn down.
+    ///
+    /// `stopLoading` is NOT the only way a load ends — every `didFailWithError`
+    /// is one too, and a chunk queued before the failure would otherwise arrive
+    /// after it.
+    private(set) var isTerminated = false
+
+    /// Marks the load terminal. Call before (or immediately after) delivering a
+    /// failure, so nothing scheduled can still fire.
+    private func markTerminated() { isTerminated = true }
 
     override func stopLoading() {
         // The implementation just cancels the current load (if it's still running).
 
+        isTerminated = true
         cancelPendingChallenge()
 
         // The app gave up on this request (cancelled, or its own timeout elapsed
@@ -1885,8 +1915,49 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
         //  • armed response rewrites (a JSON document cannot be rewritten one
         //    chunk at a time — see RESPONSE-REWRITE).
         // Which runs first is decided in `didCompleteWithError`, not here.
-        let holdForBreakpoint = (self.resolvedRule?.breakpointMode == .afterResponse)
-        let holdForRewrites = shouldBufferForRewrites(response)
+        // A body that is streamed to the app must never be held — see
+        // `responseIsHoldable`. Holding a download is what silenced the host
+        // app's progress callbacks. (See STREAMING-PROGRESS.)
+        let requestURL = (self.interceptedRequest ?? self.request).url
+        let holdable = Self.responseIsHoldable(response, requestURL: requestURL)
+
+        let breakpointWanted = (self.resolvedRule?.breakpointMode == .afterResponse)
+        // `shouldBufferForRewrites` is SIDE-EFFECTING: writing `rewriteReport`'s
+        // skip reason is the only way an armed rewrite that did nothing ever gets
+        // explained. It must therefore be evaluated BEFORE the `&&`, or Swift's
+        // short-circuit silently skips the explanation along with the hold.
+        let rewritesWanted = shouldBufferForRewrites(response)
+
+        let holdForBreakpoint = holdable && breakpointWanted
+        let holdForRewrites = holdable && rewritesWanted
+
+        // A body can be refused a hold because it streams, OR simply because it is
+        // bigger than SwiftyDebug would ever capture. Saying "it is handed to the
+        // app as it arrives" about a 15 MB JSON export is false, and sends the
+        // developer looking in the wrong place.
+        let tooLargeToHold = response.expectedContentLength > Int64(Self.maxCapturedResponseBytes)
+
+        if rewritesWanted && !holdable {
+            rewriteReport = RewriteReport(skippedReason: tooLargeToHold
+                ? Self.oversizeRewriteMessage(byteCount: response.expectedContentLength)
+                : Self.streamingPreemptedRewriteMessage(mimeType: response.mimeType))
+        }
+        if breakpointWanted && !holdable {
+            // An armed breakpoint that silently does nothing is the failure mode
+            // this codebase keeps having; say why, where the detail screen and
+            // the breakpoint inbox both show it.
+            let reason = tooLargeToHold
+                ? Self.oversizeBreakpointMessage(byteCount: response.expectedContentLength)
+                : Self.streamingPreemptedBreakpointMessage(mimeType: response.mimeType)
+            self.breakpointSkipReason = reason
+            // The transaction always records it. The shared inbox does NOT get one
+            // per asset: a scrolling image grid under a single host-wide rule would
+            // post hundreds of identical notices and evict everything else in it.
+            if !Self.hasNotedStreamingSkip {
+                Self.hasNotedStreamingSkip = true
+                BreakpointCenter.shared.note(reason, for: requestURL)
+            }
+        }
         if holdForBreakpoint || holdForRewrites {
             self.isHoldingResponse = true
             self.isHoldingForRewriteOnly = holdForRewrites && !holdForBreakpoint
@@ -1970,6 +2041,7 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
             // has always promised this trap; it just was not here.) Redirects
             // report the same error for the same reason.
             guard !Self.isClientInitiatedCancellation(error, didCancel: self.didCancelOwnTask) else { return }
+            markTerminated()
             self.client?.urlProtocol(self, didFailWithError: error)
             self.error = error
             return
@@ -2023,6 +2095,7 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
                 guard let self else { return }
                 self.performOnThread(self.clientThread, modes: self.modes) {
                     self.isHoldingResponse = false
+                    self.markTerminated()
                     self.client?.urlProtocol(self, didFailWithError: NSError(
                         domain: NSURLErrorDomain, code: NSURLErrorCancelled,
                         userInfo: [NSLocalizedDescriptionKey: "Aborted at breakpoint"]))
@@ -2089,6 +2162,147 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
         guard let mime = mimeType?.lowercased().trimmingCharacters(in: .whitespaces),
               !mime.isEmpty else { return true }
         return mime.contains("json") || mime.hasPrefix("text/")
+    }
+
+    /// Whether a response may be BUFFERED WHOLE before the app sees any of it.
+    ///
+    /// Holding a body is how an `.afterResponse` breakpoint and a response
+    /// rewrite work, and for a JSON document it costs nothing anyone notices.
+    /// For a download it destroys progress reporting: an image library computes
+    /// progress purely from how many `didReceive data` callbacks its session
+    /// gets, so a body delivered in one call reports 0% and then 100%, and a body
+    /// held at a breakpoint reports nothing at all while the user waits. That is
+    /// the "SwiftyDebug hijacked my download progress" report. (See
+    /// STREAMING-PROGRESS.)
+    ///
+    /// So media, large bodies, and bodies whose server sent no Content-Type but
+    /// whose URL looks like an asset are never held — they stream, and the
+    /// breakpoint or rewrite that wanted them records why it stood down.
+    static func responseIsHoldable(_ response: URLResponse, requestURL: URL?) -> Bool {
+        // A declared length past what SwiftyDebug would ever capture cannot be
+        // held without buffering more than the cap allows.
+        if response.expectedContentLength > Int64(maxCapturedResponseBytes) { return false }
+
+        let mime = (response.mimeType ?? "").lowercased().trimmingCharacters(in: .whitespaces)
+
+        // Open-ended streams. `text/event-stream` passes the `text/` test in
+        // `mimeTypeCanBeJSON`, so an armed rewrite used to buffer a server-sent
+        // event stream — a response that never ends, which means the app receives
+        // NOTHING, forever. NDJSON and multipart replace streams are the same
+        // shape. These can never be held, at any size.
+        let streamingTypes = ["text/event-stream", "application/x-ndjson",
+                              "application/stream+json", "application/x-json-stream",
+                              "multipart/x-mixed-replace"]
+        for type in streamingTypes where mime.hasPrefix(type) {
+            return false
+        }
+
+        if mime.isEmpty {
+            // No Content-Type: fall back to what the URL says it is. A CDN that
+            // serves `photo.jpg` with no type must not be buffered.
+            guard let ext = requestURL?.pathExtension.lowercased(), !ext.isEmpty else { return true }
+            return !skippedExtensions.contains(ext)
+        }
+
+        for prefix in ["image/", "video/", "audio/", "font/"] where mime.hasPrefix(prefix) {
+            return false
+        }
+        let binaryTypes = ["application/octet-stream", "application/pdf", "application/zip",
+                           "application/gzip", "application/x-font", "application/font",
+                           "application/wasm"]
+        for type in binaryTypes where mime.hasPrefix(type) {
+            return false
+        }
+        return true
+    }
+
+    /// Why an `.afterResponse` breakpoint did not pause a streamed response.
+    /// Pure and `static` so the wording is pinned by a test rather than by a
+    /// screenshot. (See STREAMING-PROGRESS.)
+    static func streamingPreemptedBreakpointMessage(mimeType: String?) -> String {
+        let kind = (mimeType?.isEmpty == false) ? mimeType! : "a streamed asset"
+        return "This response is \(kind), which is handed to the app as it arrives, so the "
+             + "\u{201C}after response\u{201D} breakpoint was skipped. Holding it would buffer "
+             + "the whole download and stop the app\u{2019}s progress callbacks from firing."
+    }
+
+    /// One inbox notice per launch for the streamed-response stand-down, however
+    /// many assets trigger it. Reset alongside the rest of the SDK's state.
+    static var hasNotedStreamingSkip = false
+
+    /// Why a hold was refused for a body that is simply too big to buffer. The
+    /// streaming wording would be false here, and a wrong explanation is worse
+    /// than none. Pure and `static` so the wording is pinned by a test.
+    static func oversizeBreakpointMessage(byteCount: Int64) -> String {
+        "This response declares \(ByteCountFormatter().string(fromByteCount: byteCount)), more than "
+        + "SwiftyDebug will buffer, so the \u{201C}after response\u{201D} breakpoint was skipped."
+    }
+
+    static func oversizeRewriteMessage(byteCount: Int64) -> String {
+        "This response declares \(ByteCountFormatter().string(fromByteCount: byteCount)), more than "
+        + "SwiftyDebug will buffer, so rewrites were skipped."
+    }
+
+    /// Why an armed response rewrite stood down on a streamed response.
+    static func streamingPreemptedRewriteMessage(mimeType: String?) -> String {
+        let kind = (mimeType?.isEmpty == false) ? mimeType! : "a streamed asset"
+        return "The response is \(kind), which is handed to the app as it arrives. "
+             + "Rewriting it would require buffering the whole download and would stop the "
+             + "app\u{2019}s progress callbacks from firing, so rewrites were skipped."
+    }
+
+    /// Hands `body` to the client in chunks rather than in one call.
+    ///
+    /// The bytes are identical either way; what changes is the number of
+    /// `didLoad` callbacks the app's session sees, and that count IS the
+    /// progress resolution for every library that reports download progress from
+    /// its data delegate. A mock, a cache replay and a released breakpoint used
+    /// to deliver everything in one call, so a progress bar jumped straight from
+    /// 0 to 100. (See STREAMING-PROGRESS.)
+    /// `completion` runs after the last chunk has been handed over — callers MUST
+    /// use it for `urlProtocolDidFinishLoading`, because the chunks are scheduled
+    /// rather than delivered inline.
+    ///
+    /// Scheduling matters: emitting every chunk in one runloop turn does NOT give
+    /// the app one callback per chunk. CFNetwork coalesces them — measured on a
+    /// 1 MB body, 16 inline 64 KB writes arrived as 3 to 5 app-side callbacks, and
+    /// SMALLER chunks produced FEWER (64 x 16 KB arrived as 2). One runloop turn
+    /// per chunk gives the 1:1 delivery the plain streaming path already achieves,
+    /// which is exactly how `QNSURLSessionDemux` forwards upstream chunks.
+    func deliverBodyInChunks(_ body: Data,
+                             chunkSize: Int = 64 * 1024,
+                             completion: @escaping () -> Void) {
+        guard !body.isEmpty else { completion(); return }
+        guard body.count > chunkSize else {
+            client?.urlProtocol(self, didLoad: body)
+            completion()
+            return
+        }
+
+        // Re-base the bytes. `Data` slices keep their parent's indices, so a
+        // sliced body reaching here would make `subdata(in:)` trap on an
+        // out-of-bounds range rather than deliver.
+        let bytes = Data(body)
+
+        var ranges: [Range<Int>] = []
+        var offset = 0
+        while offset < bytes.count {
+            let end = min(offset + chunkSize, bytes.count)
+            ranges.append(offset..<end)
+            offset = end
+        }
+
+        let thread = self.clientThread, modes = self.modes
+        func send(_ index: Int) {
+            // The chunks are scheduled, so the request can be cancelled between
+            // any two of them. Delivering to a cancelled client is a use of a
+            // torn-down loading context.
+            guard !self.isTerminated else { return }
+            guard index < ranges.count else { completion(); return }
+            self.client?.urlProtocol(self, didLoad: bytes.subdata(in: ranges[index]))
+            self.performOnThread(thread, modes: modes) { send(index + 1) }
+        }
+        send(0)
     }
 
     /// Applies the resolved rule's rewrites to the finished body, returning the
@@ -2186,6 +2400,15 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
             client?.urlProtocol(self, didReceive: held, cacheStoragePolicy: heldCacheStoragePolicy)
         }
         if let buffered = self.data as Data?, !buffered.isEmpty {
+            // SYNCHRONOUSLY, in one call — NOT chunked.
+            //
+            // `abandonHold` runs from the middle of `didReceive data`, and the
+            // bytes that triggered it are streamed to the client inline on the
+            // very next statement. Scheduling the buffered head across runloop
+            // turns would deliver that newer chunk FIRST and hand the app a body
+            // with its middle transposed. Chunking exists to give download
+            // progress somewhere to report from, and abandoning a hold resumes
+            // real streaming anyway — every subsequent chunk arrives on its own.
             client?.urlProtocol(self, didLoad: buffered)
         }
         heldResponse = nil
@@ -2228,8 +2451,10 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
         // SwiftyDebug's edit long after the rule was switched off.
         let policy: URLCache.StoragePolicy = rebuildHeaders ? .notAllowed : heldCacheStoragePolicy
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: policy)
-        if !body.isEmpty { client?.urlProtocol(self, didLoad: body) }
-        client?.urlProtocolDidFinishLoading(self)
+        deliverBodyInChunks(body) { [weak self] in
+            guard let self else { return }
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
     }
 
     /// Rebuilds an `HTTPURLResponse` so its headers match an edited body:

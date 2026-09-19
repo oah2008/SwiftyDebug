@@ -39,6 +39,30 @@ enum ClipboardFormatter {
         ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file)
     }
 
+    /// Puts `text` on the clipboard exactly as it is, minus the invisible
+    /// leading/trailing characters that break a paste.
+    ///
+    /// The counterpart to `copy(_:from:)`: that one produces JSON, this one
+    /// produces the bytes it was given. Every payload copy in the SDK goes
+    /// through one or the other, so no screen can put a raw string on the
+    /// pasteboard without the affix trim. A `nil` clears the pasteboard, which is
+    /// what a direct assignment did. (See COPY / ClipboardText.)
+    static func copyVerbatim(_ text: String?) {
+        UIPasteboard.general.string = text.map(ClipboardText.normalized)
+    }
+
+    /// Puts `text` on the clipboard byte-for-byte, with NO trimming.
+    ///
+    /// For the inspectors whose entire job is to reveal exactly what is stored — a
+    /// keychain item, a `UserDefaults` value, a bearer token. A token written as
+    /// `"eyJ…\n"` must copy with its newline: trimming it produces a value that
+    /// works in curl and does not work in the app, which is the opposite of what
+    /// an inspector is for. Everything that copies a *payload* goes through
+    /// `copyVerbatim` or `copy(_:from:)` instead. (See COPY.)
+    static func copyExactly(_ text: String?) {
+        UIPasteboard.general.string = text
+    }
+
     /// Copies `text` as valid JSON, blocking the screen with an explanation when
     /// the work is big enough to notice.
     ///

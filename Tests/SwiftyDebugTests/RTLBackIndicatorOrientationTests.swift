@@ -152,6 +152,84 @@ final class RTLBackIndicatorOrientationTests: XCTestCase {
                        "The back arrow renders differently from the system one in LTR")
     }
 
+    // MARK: - The control SwiftyDebug now owns
+
+    /// Every pushed screen gets the SDK's own back button, so no screen depends
+    /// on UIKit's indicator — which is installed wrapped in
+    /// `imageFlippedForRightToLeftLayoutDirection()` whatever image it is given.
+    func testEveryPushedScreenGetsTheSDKsOwnBackButton() throws {
+        let nav = try makePushedNavigation(ambientDirection: .leftToRight)
+        let top = try XCTUnwrap(nav.topViewController)
+        XCTAssertTrue(top.navigationItem.leftBarButtonItem?.customView is SwiftyDebugBackButton,
+                      "A pushed screen must carry SwiftyDebug's back button")
+        XCTAssertTrue(top.navigationItem.hidesBackButton,
+                      "UIKit's own back button must be hidden so the two cannot both appear")
+    }
+
+    /// The root has no back button — it gets the close control from the tab bar.
+    func testTheRootScreenGetsNoBackButton() {
+        let root = UIViewController()
+        let nav = SwiftyDebugNavigationController(rootViewController: root)
+        nav.loadViewIfNeeded()
+        XCTAssertFalse(root.navigationItem.leftBarButtonItem?.customView is SwiftyDebugBackButton)
+    }
+
+    /// The durable guarantee: the arrow is a plain bitmap, so there is no asset
+    /// variant and no flip flag left for any direction to act on.
+    func testTheSDKBackArrowIsNotDirectionAware() throws {
+        let nav = try makePushedNavigation(ambientDirection: .rightToLeft)
+        let arrow = try backChevronImageView(in: nav.navigationBar)
+        let image = try XCTUnwrap(arrow.image)
+
+        XCTAssertFalse(image.flipsForRightToLeftLayoutDirection,
+                       "A flipping image is mirrored by UIImageView from its own resolved direction")
+        XCTAssertFalse(image.description.contains("symbol(system:"),
+                       "A symbol can carry an RTL variant; the whole point is that this one cannot")
+
+        if let asset = image.imageAsset {
+            let ltr = asset.image(with: UITraitCollection(layoutDirection: .leftToRight))
+            let rtl = asset.image(with: UITraitCollection(layoutDirection: .rightToLeft))
+            XCTAssertEqual(try Self.pixels(of: ltr), try Self.pixels(of: rtl),
+                           "The arrow renders differently under RTL — it has a mirrored variant")
+        }
+    }
+
+    /// A pop still works through the replacement control — the button is wired to
+    /// the navigation controller, and firing it unwinds the stack.
+    func testTheSDKBackButtonPopsTheStack() throws {
+        let nav = try makePushedNavigation(ambientDirection: .leftToRight)
+        XCTAssertEqual(nav.viewControllers.count, 2)
+        let button = try XCTUnwrap(nav.topViewController?.navigationItem.leftBarButtonItem?.customView as? SwiftyDebugBackButton)
+
+        let actions = button.actions(forTarget: nav, forControlEvent: .touchUpInside) ?? []
+        XCTAssertFalse(actions.isEmpty,
+                       "The back button must be wired to the navigation controller, not left inert")
+
+        // `sendActions(for:)` routes through UIApplication, which does not deliver
+        // in this test host — the same limitation several other suites here work
+        // around. Fire the registered actions directly instead.
+        for target in button.allTargets {
+            for name in button.actions(forTarget: target, forControlEvent: .touchUpInside) ?? [] {
+                (target as? NSObject)?.perform(Selector(name))
+            }
+        }
+
+        let deadline = Date().addingTimeInterval(5)
+        while nav.viewControllers.count > 1, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        XCTAssertEqual(nav.viewControllers.count, 1, "The back button must pop")
+    }
+
+    /// `setViewControllers` is the other way a stack is built.
+    func testSetViewControllersAlsoInstallsTheBackButton() {
+        let nav = SwiftyDebugNavigationController(rootViewController: UIViewController())
+        nav.loadViewIfNeeded()
+        let second = UIViewController()
+        nav.setViewControllers([UIViewController(), second], animated: false)
+        XCTAssertTrue(second.navigationItem.leftBarButtonItem?.customView is SwiftyDebugBackButton)
+    }
+
     // MARK: - Adjacent behaviour that must not regress
 
     /// The previous round moved the back BUTTON to the left edge; only the glyph
@@ -240,19 +318,34 @@ final class RTLBackIndicatorOrientationTests: XCTestCase {
         return nav
     }
 
-    /// UIKit's private image view for the visible back arrow.
+    /// The image view holding the visible back arrow.
     ///
-    /// The bar also holds a chevron in a transition *mask* view, which is not
-    /// what the user sees — and which is a chevron symbol too once the SDK
-    /// supplies the mask image, so it has to be excluded by position in the
-    /// hierarchy rather than by what its image is.
+    /// SwiftyDebug now supplies its own back control (`SwiftyDebugBackButton`),
+    /// whose arrow is a RASTERISED bitmap rather than an SF Symbol — that is the
+    /// point of it: a bitmap has no direction-aware variant to resolve and no
+    /// flipping flag for UIKit to switch back on. So the arrow is looked up
+    /// inside that button first. The symbol lookup is kept as a fallback for a
+    /// bar that is still showing UIKit's indicator, and the transition *mask*
+    /// view — which also holds a chevron but is not what the user sees — is
+    /// excluded by position in the hierarchy either way.
     private func backChevronImageView(in bar: UINavigationBar) throws -> UIImageView {
+        let ownButtons = Self.descendants(of: bar).compactMap { $0 as? SwiftyDebugBackButton }
+        let ownArrows = ownButtons
+            .flatMap { Self.descendants(of: $0) }
+            .compactMap { $0 as? UIImageView }
+            .filter { $0.image != nil && $0.bounds.width >= 4 && $0.bounds.height >= 4 }
+        if ownArrows.count == 1 { return ownArrows[0] }
+        if ownArrows.count > 1 {
+            XCTFail("SwiftyDebugBackButton holds \(ownArrows.count) arrow image views; expected one")
+            throw Failure.notFound
+        }
+
         let chevrons = Self.descendants(of: bar)
             .compactMap { $0 as? UIImageView }
             .filter { ($0.image?.description ?? "").contains("symbol(system: chevron") }
             .filter { !Self.hasMaskAncestor($0, upTo: bar) }
         guard chevrons.count == 1 else {
-            XCTFail("Expected exactly one visible chevron image view in the bar, found \(chevrons.count)")
+            XCTFail("Expected exactly one visible back arrow in the bar, found \(chevrons.count)")
             throw Failure.notFound
         }
         return chevrons[0]

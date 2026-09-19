@@ -12,12 +12,27 @@ public class SwiftyDebug {
 
     /// URLs to monitor. When non-empty and `monitorAllUrls` is false, only requests
     /// matching these URLs are captured (case-insensitive substring match).
-    public static var urls: [String] = []
+    public static var urls: [String] = [] {
+        didSet { tagGeneration &+= 1 }
+    }
+
+    /// `urls` as `TagResolver` reads it. Separate only so the read is explicit
+    /// about the coupling: an allow-list entry can become a tag, so changing this
+    /// list must invalidate the resolver's cache — which the `didSet` above does.
+    static var urlsForTagging: [String] { urls }
 
     // MARK: - Network Tags
 
     /// Internal tag storage populated by `addTag(keyword:label:)`.
-    static var _tags: [String: String] = [:]
+    static var _tags: [String: String] = [:] {
+        didSet { tagGeneration &+= 1 }
+    }
+
+    /// Bumped on every change to `_tags`. `TagResolver` caches a resolved tag per
+    /// URL and keys that cache by this counter, so a tag added after some traffic
+    /// has already been rendered re-tags it instead of leaving a stale pill.
+    /// (See TAGS-FILTER.)
+    static private(set) var tagGeneration: UInt64 = 0
 
     /// Tag map for the network list. Key = URL keyword (case-insensitive substring),
     /// value = label to display.

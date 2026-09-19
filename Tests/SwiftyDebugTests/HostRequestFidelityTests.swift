@@ -90,12 +90,27 @@ final class HostRequestFidelityTests: XCTestCase {
         XCTAssertEqual(result.value(forHTTPHeaderField: "Accept-Language"), "ja-JP, ja;q=0.9")
     }
 
-    /// The boundary of the change: the other defaults are still added, so this
-    /// is a targeted removal rather than canonicalization being gutted.
+    /// The boundary of the change: `Accept` is still defaulted, so this is a
+    /// targeted removal rather than canonicalization being gutted.
     func testOtherCanonicalDefaultsAreStillApplied() {
         let result = canonicalised()
         XCTAssertEqual(result.value(forHTTPHeaderField: "Accept"), "*/*")
-        XCTAssertNotNil(result.value(forHTTPHeaderField: "Accept-Encoding"))
+    }
+
+    /// `Accept-Encoding` joined `Accept-Language` for the same reason: CFNetwork
+    /// sends `br;q=1.0, gzip;q=0.9, deflate;q=0.8`, and writing `gzip, deflate`
+    /// over it stripped brotli from every request the host app made as soon as
+    /// SwiftyDebug was linked — so the traffic under inspection stopped being
+    /// the traffic the app actually sends. (See STREAMING-PROGRESS.)
+    func testCanonicalizationDoesNotHardwireAcceptEncoding() {
+        let result = canonicalised()
+        XCTAssertNil(result.value(forHTTPHeaderField: "Accept-Encoding"),
+                     "SwiftyDebug must leave Accept-Encoding to CFNetwork, which offers brotli.")
+    }
+
+    func testAppSuppliedAcceptEncodingIsPreservedExactly() {
+        let result = canonicalised(headers: ["Accept-Encoding": "identity"])
+        XCTAssertEqual(result.value(forHTTPHeaderField: "Accept-Encoding"), "identity")
     }
 
     func testCanonicalizationStillNormalisesTheURL() {

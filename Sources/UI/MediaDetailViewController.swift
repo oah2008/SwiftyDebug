@@ -415,7 +415,7 @@ final class MediaDetailViewController: UIViewController {
     }
 
     @objc private func copyURL() {
-        UIPasteboard.general.string = item.urlString
+        ClipboardFormatter.copyVerbatim(item.urlString)
         let toast = UILabel()
         toast.text = "  URL copied  "
         toast.font = .systemFont(ofSize: 12, weight: .semibold)

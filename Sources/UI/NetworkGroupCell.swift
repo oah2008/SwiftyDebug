@@ -175,7 +175,9 @@ class NetworkGroupCell: UITableViewCell {
         if let tag = group.tag {
             tagPill.isHidden = false
             tagPill.text = tag
-            let color = NetworkCell.colorForTag(tag)
+            // Hash the group KEY, not its label: the rows inside this group hash
+            // the same key, so the header and its rows are one colour.
+            let color = NetworkCell.colorForTag(group.key)
             tagPill.backgroundColor = color.withAlphaComponent(0.25)
             tagPill.textColor = color
         } else {

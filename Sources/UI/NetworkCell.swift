@@ -539,61 +539,19 @@ class NetworkCell: UITableViewCell {
     // MARK: - Host Tag Logic
 
     private func configureHostTag(model: NetworkTransaction) {
-        guard let host = model.url?.host?.lowercased() else {
+        // One resolver for the pill, the filter sheet, the grouped header and
+        // the search results — so a request can never be "algolia proxy" here
+        // and "algolia.mahally.com" in the sheet. The first-match-over-a-Swift-
+        // Dictionary loop that used to live here also picked a different winner
+        // on different launches whenever two keywords matched. (See TAGS-FILTER.)
+        guard let pill = TagResolver.pill(for: model.url, isWebView: model.isWebViewRequest) else {
             hostTagLabel.isHidden = true
             return
         }
-
-        let fullURL = (model.url?.absoluteString ?? "").lowercased()
-
-        // 1. Custom tags — keyword is a substring of the full URL or the host.
-        if !SwiftyDebug._tags.isEmpty {
-            for (keyword, label) in SwiftyDebug._tags {
-                let lowerKeyword = keyword.lowercased()
-                if fullURL.contains(lowerKeyword) || host.contains(lowerKeyword) {
-                    let color = Self.colorForTag(keyword)
-                    hostTagLabel.isHidden = false
-                    hostTagLabel.text = label
-                    hostTagLabel.backgroundColor = color.withAlphaComponent(0.25)
-                    hostTagLabel.textColor = color
-                    return
-                }
-            }
-        }
-
-        // 2. WebView check
-        if model.isWebViewRequest {
-            let color = Self.colorForTag("web")
-            hostTagLabel.isHidden = false
-            hostTagLabel.text = "web"
-            hostTagLabel.backgroundColor = color.withAlphaComponent(0.25)
-            hostTagLabel.textColor = color
-            return
-        }
-
-        // 3. Built-in known third-party tags
-        let knownTags: [(keyword: String, label: String)] = [
-            ("algolia",   "algolia"),
-            ("onesignal", "one signal"),
-            ("jitsu",     "jitsu"),
-        ]
-
-        for tag in knownTags {
-            if host.contains(tag.keyword) {
-                let color = Self.colorForTag(tag.keyword)
-                hostTagLabel.isHidden = false
-                hostTagLabel.text = tag.label
-                hostTagLabel.backgroundColor = color.withAlphaComponent(0.25)
-                hostTagLabel.textColor = color
-                return
-            }
-        }
-
-        // 4. Unknown third-party: show abbreviated host
-        let color = Self.colorForTag(host)
+        let color = Self.colorForTag(pill.colorKey)
         hostTagLabel.isHidden = false
-        hostTagLabel.text = Self.abbreviateHost(host)
-        hostTagLabel.backgroundColor = color.withAlphaComponent(0.2)
+        hostTagLabel.text = pill.label
+        hostTagLabel.backgroundColor = color.withAlphaComponent(0.25)
         hostTagLabel.textColor = color
     }
 
@@ -671,23 +629,4 @@ class NetworkCell: UITableViewCell {
         onInterceptTapped?()
     }
 
-    private static func abbreviateHost(_ host: String) -> String {
-        var short = host
-        for prefix in ["www.", "api.", "cdn.", "m."] {
-            if short.hasPrefix(prefix) {
-                short = String(short.dropFirst(prefix.count))
-                break
-            }
-        }
-        for suffix in [".com", ".io", ".net", ".org", ".co"] {
-            if short.hasSuffix(suffix) {
-                short = String(short.dropLast(suffix.count))
-                break
-            }
-        }
-        if short.count > 12 {
-            short = String(short.prefix(10)) + ".."
-        }
-        return short
-    }
 }

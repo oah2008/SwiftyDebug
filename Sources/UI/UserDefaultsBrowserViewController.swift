@@ -817,7 +817,7 @@ final class UserDefaultsBrowserViewController: UITableViewController {
             showToast("Nothing to copy")
             return
         }
-        UIPasteboard.general.string = pretty
+        ClipboardFormatter.copyVerbatim(pretty)
         showToast("Copied \(entries.count) key\(entries.count == 1 ? "" : "s")")
     }
 
@@ -1469,7 +1469,7 @@ final class StorageValueReadOnlyViewController: UIViewController {
     }
 
     @objc private func copyTapped() {
-        UIPasteboard.general.string = value
+        ClipboardFormatter.copyExactly(value)
     }
 
     @objc private func deleteTapped() {

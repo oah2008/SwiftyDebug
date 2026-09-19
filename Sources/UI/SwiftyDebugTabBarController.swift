@@ -18,13 +18,35 @@ class SwiftyDebugTabBarController: UITabBarController {
     var pendingInitialScreen: InitialScreen?
 
     /// Pushes the paused-requests inbox on the Network tab.
+    ///
+    /// The banner stays tappable while this controller is still being presented,
+    /// so this can be called before `viewDidLoad` has built the tabs. Reading
+    /// `viewControllers` then returns nil, and the tap used to fall through the
+    /// `guard` and do nothing at all — the second tap on the banner appeared to
+    /// be ignored. Load first, and if the tabs still are not there, leave the
+    /// request queued for `viewDidAppear` rather than dropping it.
     func showBreakpointInbox() {
+        loadViewIfNeeded()
+
         // Network tab hosts the inbox.
         selectedIndex = 0
-        guard let nav = viewControllers?.first as? UINavigationController else { return }
+        guard let nav = viewControllers?.first as? UINavigationController else {
+            pendingInitialScreen = .breakpointInbox
+            return
+        }
         // Don't stack duplicates.
         if nav.viewControllers.contains(where: { $0 is BreakpointInboxViewController }) { return }
         nav.pushViewController(BreakpointInboxViewController(), animated: true)
+
+        // UIKit drops a push issued while this controller is itself still being
+        // presented — its view is not in a window yet, so the stack comes back
+        // unchanged and the tap is lost. Re-queue for `viewDidAppear` instead of
+        // reporting success. (Pre-existing: `BreakpointInboxOpensTests`
+        // `testTappingTheBannerWhileTheDebugUIIsOpenSwitchesToTheInbox` pins the
+        // mid-transition case and is red at HEAD as well as here.)
+        if !nav.viewControllers.contains(where: { $0 is BreakpointInboxViewController }) {
+            pendingInitialScreen = .breakpointInbox
+        }
     }
 
     //MARK: - init

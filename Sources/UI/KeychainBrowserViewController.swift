@@ -1590,7 +1590,7 @@ final class KeychainItemDetailViewController: UITableViewController {
     @objc private func copyTapped() {
         // The secret is only copied when it is currently revealed.
         let dump = rows.map { "\($0.caption)\n\($0.value)" }.joined(separator: "\n\n")
-        UIPasteboard.general.string = dump
+        ClipboardFormatter.copyVerbatim(dump)
     }
 
     override func numberOfSections(in tableView: UITableView) -> Int { 1 }

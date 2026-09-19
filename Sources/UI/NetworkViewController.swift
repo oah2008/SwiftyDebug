@@ -11,8 +11,14 @@ private enum NetworkTab: Int { case app = 0, web = 1, pinned = 2 }
 
 /// Per-tab filter + layout state (includes auto-follow + scroll offset).
 private final class TabFilterState {
-    var selectedPathFilters = Set<String>()
-    var selectedHostFilters = Set<String>()
+    /// Identities from `TagResolver` (`NetworkTag.key`). One set, not the old
+    /// path-filters/host-filters pair: a request resolves to exactly one tag, so
+    /// "is this row selected" is a set membership test and can no longer disagree
+    /// with the pill the row displays. (See TAGS-FILTER.)
+    var selectedTagKeys = Set<String>()
+    /// Host-scoped endpoint keys ("api.salla.dev/v2/stores/{id}"). Host-scoped
+    /// because a path alone collided across hosts: picking an endpoint under one
+    /// tag also admitted an identical path served by a different host.
     var selectedEndpoints = Set<String>()
     var searchText: String = ""
     var isGroupedMode: Bool = false
@@ -254,326 +260,108 @@ class NetworkViewController: UIViewController {
         }
     }
 
-    private func stripScheme(_ url: String) -> String {
-        var result = url
-        for prefix in ["https://", "http://", "HTTPS://", "HTTP://"] {
-            if result.hasPrefix(prefix) {
-                result = String(result.dropFirst(prefix.count))
-                break
-            }
-        }
-        return result
-    }
-
     //MARK: - Filter entry building
 
-    private func buildFilterEntries() -> [(display: String, filterKeys: [(key: String, isPathFilter: Bool)], isWeb: Bool)] {
-        let allCacheModels = cacheModels ?? []
-
-        // Filter by current tab first (respecting settings toggles). Media is
-        // excluded here too, so media hosts/endpoints never pollute the sheet.
-        let allModels = tabModels(from: allCacheModels)
-
-        let onlyURLs = SwiftyDebug.urls
-        var rawEntries: [(display: String, filterKey: String, isPathFilter: Bool, isWeb: Bool)] = []
-        var coveredHosts = Set<String>()
-        // Tracks filter keys already added (lowercased) so no duplicate rows are
-        // created across the onlyURLs, path-tag, host, and selected-filter passes.
-        var addedFilterKeys = Set<String>()
-
-        for urlString in onlyURLs {
-            var stripped = stripScheme(urlString)
-            if stripped.hasSuffix("/") { stripped = String(stripped.dropLast()) }
-
-            let host = stripped.components(separatedBy: "/").first ?? stripped
-
-            var hasMatch = false
-            var pathIsWeb = false
-            for model in allModels {
-                let modelURL = stripScheme(model.url?.absoluteString ?? "").lowercased()
-                let key = stripped.lowercased()
-                if modelURL.hasPrefix(key + "/") || modelURL == key {
-                    hasMatch = true
-                    if model.isWebViewRequest { pathIsWeb = true }
-                }
-            }
-
-            if hasMatch {
-                let display = tagLabel(forURLString: urlString) ?? stripped
-                rawEntries.append((display: display, filterKey: stripped, isPathFilter: true, isWeb: pathIsWeb))
-                coveredHosts.insert(host.lowercased())
-                addedFilterKeys.insert(stripped.lowercased())
-            }
-        }
-
-        // Path-scoped tag keywords (e.g. "google.com/products") become their own
-        // path-filter entries, distinct from a bare-host entry — this is what
-        // keeps two tags that share a host but differ by path from collapsing.
-        // (See TAGS-FILTER.)
-        var coveredByPathTag = Set<String>()   // model URLs already claimed by a path-tag
-        for (keyword, label) in SwiftyDebug._tags where keyword.contains("/") {
-            let key = stripScheme(keyword).lowercased()
-            let trimmedKey = key.hasSuffix("/") ? String(key.dropLast()) : key
-            guard !trimmedKey.isEmpty else { continue }
-
-            var hasMatch = false
-            var isWeb = false
-            for model in allModels {
-                let modelURL = stripScheme(model.url?.absoluteString ?? "").lowercased()
-                if modelURL.hasPrefix(trimmedKey + "/") || modelURL == trimmedKey {
-                    hasMatch = true
-                    coveredByPathTag.insert(modelURL)
-                    if model.isWebViewRequest { isWeb = true }
-                }
-            }
-            if hasMatch, !addedFilterKeys.contains(trimmedKey) {
-                addedFilterKeys.insert(trimmedKey)
-                rawEntries.append((display: label, filterKey: trimmedKey, isPathFilter: true, isWeb: isWeb))
-            }
-        }
-
-        var seenHosts = Set<String>()
-        for model in allModels {
-            guard let host = model.url?.host, !host.isEmpty else { continue }
-            let lowerHost = host.lowercased()
-            if seenHosts.contains(lowerHost) { continue }
-            seenHosts.insert(lowerHost)
-
-            if !coveredHosts.contains(lowerHost) {
-                let display = tagLabel(forHost: lowerHost) ?? host
-                let isWeb = allModels.contains { m in
-                    m.isWebViewRequest && m.url?.host?.lowercased() == lowerHost
-                }
-                rawEntries.append((display: display, filterKey: host, isPathFilter: false, isWeb: isWeb))
-            }
-        }
-
-        // Add currently-selected filters that are not already in the list (exact match)
-        let state = currentTabState
-
-        for key in state.selectedPathFilters {
-            let lower = key.lowercased()
-            if !addedFilterKeys.contains(lower) {
-                addedFilterKeys.insert(lower)
-                // Find original URL from SwiftyDebug.urls to resolve tag correctly
-                let originalURL = onlyURLs.first { stripScheme($0).lowercased().hasPrefix(lower) }
-                let display = tagLabel(forURLString: originalURL ?? key) ?? tagLabel(forHost: lower.components(separatedBy: "/").first ?? lower) ?? key
-                rawEntries.append((display: display, filterKey: key, isPathFilter: true, isWeb: false))
-            }
-        }
-        for key in state.selectedHostFilters {
-            let lower = key.lowercased()
-            if !addedFilterKeys.contains(lower) {
-                addedFilterKeys.insert(lower)
-                let originalURL = onlyURLs.first { stripScheme($0).lowercased().hasPrefix(lower) }
-                let display = tagLabel(forURLString: originalURL ?? key) ?? tagLabel(forHost: lower) ?? key
-                rawEntries.append((display: display, filterKey: key, isPathFilter: false, isWeb: false))
-            }
-        }
-
-        // Sort by priority then alphabetically
-        let sorted = rawEntries.sorted {
-            let priorityA = $0.isPathFilter ? 0 : ($0.isWeb ? 1 : 2)
-            let priorityB = $1.isPathFilter ? 0 : ($1.isWeb ? 1 : 2)
-            if priorityA != priorityB { return priorityA < priorityB }
-            return $0.display.lowercased() < $1.display.lowercased()
-        }
-
-        // Merge entries into rows. Path filters are keyed by their *filterKey* so
-        // two tags that share a display label but target different paths (e.g.
-        // "Algolia Proxy" → /products and another → /events) stay as separate
-        // rows. Host filters keep merging by display label so http/https and
-        // duplicate hosts collapse as before. (See TAGS-FILTER.)
-        var rowOrder: [String] = []
-        var mergedMap: [String: (display: String, filterKeys: [(key: String, isPathFilter: Bool)], isWeb: Bool)] = [:]
-        for entry in sorted {
-            // Distinct merge key: path filters never merge across different keys.
-            let mergeKey = entry.isPathFilter
-                ? "path|" + entry.filterKey.lowercased()
-                : "host|" + entry.display.lowercased()
-            if mergedMap[mergeKey] == nil {
-                rowOrder.append(mergeKey)
-                mergedMap[mergeKey] = (display: entry.display, filterKeys: [], isWeb: false)
-            }
-            mergedMap[mergeKey]!.filterKeys.append((key: entry.filterKey, isPathFilter: entry.isPathFilter))
-            if entry.isWeb { mergedMap[mergeKey]!.isWeb = true }
-        }
-        return rowOrder.map { mergeKey in
-            let info = mergedMap[mergeKey]!
-            return (display: info.display, filterKeys: info.filterKeys, isWeb: info.isWeb)
-        }
-    }
-
-    /// Returns the tag label from the tag map that best matches the full URL,
-    /// or nil if no custom tag matches.
+    /// Every tag that has at least one request in the current tab, with its count.
     ///
-    /// Matching is **deterministic** and **path-aware** (see TAGS-FILTER): when
-    /// two tag keywords could match, the *longest* keyword wins (most specific),
-    /// so path-scoped keywords like `google.com/products` beat a bare host
-    /// keyword like `google.com`, and dictionary iteration order no longer
-    /// affects the result.
-    private func tagLabel(forURLString urlString: String) -> String? {
-        let map = SwiftyDebug._tags
-        guard !map.isEmpty else { return nil }
-        // Direct key lookup first (most common case: urls key == tag keyword)
-        if let label = map[urlString] { return label }
+    /// Enumerated FROM THE TRAFFIC via `TagResolver`, not assembled from four
+    /// overlapping passes over `SwiftyDebug.urls`, the tag table and the host
+    /// list. Those passes deduped by a normalised filter key, and that dedup is
+    /// what swallowed one of two tags that shared a host — the reported bug.
+    /// There is nothing left to swallow: one request resolves to one tag, and
+    /// every tag with a request gets a row. (See TAGS-FILTER.)
+    private func buildFilterEntries() -> [(tag: NetworkTag, count: Int)] {
+        let models = tabModels(from: cacheModels ?? [])
+        var entries = TagResolver.tags(forURLStrings: models.compactMap { $0.url?.absoluteString })
 
-        let lower = urlString.lowercased()
-        // Longest-keyword-wins substring match for determinism + path awareness.
-        var best: (keyword: String, label: String)?
-        for (keyword, label) in map where lower.contains(keyword.lowercased()) {
-            if best == nil || keyword.count > best!.keyword.count {
-                best = (keyword, label)
-            }
+        // A tag the user has selected but whose traffic has since been cleared
+        // must still render, or the sheet would silently drop a filter that is
+        // actively hiding rows.
+        let known = Set(entries.map { $0.tag.key })
+        for key in currentTabState.selectedTagKeys where !known.contains(key) {
+            entries.append((tag: NetworkTag(key: key,
+                                            label: Self.orphanedTagLabel(forKey: key),
+                                            origin: .derivedHost,
+                                            matchedKeyword: ""),
+                            count: 0))
         }
-        return best?.label
+        return entries
     }
 
-    /// Returns the tag label whose keyword matches the given host, or nil.
+    /// Display name for a selected tag with no traffic left to name it.
+    static func orphanedTagLabel(forKey key: String) -> String {
+        for prefix in ["tag:", "url:", "api:", "host:"] where key.hasPrefix(prefix) {
+            return String(key.dropFirst(prefix.count))
+        }
+        return key
+    }
+
+    /// True when any request in the tab is a webview request carrying `tagKey`.
+    /// Drives the "· web" annotation the sheet shows under a row.
+    private func tagHasWebTraffic(_ tagKey: String, in models: [NetworkTransaction]) -> Bool {
+        models.contains { $0.isWebViewRequest && TagResolver.matches(tagKey: tagKey, url: $0.url) }
+    }
+
+    /// The endpoints reachable under the selected tags, one row per distinct
+    /// host+endpoint.
     ///
-    /// Only *host-scoped* keywords (those without a `/` path segment) can match a
-    /// bare host; a path-scoped keyword like `google.com/products` intentionally
-    /// does NOT match the bare host `google.com` (it needs the full URL — see
-    /// `tagLabel(forURLString:)`). Longest keyword wins for determinism.
-    private func tagLabel(forHost host: String) -> String? {
-        let map = SwiftyDebug._tags
-        guard !map.isEmpty else { return nil }
-        let lowerHost = host.lowercased()
-        var best: (keyword: String, label: String)?
-        for (keyword, label) in map {
-            let k = keyword.lowercased()
-            // Skip path-scoped keywords here — they belong to the full-URL matcher.
-            if k.contains("/") { continue }
-            guard lowerHost.contains(k) else { continue }
-            if best == nil || keyword.count > best!.keyword.count {
-                best = (keyword, label)
-            }
-        }
-        return best?.label
-    }
-
-    private func uniqueEndpointsForFilters(pathFilters: Set<String>, hostFilters: Set<String>) -> [FilterableEndpoint] {
-        guard let allCache = cacheModels else { return [] }
-        // Filter by current tab (respecting settings toggles + media routing)
+    /// Keyed by HOST and path, not by path alone. The old key was the normalised
+    /// path on its own, so a proxy and its origin exposing the same route shared
+    /// one row: selecting it under one tag admitted the other host's traffic, and
+    /// the second host's row never appeared at all because the dedup had already
+    /// claimed the path. (See TAGS-FILTER.)
+    private func uniqueEndpointsForFilters(tagKeys: Set<String>) -> [FilterableEndpoint] {
+        guard !tagKeys.isEmpty, let allCache = cacheModels else { return [] }
         let models = tabModels(from: allCache)
-        if pathFilters.isEmpty && hostFilters.isEmpty { return [] }
 
-        let onlyURLs = SwiftyDebug.urls
-
-        // Build set of onlyURLs paths (for exclusion — already top-level filter entries).
-        // Also map: lowercased stripped key → original full URL (for tag lookup).
-        var onlyURLPaths = Set<String>()
-        var strippedToOriginalURL: [String: String] = [:]
-        for urlString in onlyURLs {
-            var stripped = stripScheme(urlString)
-            if stripped.hasSuffix("/") { stripped = String(stripped.dropLast()) }
-            strippedToOriginalURL[stripped.lowercased()] = urlString
-            if let url = URL(string: urlString) {
-                var path = url.path
-                if path.hasSuffix("/") && path.count > 1 { path = String(path.dropLast()) }
-                if !path.isEmpty && path != "/" {
-                    onlyURLPaths.insert(Self.normalizeEndpoint(path).lowercased())
-                }
-            }
-        }
-
-        // Tag label for each selected path filter.
-        var pathFilterTagMap: [String: String] = [:]
-        for pf in pathFilters {
-            let key = pf.lowercased()
-            if let original = strippedToOriginalURL[key] {
-                pathFilterTagMap[key] = tagLabel(forURLString: original) ?? pf
-            } else {
-                pathFilterTagMap[key] = tagLabel(forURLString: pf) ?? pf
-            }
-        }
-
-        // Tag label for each selected host filter.
-        var hostFilterTagMap: [String: String] = [:]
-        for hf in hostFilters {
-            hostFilterTagMap[hf.lowercased()] = tagLabel(forHost: hf.lowercased()) ?? hf
-        }
-
-        // Path prefix to strip per path filter so we show relative sub-paths.
-        // e.g. "api.salla.dev/mahally/v2" → "/mahally/v2"
-        var pathPrefixMap: [String: String] = [:]
-        for pf in pathFilters {
-            let subParts = Array(pf.components(separatedBy: "/").dropFirst())
-            if !subParts.isEmpty {
-                pathPrefixMap[pf.lowercased()] = "/" + subParts.joined(separator: "/")
-            }
-        }
-
-        // Pre-build set of filterPaths that have at least one web request, so
-        // we can show "· web" in the tag regardless of which model is processed first.
-        var webFilterPaths = Set<String>()
-        for model in models where model.isWebViewRequest {
-            let fp = Self.normalizeEndpoint(model.url?.path ?? "")
-            if !fp.isEmpty { webFilterPaths.insert(fp) }
-        }
-
-        var seen = Set<String>()   // dedup by filterPath (full normalized path)
+        var seen = Set<String>()
         var result = [FilterableEndpoint]()
+        var webKeys = Set<String>()
+
         for model in models {
-            let modelURL = stripScheme(model.url?.absoluteString ?? "").lowercased()
-            let host = (model.url?.host ?? "").lowercased()
-            let fullPath = model.url?.path ?? ""
+            guard let url = model.url as URL?,
+                  let tag = TagResolver.tag(for: url),
+                  tagKeys.contains(tag.key) else { continue }
 
-            var matchedPrefix: String? = nil
-            var matchedTag = ""
-            var matches = false
-            for pf in pathFilters {
-                let key = pf.lowercased()
-                if modelURL.hasPrefix(key + "/") || modelURL == key {
-                    matches = true
-                    matchedPrefix = pathPrefixMap[key]
-                    matchedTag = pathFilterTagMap[key] ?? pf
-                    break
-                }
-            }
-            if !matches {
-                for hf in hostFilters {
-                    if host == hf.lowercased() {
-                        matches = true
-                        matchedTag = hostFilterTagMap[hf.lowercased()] ?? hf
-                        break
-                    }
-                }
-            }
-            if !matches { continue }
+            let normalizedPath = Self.normalizeEndpoint(url.path)
+            guard !normalizedPath.isEmpty, normalizedPath != "/" else { continue }
 
-            // Skip models whose full path is itself an onlyURLs entry (already a top-level filter)
-            let fullNormalized = Self.normalizeEndpoint(fullPath).lowercased()
-            if fullNormalized.isEmpty || onlyURLPaths.contains(fullNormalized) { continue }
+            let host = TagResolver.normalizeHost(url.host ?? "")
+            let filterKey = Self.endpointKey(host: host, normalizedPath: normalizedPath)
+            if model.isWebViewRequest { webKeys.insert(filterKey) }
+            guard seen.insert(filterKey).inserted else { continue }
 
-            // filterPath = full normalized path (used as key in applyFilter)
-            let filterPath = Self.normalizeEndpoint(fullPath)
-            if filterPath.isEmpty { continue }
-            guard seen.insert(filterPath).inserted else { continue }
-
-            // displayPath = relative sub-path (strip the onlyURLs base prefix for readability)
-            var displayPath = fullPath
-            if let prefix = matchedPrefix, fullPath.lowercased().hasPrefix(prefix.lowercased()) {
-                let relative = String(fullPath.dropFirst(prefix.count))
-                displayPath = relative.isEmpty ? "/" : relative
-            }
-            let normalizedDisplay = Self.normalizeEndpoint(displayPath)
-            if normalizedDisplay.isEmpty || normalizedDisplay == "/" { continue }
-
-            let isWebEndpoint = webFilterPaths.contains(filterPath)
-            let endpointTag: String
-            if isWebEndpoint {
-                endpointTag = matchedTag.isEmpty ? "web" : "\(matchedTag) · web"
-            } else {
-                endpointTag = matchedTag
-            }
-            result.append(FilterableEndpoint(
-                displayPath: normalizedDisplay,
-                filterPath: filterPath,
-                tag: endpointTag
-            ))
+            result.append(FilterableEndpoint(displayPath: normalizedPath,
+                                             filterPath: filterKey,
+                                             tag: tag.label))
         }
-        return result.sorted { $0.displayPath < $1.displayPath }
+
+        // The "· web" annotation is applied after the sweep so it does not depend
+        // on whether the webview request happened to be the first one seen.
+        return result
+            .map { endpoint in
+                guard webKeys.contains(endpoint.filterPath) else { return endpoint }
+                return FilterableEndpoint(displayPath: endpoint.displayPath,
+                                          filterPath: endpoint.filterPath,
+                                          tag: endpoint.tag.isEmpty ? "web" : endpoint.tag + " \u{00B7} web")
+            }
+            .sorted { ($0.tag, $0.displayPath) < ($1.tag, $1.displayPath) }
+    }
+
+    /// The identity of one endpoint row. Host-scoped — see
+    /// `uniqueEndpointsForFilters`.
+    static func endpointKey(host: String, normalizedPath: String) -> String {
+        host + normalizedPath
+    }
+
+    /// The endpoint key for a captured request, so the list and the predicate
+    /// derive it the same way.
+    static func endpointKey(for url: URL?) -> String? {
+        guard let url else { return nil }
+        let normalizedPath = normalizeEndpoint(url.path)
+        guard !normalizedPath.isEmpty, normalizedPath != "/" else { return nil }
+        return endpointKey(host: TagResolver.normalizeHost(url.host ?? ""),
+                           normalizedPath: normalizedPath)
     }
 
     static func normalizeEndpoint(_ path: String) -> String {
@@ -597,33 +385,30 @@ class NetworkViewController: UIViewController {
         //    pinned item is always shown.
         var filtered = tabModels(from: cacheModels)
 
-        // 2. Path / host filters
-        let pathFilters = state.selectedPathFilters
-        let hostFilters = state.selectedHostFilters
+        // 2. Tag filter.
+        //
+        // "Belongs to the selected tag" is `TagResolver`'s own answer, so the
+        // rows kept are exactly the rows showing that pill. The predicate this
+        // replaces compared a tag keyword against `absoluteString` — which
+        // carries the query string — so selecting a tag for an endpoint like
+        // `/1/events` matched nothing at all as soon as the request had
+        // `?x-algolia-api-key=…` on it. (See TAGS-FILTER.)
+        let tagKeys = state.selectedTagKeys
         let endpoints = state.selectedEndpoints
 
-        let hasFilterSelection = !pathFilters.isEmpty || !hostFilters.isEmpty
-        if hasFilterSelection {
+        if !tagKeys.isEmpty {
             filtered = filtered.filter { model in
-                let modelURL = stripScheme(model.url?.absoluteString ?? "").lowercased()
-                let host = (model.url?.host ?? "").lowercased()
-
-                for pf in pathFilters {
-                    let key = pf.lowercased()
-                    if modelURL.hasPrefix(key + "/") || modelURL == key { return true }
-                }
-                for hf in hostFilters {
-                    if host == hf.lowercased() { return true }
-                }
-                return false
+                guard let key = TagResolver.tag(for: model.url)?.key else { return false }
+                return tagKeys.contains(key)
             }
         }
 
-        // 3. Endpoint filter
+        // 3. Endpoint filter — host-scoped, derived by the same helper the sheet
+        //    lists with.
         if !endpoints.isEmpty {
             filtered = filtered.filter { model in
-                let normalized = Self.normalizeEndpoint(model.url?.path ?? "")
-                return endpoints.contains(normalized)
+                guard let key = Self.endpointKey(for: model.url as URL?) else { return false }
+                return endpoints.contains(key)
             }
         }
 
@@ -690,9 +475,7 @@ class NetworkViewController: UIViewController {
     /// active pill so an applied filter is visible without decoding a glyph.
     private func updateFilterButtonIcon() {
         let state = currentTabState
-        let hasFilter = !state.selectedPathFilters.isEmpty ||
-                        !state.selectedHostFilters.isEmpty ||
-                        !state.selectedEndpoints.isEmpty
+        let hasFilter = !state.selectedTagKeys.isEmpty || !state.selectedEndpoints.isEmpty
         let iconName = hasFilter
             ? "line.3.horizontal.decrease.circle.fill"
             : "line.3.horizontal.decrease.circle"
@@ -1029,49 +812,34 @@ class NetworkViewController: UIViewController {
 
     //MARK: - Grouped models
 
+    /// Groups the visible rows by their resolved tag.
+    ///
+    /// One pass over the traffic, grouping by `NetworkTag.key`, rather than two
+    /// passes (allow-list URLs, then leftover hosts) with two different matchers.
+    /// Because the grouping key IS the tag, a group header, the pills inside it
+    /// and the filter sheet row all name the same thing. (See TAGS-FILTER.)
     private func buildGroupedModels(from models: [NetworkTransaction]) -> [NetworkGroup] {
-        let onlyURLs = SwiftyDebug.urls
-        var groups: [(key: String, display: String, tag: String?, isPath: Bool, models: [NetworkTransaction])] = []
-        var assigned = Set<Int>()
+        var order: [String] = []
+        var byKey: [String: (tag: NetworkTag, models: [NetworkTransaction])] = [:]
 
-        // Pass 1: onlyURLs groups
-        for urlString in onlyURLs {
-            var stripped = stripScheme(urlString)
-            if stripped.hasSuffix("/") { stripped = String(stripped.dropLast()) }
-            let tag = tagLabel(forURLString: urlString)
-            var matched: [NetworkTransaction] = []
-            for (i, model) in models.enumerated() {
-                let modelURL = stripScheme(model.url?.absoluteString ?? "").lowercased()
-                let key = stripped.lowercased()
-                if modelURL.hasPrefix(key + "/") || modelURL == key {
-                    matched.append(model)
-                    assigned.insert(i)
-                }
+        for model in models {
+            guard let tag = TagResolver.tag(for: model.url) else { continue }
+            if byKey[tag.key] == nil {
+                order.append(tag.key)
+                byKey[tag.key] = (tag: tag, models: [])
             }
-            if !matched.isEmpty {
-                groups.append((key: stripped, display: tag ?? stripped, tag: tag, isPath: true, models: matched))
-            }
+            byKey[tag.key]!.models.append(model)
         }
 
-        // Pass 2: remaining models grouped by host
-        var hostGroups: [String: [NetworkTransaction]] = [:]
-        var hostOrder: [String] = []
-        for (i, model) in models.enumerated() where !assigned.contains(i) {
-            let host = (model.url?.host ?? "").lowercased()
-            guard !host.isEmpty else { continue }
-            if hostGroups[host] == nil { hostOrder.append(host) }
-            hostGroups[host, default: []].append(model)
-        }
-        for host in hostOrder {
-            let tag = tagLabel(forHost: host)
-            let display = tag ?? host
-            groups.append((key: host, display: display, tag: tag, isPath: false, models: hostGroups[host]!))
-        }
-
-        return groups.map {
-            NetworkGroup(key: $0.key, displayName: $0.display, fullURL: $0.key,
-                         tag: $0.tag, isPathFilter: $0.isPath,
-                         count: $0.models.count, models: $0.models)
+        return order.compactMap { key in
+            guard let entry = byKey[key] else { return nil }
+            return NetworkGroup(key: key,
+                                displayName: entry.tag.label,
+                                fullURL: entry.tag.matchedKeyword,
+                                tag: entry.tag.label,
+                                isPathFilter: entry.tag.origin == .userTag,
+                                count: entry.models.count,
+                                models: entry.models)
         }
     }
 
@@ -1079,27 +847,27 @@ class NetworkViewController: UIViewController {
 
     @objc func didTapFilter() {
         let entries = buildFilterEntries()
+        let tabbedModels = tabModels(from: cacheModels ?? [])
 
         let state = currentTabState
         let sheet = NetworkFilterSheetController()
-        sheet.entries = entries
-        sheet.tempPathFilters = state.selectedPathFilters
-        sheet.tempHostFilters = state.selectedHostFilters
+        sheet.entries = entries.map { entry in
+            NetworkFilterSheetController.Row(tag: entry.tag,
+                                             count: entry.count,
+                                             isWeb: tagHasWebTraffic(entry.tag.key, in: tabbedModels))
+        }
+        sheet.tempTagKeys = state.selectedTagKeys
         sheet.tempEndpoints = state.selectedEndpoints
 
         sheet.endpointProvider = { [weak self, weak sheet] in
             guard let self = self, let sheet = sheet else { return [] }
-            return self.uniqueEndpointsForFilters(
-                pathFilters: sheet.tempPathFilters,
-                hostFilters: sheet.tempHostFilters
-            )
+            return self.uniqueEndpointsForFilters(tagKeys: sheet.tempTagKeys)
         }
 
-        sheet.onApply = { [weak self] pathFilters, hostFilters, endpoints in
+        sheet.onApply = { [weak self] tagKeys, endpoints in
             guard let self = self else { return }
             let s = self.currentTabState
-            s.selectedPathFilters = pathFilters
-            s.selectedHostFilters = hostFilters
+            s.selectedTagKeys = tagKeys
             s.selectedEndpoints = endpoints
             self.applyFilter()
             self.updateFilterButtonIcon()

@@ -55,7 +55,13 @@ class ConsoleCell: UITableViewCell {
 
     private static let baseParagraphStyle: NSParagraphStyle = {
         let p = NSMutableParagraphStyle()
-        p.alignment = .natural
+        // A paragraph style on the attributed string OVERRIDES the label's own
+        // `textAlignment`, so neither the appearance proxy nor the subtree sweep
+        // can reach these lines — they have to be pinned here. `.natural` and a
+        // `.natural` base writing direction both resolve from the text's content
+        // in an RTL host, which mirrored every console line. (See FORCED-LTR.)
+        p.alignment = .left
+        p.baseWritingDirection = .leftToRight
         p.lineSpacing = 1
         p.lineBreakMode = .byCharWrapping
         return p

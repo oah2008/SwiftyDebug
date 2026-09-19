@@ -874,7 +874,7 @@ final class JSONEditorViewController: UIViewController {
                 self.showAlert("Can't copy this value", self.unrepresentableReason(of: node))
                 return
             }
-            UIPasteboard.general.string = text
+            ClipboardFormatter.copyVerbatim(text)
         })
         options.append(.init(title: "Copy path", subtitle: path.display, symbol: "arrow.triangle.branch") {
             UIPasteboard.general.string = path.display

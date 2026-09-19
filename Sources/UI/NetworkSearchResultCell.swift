@@ -467,39 +467,13 @@ final class NetworkSearchResultCell: UITableViewCell {
     }
 
     private func configureHostTag(model: NetworkTransaction) {
-        guard let host = model.url?.host?.lowercased() else {
+        // Same resolver as `NetworkCell` — a search hit and the list row it came
+        // from must show the same pill. (See TAGS-FILTER.)
+        guard let pill = TagResolver.pill(for: model.url, isWebView: model.isWebViewRequest) else {
             hostTagLabel.isHidden = true
             return
         }
-
-        let fullURL = (model.url?.absoluteString ?? "").lowercased()
-
-        if !SwiftyDebug._tags.isEmpty {
-            for (keyword, label) in SwiftyDebug._tags {
-                let lowerKeyword = keyword.lowercased()
-                if fullURL.contains(lowerKeyword) || host.contains(lowerKeyword) {
-                    applyHostTag(label, key: keyword, alpha: 0.25)
-                    return
-                }
-            }
-        }
-
-        if model.isWebViewRequest {
-            applyHostTag("web", key: "web", alpha: 0.25)
-            return
-        }
-
-        let knownTags: [(keyword: String, label: String)] = [
-            ("algolia",   "algolia"),
-            ("onesignal", "one signal"),
-            ("jitsu",     "jitsu"),
-        ]
-        for tag in knownTags where host.contains(tag.keyword) {
-            applyHostTag(tag.label, key: tag.keyword, alpha: 0.25)
-            return
-        }
-
-        applyHostTag(Self.abbreviateHost(host), key: host, alpha: 0.2)
+        applyHostTag(pill.label, key: pill.colorKey, alpha: 0.25)
     }
 
     private func applyHostTag(_ label: String, key: String, alpha: CGFloat) {
@@ -510,19 +484,4 @@ final class NetworkSearchResultCell: UITableViewCell {
         hostTagLabel.textColor = color
     }
 
-    private static func abbreviateHost(_ host: String) -> String {
-        var short = host
-        for prefix in ["www.", "api.", "cdn.", "m."] where short.hasPrefix(prefix) {
-            short = String(short.dropFirst(prefix.count))
-            break
-        }
-        for suffix in [".com", ".io", ".net", ".org", ".co"] where short.hasSuffix(suffix) {
-            short = String(short.dropLast(suffix.count))
-            break
-        }
-        if short.count > 12 {
-            short = String(short.prefix(10)) + ".."
-        }
-        return short
-    }
 }

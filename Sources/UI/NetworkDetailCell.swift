@@ -333,19 +333,19 @@ class NetworkDetailCell: UITableViewCell {
                     contentTextView.attributedText = nil
                     contentTextView.text = content
                     contentTextView.font = .systemFont(ofSize: 13)
-                    contentTextView.textAlignment = .natural
+                    contentTextView.textAlignment = .left  // `.natural` resolves RIGHT in an RTL host; the SDK is always LTR. (See FORCED-LTR.)
                     contentTextView.textColor = UIColor(white: 0.55, alpha: 1)
                 } else if mustInPreview {
                     // Large content: show truncated preview with highlighting + button
                     let truncated = String(content.prefix(Self.truncateLength)) + "\n..."
                     contentTextView.attributedText = isCurl ? Self.highlightCurl(truncated) : Self.highlightJSON(truncated)
-                    contentTextView.textAlignment = .natural
+                    contentTextView.textAlignment = .left  // `.natural` resolves RIGHT in an RTL host; the SDK is always LTR. (See FORCED-LTR.)
                     showFullButton.setTitle(isCurl ? "Show Full cURL" : "Show Full Response", for: .normal)
                     showFullButton.isHidden = false
                 } else {
                     // Normal content: full syntax highlighting
                     contentTextView.attributedText = isCurl ? Self.highlightCurl(content) : Self.highlightJSON(content)
-                    contentTextView.textAlignment = .natural
+                    contentTextView.textAlignment = .left  // `.natural` resolves RIGHT in an RTL host; the SDK is always LTR. (See FORCED-LTR.)
                 }
             }
         }

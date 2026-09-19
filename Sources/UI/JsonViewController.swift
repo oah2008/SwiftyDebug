@@ -124,8 +124,13 @@ class JsonViewController: UIViewController {
             result.append(contentAttr)
         }
 
-        // Paragraph style for the entire string
+        // Paragraph style for the entire string.
+        // Alignment and base writing direction are pinned here because a
+        // paragraph style beats the view's `textAlignment`, so the window's
+        // forced-LTR sweep cannot correct it. (See FORCED-LTR.)
         let paraStyle = NSMutableParagraphStyle()
+        paraStyle.alignment = .left
+        paraStyle.baseWritingDirection = .leftToRight
         paraStyle.lineBreakMode = .byWordWrapping
         paraStyle.lineSpacing = 2
         result.addAttribute(.paragraphStyle, value: paraStyle, range: NSRange(location: 0, length: result.length))
@@ -210,7 +215,7 @@ class JsonViewController: UIViewController {
         } else {
             text = logModel?.content ?? ""
         }
-        UIPasteboard.general.string = text
+        ClipboardFormatter.copyVerbatim(text)
 
         // Flash checkmark feedback
         let config = UIImage.SymbolConfiguration(pointSize: 16, weight: .medium)

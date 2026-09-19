@@ -166,24 +166,21 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         return result
     }
 
+    /// Labels come from the one resolver, so a host reads the same here as it
+    /// does on a request row and in the network filter sheet. This screen used to
+    /// carry its own first-match-over-a-dictionary copy, which returned a
+    /// different answer from the rest of the SDK — and a different one between
+    /// launches. Only the LABELS are shared: the `filterKeys` this sheet produces
+    /// are persisted into `InterceptRule.matchHosts` and must keep their existing
+    /// shape. (See TAGS-FILTER.)
     private func tagLabel(forURLString urlString: String) -> String? {
-        let map = SwiftyDebug._tags
-        guard !map.isEmpty else { return nil }
-        let lower = urlString.lowercased()
-        if let label = map[urlString] { return label }
-        for (keyword, label) in map where lower.contains(keyword.lowercased()) {
-            return label
-        }
-        return nil
+        guard let tag = TagResolver.tag(forURLString: urlString),
+              tag.origin != .derivedHost else { return nil }
+        return tag.label
     }
 
     private func tagLabel(forHost host: String) -> String? {
-        let map = SwiftyDebug._tags
-        guard !map.isEmpty else { return nil }
-        for (keyword, label) in map where host.contains(keyword.lowercased()) {
-            return label
-        }
-        return nil
+        tagLabel(forURLString: "https://" + host)
     }
 
     // MARK: - UI Setup

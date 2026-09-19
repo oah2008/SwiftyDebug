@@ -313,8 +313,10 @@ class NetworkGroupDetailVC: UIViewController {
         // Endpoint filter
         if !selectedEndpoints.isEmpty {
             result = result.filter { model in
-                let normalized = NetworkViewController.normalizeEndpoint(model.url?.path ?? "")
-                return selectedEndpoints.contains(normalized)
+                // Host-scoped, same helper the list is built with — a path alone
+                // collides across hosts. (See TAGS-FILTER.)
+                guard let key = NetworkViewController.endpointKey(for: model.url as URL?) else { return false }
+                return selectedEndpoints.contains(key)
             }
         }
 
@@ -357,7 +359,7 @@ class NetworkGroupDetailVC: UIViewController {
         // Pre-supply endpoints directly
         sheet.endpointProvider = { endpoints }
 
-        sheet.onApply = { [weak self] _, _, endpoints in
+        sheet.onApply = { [weak self] _, endpoints in
             guard let self = self else { return }
             self.selectedEndpoints = endpoints
             self.updateFilterButtonIcon()
@@ -387,13 +389,14 @@ class NetworkGroupDetailVC: UIViewController {
             }
         }
 
-        let tag = self.title ?? groupKey
-
         for model in models {
             let fullPath = model.url?.path ?? ""
             guard !fullPath.isEmpty else { continue }
-            let filterPath = NetworkViewController.normalizeEndpoint(fullPath)
-            guard !filterPath.isEmpty, seen.insert(filterPath).inserted else { continue }
+            // The row's tag comes from the resolver, not from this screen's
+            // title, so it reads the same here as in the list. (See TAGS-FILTER.)
+            let tag = TagResolver.tag(for: model.url)?.label ?? (self.title ?? groupKey)
+            guard let filterPath = NetworkViewController.endpointKey(for: model.url as URL?),
+                  seen.insert(filterPath).inserted else { continue }
 
             // Compute relative display path (strip group prefix)
             var displayPath = fullPath

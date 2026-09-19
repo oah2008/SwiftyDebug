@@ -58,6 +58,23 @@ class SwiftyDebugHostingWindow: UIWindow {
     private static let appearanceProxyInstalled: Void = {
         UIView.appearance(whenContainedInInstancesOf: [SwiftyDebugHostingWindow.self])
             .semanticContentAttribute = .forceLeftToRight
+
+        // `semanticContentAttribute` does NOT move text alignment. A label that
+        // never assigns `textAlignment` keeps `.natural`, and `.natural` resolves
+        // from the *text/process* writing direction, not from the view's semantic
+        // attribute and not from the `layoutDirection` trait — so in an RTL host
+        // every unaligned label in the SDK rendered right-aligned no matter how
+        // hard the window pinned direction. That is the "text alignment broken"
+        // half of the report, and it needs its own proxy.
+        //
+        // UIAppearance never overwrites a value a view set for itself, so the
+        // explicit `.center` and `.right` alignments throughout the SDK survive.
+        UILabel.appearance(whenContainedInInstancesOf: [SwiftyDebugHostingWindow.self])
+            .textAlignment = .left
+        UITextView.appearance(whenContainedInInstancesOf: [SwiftyDebugHostingWindow.self])
+            .textAlignment = .left
+        UITextField.appearance(whenContainedInInstancesOf: [SwiftyDebugHostingWindow.self])
+            .textAlignment = .left
     }()
 
     override init(frame: CGRect) {
@@ -98,25 +115,71 @@ class SwiftyDebugHostingWindow: UIWindow {
         UITraitCollection(traitsFrom: [base, UITraitCollection(layoutDirection: .leftToRight)])
     }
 
-    // MARK: - Audit
-
-    private var didAuditLayoutDirection = false
+    // MARK: - Continuous enforcement
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        auditLayoutDirectionOnce()
+        enforceLeftToRightSubtree()
+        auditLayoutDirection()
     }
+
+    /// Re-asserts LTR over everything currently hosted, every layout pass.
+    ///
+    /// Both previous mechanisms were entry-time: the appearance proxy stamps a
+    /// view once as it moves into the window, and `traitOverrides` is set once on
+    /// the window. Neither reaches a view UIKit builds, re-parents or
+    /// re-configures later — a navigation bar's private back-button image view is
+    /// created on push, an alert's hierarchy does not exist until it is
+    /// presented, and a cell dequeued after the first sweep was never swept.
+    ///
+    /// `pinLeftToRight()` no-ops on a node that is already correct, so a steady
+    /// state costs one comparison per view per layout pass.
+    private func enforceLeftToRightSubtree() {
+        rootViewController?.view.pinLeftToRight()
+        // A presented sheet or alert lives in its own container under this window,
+        // outside the root view controller's subtree.
+        var presented = rootViewController?.presentedViewController
+        while let controller = presented {
+            if !Self.isOutOfProcess(controller) { controller.view.pinLeftToRight() }
+            presented = controller.presentedViewController
+        }
+        for subview in subviews where subview !== rootViewController?.view {
+            subview.pinLeftToRight()
+        }
+    }
+
+    /// Share sheets and document pickers are REMOTE view controllers: their
+    /// content is rendered by another process, the SDK does not own it, and
+    /// reaching into it is both ineffective and not ours to do. They keep the
+    /// system's direction, deliberately.
+    static func isOutOfProcess(_ controller: UIViewController) -> Bool {
+        if controller is UIActivityViewController || controller is UIDocumentPickerViewController {
+            return true
+        }
+        return String(describing: type(of: controller)).contains("Remote")
+    }
+
+    // MARK: - Audit
+
+    /// Classes already reported, so a persistent failure logs once rather than
+    /// once per layout pass.
+    private var auditedFailures = Set<String>()
 
     /// Forced LTR is invisible when it works and equally invisible when it fails —
     /// the exact shape of silent no-op this codebase keeps shipping. If a host app
     /// still wins, say so once, out loud, instead of quietly rendering mirrored.
-    private func auditLayoutDirectionOnce() {
-        guard !didAuditLayoutDirection, let root = rootViewController?.view, root.window === self else { return }
-        didAuditLayoutDirection = true
+    private func auditLayoutDirection() {
+        guard let root = rootViewController?.view, root.window === self else { return }
 
         let semanticIsLTR = root.effectiveUserInterfaceLayoutDirection == .leftToRight
         let traitIsLTR = root.traitCollection.layoutDirection != .rightToLeft
         if semanticIsLTR && traitIsLTR { return }
+
+        // Keyed by class so a real, persistent failure is reported — the previous
+        // one-shot flag fired on the FIRST layout pass, when this window holds
+        // nothing but the bubble, and then disarmed itself before any of the UI
+        // it was meant to check existed.
+        guard auditedFailures.insert(String(describing: type(of: root))).inserted else { return }
 
         NSLog("""
               [SwiftyDebug] Forced left-to-right layout did NOT take effect in \
@@ -142,9 +205,26 @@ extension UIView {
     /// their geometry one layout pass earlier) and for anything built outside an
     /// SDK window.
     func forceLTR() {
-        // The semantic attribute alone does not move the `layoutDirection` trait,
-        // and direction-aware images resolve from the trait — pin both.
-        //
+        pinLeftToRight()
+    }
+
+    /// Pins direction on this view and everything beneath it: the semantic
+    /// attribute, the `layoutDirection` trait, and text alignment.
+    ///
+    /// All three, on every node — the previous version pinned the trait on the
+    /// *receiver only* and left the subtree to inheritance, and never touched
+    /// alignment at all. Each is skipped when already correct, so re-running this
+    /// every layout pass is a comparison per view, not work per view.
+    func pinLeftToRight() {
+        // Never descend into another process's view hierarchy — a share sheet or
+        // document picker is rendered remotely, so pinning it does nothing useful
+        // and is not the SDK's business.
+        if Self.isRemoteContainer(self) { return }
+
+        if semanticContentAttribute != .forceLeftToRight {
+            semanticContentAttribute = .forceLeftToRight
+        }
+
         // `traitOverrides.layoutDirection` RAISES NSInternalInconsistencyException
         // ("Can't return value for trait LayoutDirection that has no override")
         // when nothing has been overridden yet, so `contains` has to be checked
@@ -155,15 +235,33 @@ extension UIView {
                 traitOverrides.layoutDirection = .leftToRight
             }
         }
-        forceLTRSemantics()
+
+        pinNaturalTextAlignmentToLeft()
+
+        for subview in subviews {
+            subview.pinLeftToRight()
+        }
     }
 
-    private func forceLTRSemantics() {
-        if semanticContentAttribute != .forceLeftToRight {
-            semanticContentAttribute = .forceLeftToRight
-        }
-        for subview in subviews {
-            subview.forceLTRSemantics()
+    /// `.natural` means "follow the writing direction", and in an RTL host that
+    /// resolves RIGHT however the view's direction is pinned — alignment is the
+    /// one thing neither the semantic attribute nor the trait moves. Inside
+    /// SwiftyDebug `.natural` always means `.left`.
+    ///
+    /// Only `.natural` is rewritten: a label the SDK deliberately centred or
+    /// right-aligned keeps what it was given.
+    /// A host for out-of-process content (`_UIRemoteView` and friends).
+    static func isRemoteContainer(_ view: UIView) -> Bool {
+        String(describing: type(of: view)).contains("Remote")
+    }
+
+    private func pinNaturalTextAlignmentToLeft() {
+        if let label = self as? UILabel {
+            if label.textAlignment == .natural { label.textAlignment = .left }
+        } else if let textView = self as? UITextView {
+            if textView.textAlignment == .natural { textView.textAlignment = .left }
+        } else if let textField = self as? UITextField {
+            if textField.textAlignment == .natural { textField.textAlignment = .left }
         }
     }
 }

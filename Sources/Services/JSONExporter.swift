@@ -76,8 +76,15 @@ enum JSONExporter {
     /// verbatim without added indentation). This is the fix for the "copy JSON
     /// adds a leading space / is invalid" bug. (See COPY.)
     static func clipboardString(from text: String) -> String {
-        if let json = prettyJSONString(from: text) { return json }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Normalise BEFORE parsing as well as after: a body prefixed with a BOM
+        // that Foundation happens to accept and one it rejects must reach the
+        // clipboard identically. `.whitespacesAndNewlines` — what this used to
+        // trim with — contains no BOM, no zero-width space and no bidi mark, so
+        // the invisible leading character that broke pasting into Algolia went
+        // straight through. (See COPY / ClipboardText.)
+        let source = ClipboardText.normalized(text)
+        if let json = prettyJSONString(from: source) { return ClipboardText.normalized(json) }
+        return source
     }
 
     // MARK: - File export
