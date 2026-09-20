@@ -761,6 +761,32 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     /// self.request.HTTPBody is nil when the body was sent via a stream,
     /// so we must capture it from the recursiveRequest after reading the stream.
     private var capturedRequestBody: Data?
+    /// Observes what `startLoading` did with the request body. **nil in every
+    /// shipping build** — only a test ever installs one.
+    ///
+    /// A hook rather than a `static var` holding the value: the capture is
+    /// per-instance and the instances belong to the URL loading system, so an
+    /// end-to-end test has no other way to reach it — but parking the last
+    /// request body in a static would keep whatever it contained (an
+    /// `Authorization` header's bearer token, a password, a card number) alive
+    /// for the life of the host app's process, and would be a data race on
+    /// every request besides. With the hook, production retains nothing and
+    /// races on nothing.
+    ///
+    /// `path` is `"eof"` (drained whole, became `httpBody`), `"resumed"`
+    /// (partially drained, handed back through a replacement stream),
+    /// `"fallback"`, or `"none"`. A test meaning to exercise the resume path
+    /// has to be able to prove that it did.
+    static var requestBodyCaptureObserverForTesting: ((_ body: Data?, _ path: String) -> Void)?
+
+    /// Stops the body pump when this request ends without being sent. See
+    /// `BodyStreamPumpToken`.
+    private var bodyPumpToken: BodyStreamPumpToken?
+
+    /// True when `capturedRequestBody` is only the PREFIX of the body — the app
+    /// supplied a stream whose producer had not finished when the request
+    /// started. The bytes still all get SENT; only the capture is partial.
+    private var capturedRequestBodyIsPartial = false
     /// The request after intercept rules have been applied (headers/query params modified).
     /// Used in stopLoading() so the UI reflects the actual request that was sent.
     private var interceptedRequest: URLRequest?
@@ -903,6 +929,9 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
 
     deinit {
         // We should have cleared task and pending challenge by now.
+        // Backstop: `stopLoading` cancels the pump on every normal path, but a
+        // protocol instance released without it must not leave a thread behind.
+        bodyPumpToken?.cancel()
     }
 
     // MARK: - Query-parameter edits (pure, so it can be unit-tested)
@@ -1064,33 +1093,62 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                                         forKey: CustomHTTPProtocol.kOurRecursiveRequestFlagProperty,
                                         in: recursiveRequest)
 
-        // A body STREAM is left exactly as the app set it: never opened, never
-        // read, never closed.
+        // The request body ALWAYS arrives as a stream, never as `httpBody`.
         //
-        // This used to drain it into `httpBody` — to capture the body, and to
-        // skip the `needNewBodyStream` bounce the clone provokes. Both are real
-        // wins, and neither is worth what they cost, because an InputStream
-        // cannot be rewound. The drain stopped on `hasBytesAvailable`, which
-        // also goes false for a stream that is merely STARVED — the bound pair
-        // behind every streamed multipart upload reports exactly that while its
-        // producer is still writing — and the bytes already read were then
-        // dropped on the floor while the same, now partially consumed, stream
-        // stayed attached to the outgoing request. The host app's upload went
-        // out missing its head: a corrupted body, non-deterministically, in a
-        // debugger the app cannot see into.
+        // This is the fact the whole capture path rests on, and it is easy to
+        // get backwards: the URL loading system converts `httpBody` into an
+        // `httpBodyStream` before a `URLProtocol` is asked anything at all, so
+        // `self.request.httpBody` is nil for every request that has a body.
+        // (`RequestBodyCaptureProbeTests` pins it.) Reading this stream is
+        // therefore not an optimisation for streamed uploads — it is the only
+        // way any request body is ever captured, and it is also what avoids the
+        // `needNewBodyStream` bounce the clone provokes.
         //
-        // There is no way to know in advance which streams will reach EOF, and
-        // no way to put back what a read has taken. So the SDK does not read.
-        // The cost is that a streamed request body is not captured (the detail
-        // screen shows it as having no body); an uncaptured body is a missing
-        // feature, a corrupted one is a production incident.
+        // What must never happen is losing bytes. `mutableCopy()` does not copy
+        // the stream — it IS the object the app handed to `URLSession`, proven
+        // by the same probe test — and a stream cannot be rewound. So:
         //
-        // Requests that carry their body as `httpBody` — effectively all of
-        // them — are unaffected and still capture exactly as before.
-
-        // Capture the request body for the debug model. This is nil when the app
-        // sent its body via HTTPBodyStream; see above for why it stays nil.
-        self.capturedRequestBody = recursiveRequest.httpBody
+        //  * Drained to EOF (every `httpBody` request, every file- or
+        //    data-backed stream): the bytes become `httpBody`, which detaches
+        //    the stream. Nothing half-read can be sent.
+        //  * Drained but NOT at EOF (a bound pair whose producer is still
+        //    writing — the shape behind a streamed multipart upload): the bytes
+        //    already taken are handed BACK, at the front of a replacement
+        //    stream that then forwards the rest. The request still sends every
+        //    byte, in order. Dropping them here — which is what returning nil
+        //    used to do — sent the app's upload missing its head.
+        if let stream = recursiveRequest.httpBodyStream, recursiveRequest.httpBody == nil {
+            let drained = Self.drainBody(from: stream)
+            if drained.reachedEOF {
+                stream.close()
+                recursiveRequest.httpBody = drained.data
+                self.capturedRequestBody = drained.data
+                Self.requestBodyCaptureObserverForTesting?(drained.data, "eof")
+            } else if let resumed = Self.resumedBodyStream(prefix: drained.data, rest: stream) {
+                recursiveRequest.httpBodyStream = resumed.stream
+                self.bodyPumpToken = resumed.token
+                // What was captured is a prefix, not the body. Flagged so the
+                // detail screen says so and Replay refuses — showing a fragment
+                // as if it were the whole request is worse than showing none.
+                self.capturedRequestBody = drained.data.isEmpty ? nil : drained.data
+                self.capturedRequestBodyIsPartial = !drained.data.isEmpty
+                Self.requestBodyCaptureObserverForTesting?(self.capturedRequestBody, "resumed")
+            } else {
+                // Unreachable in practice: `getBoundStreams` does not fail. If
+                // it ever does, the bytes are already out of the stream and the
+                // only correct thing left is to finish the read, however long
+                // that takes, rather than send a truncated body.
+                var rest = drained.data
+                rest.append(Self.blockingDrainToEOF(from: stream))
+                stream.close()
+                recursiveRequest.httpBody = rest
+                self.capturedRequestBody = rest
+                Self.requestBodyCaptureObserverForTesting?(rest, "fallback")
+            }
+        } else {
+            self.capturedRequestBody = recursiveRequest.httpBody
+            Self.requestBodyCaptureObserverForTesting?(recursiveRequest.httpBody, "none")
+        }
 
         // --- Interception: check for matching intercept rules ---
         if let url = recursiveRequest.url {
@@ -1376,6 +1434,195 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         }
     }
 
+    /// Reads what the body stream has for us, reporting whether it ended.
+    ///
+    /// EOF is decided by `read` returning 0, or by the stream reporting
+    /// `.atEnd`; NEVER by `hasBytesAvailable` going false. That flag also goes
+    /// false for a stream that is merely starved, and treating starvation as
+    /// the end is what installed an empty or truncated buffer as a whole body.
+    ///
+    /// The bytes are returned either way. The caller is responsible for giving
+    /// back anything taken from a stream that has not finished — see
+    /// `resumedBodyStream(prefix:rest:)`. Static and pure so the EOF rule is
+    /// testable without a live request.
+    static func drainBody(from stream: InputStream) -> (data: Data, reachedEOF: Bool) {
+        let bodyData = NSMutableData()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        var reachedEOF = false
+        if stream.streamStatus == .notOpen { stream.open() }
+        while stream.hasBytesAvailable {
+            let bytesRead = stream.read(&buffer, maxLength: buffer.count)
+            if bytesRead > 0 {
+                bodyData.append(buffer, length: bytesRead)
+            } else {
+                // 0 is EOF; negative is a read error, and an errored stream
+                // never yielded a complete body to take over.
+                reachedEOF = (bytesRead == 0)
+                break
+            }
+        }
+        // A stream that hands over its whole buffer in one read leaves the loop
+        // on `hasBytesAvailable`, not on a 0-read, so the status decides.
+        if !reachedEOF { reachedEOF = (stream.streamStatus == .atEnd) }
+        return (bodyData as Data, reachedEOF)
+    }
+
+    /// Blocks until the stream ends. Only for the unreachable fallback in
+    /// `startLoading`, where bytes have already been taken and there is no
+    /// replacement stream to put them into: finishing the read is then the only
+    /// way to send a body that is not truncated.
+    static func blockingDrainToEOF(from stream: InputStream) -> Data {
+        let rest = NSMutableData()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let bytesRead = stream.read(&buffer, maxLength: buffer.count)
+            if bytesRead <= 0 { break }
+            rest.append(buffer, length: bytesRead)
+        }
+        return rest as Data
+    }
+
+    /// Lets a request stop its body pump when the body is no longer going
+    /// anywhere.
+    ///
+    /// The drain runs at the very top of `startLoading`, before intercept rules
+    /// are resolved, and a rule can BLOCK the request, answer it from a mock, or
+    /// park it at a breakpoint — every one of which returns without ever
+    /// sending it. The pump would then fill its 64 KB pipe, find nobody
+    /// draining it, and sit in its write loop until the backstop deadline.
+    /// Cancelling ends it on the next turn instead.
+    final class BodyStreamPumpToken {
+        private let lock = NSLock()
+        private var cancelled = false
+        var isCancelled: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return cancelled
+        }
+        func cancel() {
+            lock.lock(); cancelled = true; lock.unlock()
+        }
+    }
+
+    /// A stand-in body stream that yields `prefix` and then everything still to
+    /// come from `rest`, so a partially drained stream can still be sent whole.
+    ///
+    /// A bound pair rather than an `InputStream` subclass on purpose: CFNetwork
+    /// drives a body stream through the CFReadStream client callbacks, which a
+    /// Swift subclass does not implement and cannot easily; a bound-pair read
+    /// stream is a real CFReadStream and is exactly what apps hand to
+    /// `URLSession` for streamed uploads in the first place.
+    ///
+    /// The pump thread always terminates: at EOF, on a read or write error, if
+    /// the consumer closes its end, or at the backstop deadline.
+    static func resumedBodyStream(prefix: Data,
+                                  rest: InputStream) -> (stream: InputStream,
+                                                         token: BodyStreamPumpToken)? {
+        var boundInput: InputStream?
+        var boundOutput: OutputStream?
+        Stream.getBoundStreams(withBufferSize: Self.bodyPumpBufferBytes,
+                               inputStream: &boundInput,
+                               outputStream: &boundOutput)
+        guard let boundInput, let boundOutput else { return nil }
+        let token = BodyStreamPumpToken()
+
+        Self.adjustLivePumpCount(+1)
+        let pump = Thread {
+            boundOutput.open()
+            // `rest` is already open on the production path — `drainBody` opened
+            // it — but reading a `.notOpen` stream yields nothing and looks
+            // exactly like EOF, so the forwarded body would silently be the
+            // prefix alone. Do not depend on the caller for that.
+            if rest.streamStatus == .notOpen { rest.open() }
+            defer {
+                boundOutput.close()
+                rest.close()
+                Self.adjustLivePumpCount(-1)
+            }
+            let deadline = Date().addingTimeInterval(Self.bodyPumpDeadline)
+
+            /// False once there is no point continuing: the request was
+            /// cancelled or never sent, the consumer closed its end, or the
+            /// backstop elapsed.
+            func stillWanted() -> Bool {
+                !token.isCancelled
+                    && Date() <= deadline
+                    && boundOutput.streamStatus != .error
+                    && boundOutput.streamStatus != .closed
+            }
+
+            /// Writes every byte, waiting when the consumer has not drained the
+            /// pipe yet. Every wait is interruptible — that is the whole point.
+            func writeAll(_ bytes: UnsafePointer<UInt8>, _ count: Int) -> Bool {
+                var offset = 0
+                while offset < count {
+                    guard stillWanted() else { return false }
+                    if !boundOutput.hasSpaceAvailable {
+                        Thread.sleep(forTimeInterval: 0.002)
+                        continue
+                    }
+                    let written = boundOutput.write(bytes + offset, maxLength: count - offset)
+                    if written <= 0 { return false }
+                    offset += written
+                }
+                return true
+            }
+
+            let handedBack: Bool = prefix.isEmpty ? true : prefix.withUnsafeBytes { raw in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return true }
+                return writeAll(base, raw.count)
+            }
+            guard handedBack else { return }
+
+            var buffer = [UInt8](repeating: 0, count: Self.bodyPumpBufferBytes)
+            while stillWanted() {
+                // A BLOCKING read, deliberately. Polling `hasBytesAvailable`
+                // instead would never see EOF — a bound pair reports `.atEnd`
+                // only once a read has returned 0 — so the pipe would never be
+                // closed and CFNetwork would wait out the whole deadline for a
+                // body that had already finished. Blocking here is also exactly
+                // what CFNetwork itself would be doing on this stream if the SDK
+                // were not in the middle, so it costs the app nothing it was not
+                // already paying.
+                let bytesRead = rest.read(&buffer, maxLength: buffer.count)
+                if bytesRead <= 0 { return }   // EOF or error: `defer` closes the pipe
+                if !writeAll(&buffer, bytesRead) { return }
+            }
+        }
+        pump.name = "com.swiftydebug.body-stream-pump"
+        pump.stackSize = 256 * 1024
+        pump.start()
+        return (boundInput, token)
+    }
+
+    /// How many body pumps are running right now.
+    ///
+    /// A counter, not a handle: it retains nothing and says nothing about any
+    /// request's contents. It exists because "the pump always exits" is the one
+    /// property of this design that cannot be checked by looking at the output
+    /// of a request — a leaked pump is invisible until the thread count grows.
+    private static let livePumpLock = NSLock()
+    private static var livePumps = 0
+
+    private static func adjustLivePumpCount(_ delta: Int) {
+        livePumpLock.lock()
+        livePumps += delta
+        livePumpLock.unlock()
+    }
+
+    static var livePumpCountForTesting: Int {
+        livePumpLock.lock(); defer { livePumpLock.unlock() }
+        return livePumps
+    }
+
+    /// Pipe size for `resumedBodyStream`. One buffer in flight is enough: the
+    /// point is to forward, not to buffer the upload a second time.
+    static let bodyPumpBufferBytes = 64 * 1024
+
+    /// Backstop so a pump thread cannot outlive its request forever if the
+    /// consumer goes away without closing. Generously longer than any request
+    /// this SDK would otherwise allow to run.
+    static let bodyPumpDeadline: TimeInterval = 10 * 60
+
     /// Why an armed breakpoint never paused a request a mock answered. Pure and
     /// `static` so the wording is pinned by tests — this sentence IS the fix, so
     /// it has to survive refactoring.
@@ -1481,6 +1728,10 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
 
         isTerminated = true
         cancelPendingChallenge()
+        // Nothing more will read this request's body — whether it completed,
+        // was cancelled, was blocked, or was answered from a mock.
+        bodyPumpToken?.cancel()
+        bodyPumpToken = nil
 
         // The app gave up on this request (cancelled, or its own timeout elapsed
         // while it sat at a breakpoint). Delivering now would go nowhere, so drop
@@ -1524,6 +1775,10 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                 model.requestData = reqBody.subdata(in: 0..<Int(maxBodySize))
                 model.isRequestBodyTruncated = true
             }
+            // A streamed body whose producer was still writing is captured as a
+            // prefix. Same flag, same meaning: what you are looking at is not
+            // the whole request.
+            if self.capturedRequestBodyIsPartial { model.isRequestBodyTruncated = true }
         }
         // NOTE: Do NOT re-read HTTPBodyStream here - it's already consumed by the URL loading
         // system at this point. The body was already converted to HTTPBody in startLoading.
@@ -1966,7 +2221,13 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
     func urlSession(_ session: URLSession,
                     task: URLSessionTask,
                     needNewBodyStream completionHandler: @escaping (InputStream?) -> Void) {
-        guard let body = self.capturedRequestBody ?? self.request.httpBody,
+        // A PARTIAL capture must never be offered as a body. On the resumed
+        // path `capturedRequestBody` is only the prefix that was drained off a
+        // producer still writing; replaying that would send a fraction of the
+        // upload and call it complete — worse than the empty body `nil` gives,
+        // because it looks like a successful request.
+        guard !self.capturedRequestBodyIsPartial,
+              let body = self.capturedRequestBody ?? self.request.httpBody,
               !body.isEmpty else {
             completionHandler(nil)
             return
