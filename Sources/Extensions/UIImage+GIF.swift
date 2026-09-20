@@ -91,7 +91,10 @@ import ImageIO
         return UIImage(named: name)
     }
 
-    private static func ssz_frameDurationAtIndex(_ index: Int, source: CGImageSource) -> Float {
+    /// Not private: `ImageLoader` builds a DOWNSAMPLED animated image and needs
+    /// the same per-frame timing, and duplicating this logic there would let the
+    /// two drift.
+    static func ssz_frameDurationAtIndex(_ index: Int, source: CGImageSource) -> Float {
         var frameDuration: Float = 0.1
 
         guard let cfFrameProperties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) else {

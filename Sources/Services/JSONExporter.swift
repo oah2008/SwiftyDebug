@@ -89,6 +89,52 @@ enum JSONExporter {
 
     // MARK: - File export
 
+    /// What a node copied from the WKWebView JSON viewer should put on the
+    /// clipboard.
+    ///
+    /// The viewer is a third-party web component, and what it hands the native
+    /// bridge for a SCALAR is the value's JSON *literal* — measured against the
+    /// shipped bundle:
+    ///
+    ///     typeof e === "string" ? w = `"${e}"` : w = String(e)
+    ///
+    /// So copying a token, a URL or an id — the values anyone actually copies out
+    /// of a response — produced `"eyJhbGciOi…"` **with the quotes**, and pasting
+    /// that into curl, a browser or Algolia is wrong every time. A container
+    /// copies `JSON.stringify(value, null, 2)`, which is real JSON and must keep
+    /// its quotes.
+    ///
+    /// So: unwrap a lone JSON string and nothing else. Everything else goes
+    /// through `clipboardString(from:)`, which also strips the invisible affixes
+    /// that once broke pasting into Algolia. (See COPY.)
+    static func clipboardString(forViewerPayload payload: String) -> String {
+        if let literal = unwrappedViewerStringLiteral(payload) { return literal }
+        return clipboardString(from: ClipboardText.normalized(payload))
+    }
+
+    /// The decoded value when `payload` is a lone JSON string, else nil.
+    ///
+    /// Split out because it is the CHEAP half. Its caller on the WKWebView
+    /// clipboard bridge runs on the main thread, and the other half —
+    /// `clipboardString(from:)` — re-parses, re-indexes and re-prints the whole
+    /// body with the size ceiling lifted, which is seconds of main thread on a
+    /// multi-megabyte document and a watchdog kill of the HOST app. Anything
+    /// this returns nil for has to go through `ClipboardFormatter.copy`, which
+    /// already moves that work off the main thread behind an overlay.
+    static func unwrappedViewerStringLiteral(_ payload: String) -> String? {
+        let trimmed = ClipboardText.normalized(payload)
+
+        // A lone JSON string — and only that. `fragmentsAllowed` is what lets a
+        // bare `"…"` parse at all; an object, an array, a number or a bool falls
+        // through untouched. The length pre-filter keeps a megabyte container
+        // from paying for a parse attempt that cannot succeed.
+        guard trimmed.hasPrefix("\""), trimmed.hasSuffix("\""), trimmed.utf8.count >= 2,
+              let data = trimmed.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
+              let string = parsed as? String else { return nil }
+        return string
+    }
+
     /// Writes `contents` to a temporary `.json` (or given extension) file and
     /// returns its URL, for sharing via `UIActivityViewController`. Uses a
     /// stable, sanitized filename so repeated exports overwrite rather than leak.

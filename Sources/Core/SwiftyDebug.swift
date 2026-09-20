@@ -179,8 +179,18 @@ public class SwiftyDebug {
 // MARK: - Override Swift `print`
 
 public func print<T>(file: String = #file, function: String = #function, line: Int = #line, _ message: T, color: UIColor = .white) {
-    // Host stdout always passes through, unchanged.
-    Swift.print(message)
+    // Host stdout always passes through, unchanged — but around the capture
+    // pipe, not through it. `NSLogHook` dup2's stdout into that pipe, so a
+    // `Swift.print` here reached the Console tab as a second, untimestamped row
+    // a flush interval behind the timestamped one `PrintInterceptor` writes
+    // below. `writeBypassingPipe` returns false when the pipe is not installed,
+    // which is the only case where `Swift.print` is still the right call.
+    let handled = SwiftyDebugRuntime.isActive
+        && PrintInterceptor.shared.enable
+        && NSLogHook.writeBypassingPipe("\(message)\n")
+    if !handled {
+        Swift.print(message)
+    }
 
     // Skip all SwiftyDebug work (string building, DB writes) when capture is off
     // or the SDK is fully stopped — this is the hot path for a disabled SDK.

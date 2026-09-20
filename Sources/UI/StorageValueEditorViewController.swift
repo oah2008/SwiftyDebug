@@ -91,6 +91,7 @@ final class StorageValueEditorViewController: UIViewController, UITextViewDelega
         navigationItem.rightBarButtonItem?.tintColor = DebugTheme.accentColor
 
         buildUI()
+        observeKeyboard()
         refreshJSONBanner()
         view.forceLTR()
     }
@@ -252,6 +253,39 @@ final class StorageValueEditorViewController: UIViewController, UITextViewDelega
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
             stack.bottomAnchor.constraint(equalTo: scroll.bottomAnchor, constant: -40),
         ])
+    }
+
+    // MARK: - Keyboard
+
+    /// The VALUE text view does not scroll (`isScrollEnabled = false`), so the
+    /// whole value lives in the outer scroll view's content and the scroll view
+    /// bottoms out at `contentSize`. Without an inset the region the keyboard
+    /// covers — the tail of a long JSON value, and the delete button — simply
+    /// cannot be reached while editing.
+    private func observeKeyboard() {
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardFrameWillChange(_:)),
+            name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardWillHide(_:)),
+            name: UIResponder.keyboardWillHideNotification, object: nil)
+    }
+
+    @objc private func keyboardFrameWillChange(_ note: Notification) {
+        guard let end = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+        let keyboard = view.convert(end, from: nil)
+        applyKeyboardOverlap(max(0, scroll.frame.maxY - keyboard.minY))
+    }
+
+    @objc private func keyboardWillHide(_ note: Notification) {
+        applyKeyboardOverlap(0)
+    }
+
+    /// Insets the scroller so the edited text can sit above the keyboard rather
+    /// than under it.
+    private func applyKeyboardOverlap(_ overlap: CGFloat) {
+        scroll.contentInset.bottom = overlap
+        scroll.verticalScrollIndicatorInsets.bottom = overlap
     }
 
     // MARK: - JSON awareness

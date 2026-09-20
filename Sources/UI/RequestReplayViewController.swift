@@ -62,6 +62,20 @@ final class RequestReplayViewController: UITableViewController {
     /// has no text form to re-encode and used to be dropped entirely.
     private let originalBody: Data?
 
+    /// The query string exactly as it arrived, still percent-encoded.
+    ///
+    /// `params` holds the *decoded* pairs so the table shows readable values, and
+    /// writing them back through `URLComponents.queryItems` re-encodes against
+    /// `urlQueryAllowed` — which permits `+`, `/`, `,`, `:` and `@`. A cursor the
+    /// app sent as `%2B` would go out as a raw `+`, which every server-side query
+    /// parser reads as a space, so the replayed request is not the captured one.
+    /// Unless the developer edits a param, the original bytes are restored.
+    private let originalPercentEncodedQuery: String?
+
+    /// True once the developer adds, deletes or retypes a query param. Until then
+    /// `originalPercentEncodedQuery` is sent as-is.
+    private var paramsWereEdited = false
+
     /// The request as captured, before any edits — the most relevant source of
     /// header names to offer back after the user deletes one.
     private let originalHeaders: [(name: String, value: String)]
@@ -78,7 +92,12 @@ final class RequestReplayViewController: UITableViewController {
     /// GET and HEAD never carry a body. DELETE technically can, real APIs use it,
     /// and an imported `curl -X DELETE -d …` would otherwise lose its payload
     /// with nothing on screen to say so.
-    private var methodSupportsBody: Bool { !["GET", "HEAD"].contains(method) }
+    ///
+    /// The method picker reads the same rule: a second hardcoded list there once
+    /// promised "DELETE — No request body" while the editor showed and sent one.
+    static func supportsBody(_ method: String) -> Bool { !["GET", "HEAD"].contains(method) }
+
+    private var methodSupportsBody: Bool { Self.supportsBody(method) }
 
     private enum Section: Int, CaseIterable {
         case request = 0     // method + URL
@@ -126,12 +145,14 @@ final class RequestReplayViewController: UITableViewController {
 
         let url = model.url as URL?
         if let url, var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            originalPercentEncodedQuery = comps.percentEncodedQuery
             for item in comps.queryItems ?? [] {
                 params.append(KV(key: item.name, value: item.value ?? ""))
             }
             comps.query = nil
             baseURLString = comps.url?.absoluteString ?? (url.absoluteString)
         } else {
+            originalPercentEncodedQuery = nil
             baseURLString = url?.absoluteString ?? ""
         }
 
@@ -163,12 +184,14 @@ final class RequestReplayViewController: UITableViewController {
         self.method = curl.method.uppercased()
 
         if var comps = URLComponents(url: curl.url, resolvingAgainstBaseURL: false) {
+            originalPercentEncodedQuery = comps.percentEncodedQuery
             for item in comps.queryItems ?? [] {
                 params.append(KV(key: item.name, value: item.value ?? ""))
             }
             comps.query = nil
             baseURLString = comps.url?.absoluteString ?? curl.url.absoluteString
         } else {
+            originalPercentEncodedQuery = nil
             baseURLString = curl.url.absoluteString
         }
 
@@ -233,6 +256,24 @@ final class RequestReplayViewController: UITableViewController {
         return request
     }
 
+    /// Writes the outgoing query onto `comps`.
+    ///
+    /// Pure and `internal` for the same reason `makeRequest` is: the rule that an
+    /// untouched query replays byte-for-byte — `%2B` stays `%2B`, a valueless
+    /// flag stays valueless — is invisible on screen, because the table shows the
+    /// decoded value either way, so only a test can catch it breaking.
+    static func applyQuery(to comps: inout URLComponents,
+                           params: [(name: String, value: String)],
+                           originalPercentEncodedQuery: String?,
+                           paramsWereEdited: Bool) {
+        if !paramsWereEdited, let raw = originalPercentEncodedQuery {
+            comps.percentEncodedQuery = raw
+            return
+        }
+        let liveParams = params.filter { !$0.name.isEmpty }
+        comps.queryItems = liveParams.isEmpty ? nil : liveParams.map { URLQueryItem(name: $0.name, value: $0.value) }
+    }
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -279,8 +320,14 @@ final class RequestReplayViewController: UITableViewController {
             showAlert("Invalid URL", "Could not parse the URL.")
             return
         }
-        let liveParams = params.filter { !$0.key.isEmpty }
-        comps.queryItems = liveParams.isEmpty ? nil : liveParams.map { URLQueryItem(name: $0.key, value: $0.value) }
+        // An untouched query goes back on the wire byte-for-byte: re-encoding the
+        // decoded pairs turns `%2B` into `+`, `%2F` into `/` and a valueless flag
+        // into `flag=`, which changes what the server actually receives. Only an
+        // edited param list is worth that cost.
+        Self.applyQuery(to: &comps,
+                        params: params.map { (name: $0.key, value: $0.value) },
+                        originalPercentEncodedQuery: originalPercentEncodedQuery,
+                        paramsWereEdited: paramsWereEdited)
         guard let url = comps.url else {
             showAlert("Invalid URL", "Could not build the URL with those parameters.")
             return
@@ -583,7 +630,7 @@ final class RequestReplayViewController: UITableViewController {
         let options = Self.methods.map { m in
             OptionPickerSheetViewController.Option(
                 title: m,
-                subtitle: ["GET", "HEAD", "DELETE"].contains(m) ? "No request body" : "Supports a request body",
+                subtitle: Self.supportsBody(m) ? "Supports a request body" : "No request body",
                 symbol: nil,
                 tint: m == method ? DebugTheme.accentColor : .white
             ) { [weak self] in
@@ -630,11 +677,13 @@ final class RequestReplayViewController: UITableViewController {
         cell.configure(key: item.key, value: item.value, removing: false, keyEditable: true)
         cell.onKeyChanged = { [weak self] k in
             guard let self else { return }
-            if list == .params { self.params[ip.row].key = k } else { self.headers[ip.row].key = k }
+            if list == .params { self.params[ip.row].key = k; self.paramsWereEdited = true }
+            else { self.headers[ip.row].key = k }
         }
         cell.onValueChanged = { [weak self] v in
             guard let self else { return }
-            if list == .params { self.params[ip.row].value = v } else { self.headers[ip.row].value = v }
+            if list == .params { self.params[ip.row].value = v; self.paramsWereEdited = true }
+            else { self.headers[ip.row].value = v }
         }
         cell.currentKeyText = { [weak self] in
             guard let self else { return "" }
@@ -839,6 +888,7 @@ final class RequestReplayViewController: UITableViewController {
             pickMethod()
         case .params where ip.row == params.count:
             params.append(KV(key: "", value: ""))
+            paramsWereEdited = true
             tableView.reloadSections(IndexSet(integer: ip.section), with: .automatic)
         case .headers where ip.row == headers.count:
             headers.append(KV(key: "", value: ""))
@@ -861,7 +911,9 @@ final class RequestReplayViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, commit style: UITableViewCell.EditingStyle, forRowAt ip: IndexPath) {
         guard style == .delete else { return }
         switch Section(rawValue: ip.section)! {
-        case .params:  params.remove(at: ip.row)
+        case .params:
+            params.remove(at: ip.row)
+            paramsWereEdited = true
         case .headers:
             headers.remove(at: ip.row)
             // A deleted header becomes available again.

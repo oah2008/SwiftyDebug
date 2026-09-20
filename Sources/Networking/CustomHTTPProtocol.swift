@@ -465,36 +465,44 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         let defaultSel = Selector(("defaultSessionConfiguration"))
             let ephemeralSel = Selector(("ephemeralSessionConfiguration"))
 
+            // Latch BOTH original IMPs before either replacement is installed,
+            // and capture them by value in the blocks below. `replaceMethod`
+            // installs the new IMP first and only then returns the original, so
+            // a thread that called `URLSessionConfiguration.default` inside that
+            // window entered the replacement with the global still nil and
+            // trapped on the force-unwrap — which is precisely what a
+            // third-party SDK spinning up its networking on a background queue
+            // does while `enable()` runs on the main thread. This is the same
+            // order the `protocolClasses` getter below and
+            // `swizzleRequestTimeoutSetter` already use.
+            guard let defMethod = class_getClassMethod(URLSessionConfiguration.self, defaultSel),
+                  let ephMethod = class_getClassMethod(URLSessionConfiguration.self, ephemeralSel) else {
+                return
+            }
+            let origDefaultIMP = method_getImplementation(defMethod)
+            let origEphemeralIMP = method_getImplementation(ephMethod)
+            orig_defaultSessionConfiguration = origDefaultIMP
+            orig_ephemeralSessionConfiguration = origEphemeralIMP
+
             // Replacement block for +defaultSessionConfiguration.
             // imp_implementationWithBlock blocks receive (self, args...) -- no _cmd.
             let replacedDefault: @convention(block) (AnyObject) -> URLSessionConfiguration = { selfObj in
-                let original = unsafeBitCast(orig_defaultSessionConfiguration!, to: SessionConfigConstructor.self)
+                let original = unsafeBitCast(origDefaultIMP, to: SessionConfigConstructor.self)
                 let config = original(selfObj, defaultSel)
                 CustomHTTPProtocol.injectProtocol(into: config)
                 return config
             }
 
-            orig_defaultSessionConfiguration = replaceMethod(
-                defaultSel,
-                imp_implementationWithBlock(replacedDefault),
-                URLSessionConfiguration.self,
-                true
-            )
-
             // Replacement block for +ephemeralSessionConfiguration.
             let replacedEphemeral: @convention(block) (AnyObject) -> URLSessionConfiguration = { selfObj in
-                let original = unsafeBitCast(orig_ephemeralSessionConfiguration!, to: SessionConfigConstructor.self)
+                let original = unsafeBitCast(origEphemeralIMP, to: SessionConfigConstructor.self)
                 let config = original(selfObj, ephemeralSel)
                 CustomHTTPProtocol.injectProtocol(into: config)
                 return config
             }
 
-            orig_ephemeralSessionConfiguration = replaceMethod(
-                ephemeralSel,
-                imp_implementationWithBlock(replacedEphemeral),
-                URLSessionConfiguration.self,
-                true
-            )
+            method_setImplementation(defMethod, imp_implementationWithBlock(replacedDefault))
+            method_setImplementation(ephMethod, imp_implementationWithBlock(replacedEphemeral))
 
             // Also swizzle the protocolClasses GETTER on the actual runtime class
             // of URLSessionConfiguration. This is critical because in ObjC, +load
@@ -813,9 +821,16 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     /// sent no Content-Type. Not `private` so the hold gate and its tests can
     /// see it. (See STREAMING-PROGRESS.)
     static let skippedExtensions: Set<String> = {
+        // Kept in step with `NetworkViewController.mediaPathExtensions`, which is
+        // what DECIDES a captured request is media. When this set was the smaller
+        // of the two, a `.webm`/`.m3u8`/`.ts` response sailed past the capture
+        // gate with "Monitor Media" off, was written to disk, and then showed up
+        // in the Media tab anyway.
         return Set([
-            "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "tiff", "heic", "heif",
+            "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "tiff", "tif",
+            "heic", "heif", "avif",
             "mp4", "mov", "avi", "m4v", "m4a", "mp3", "wav", "aac",
+            "mkv", "webm", "m3u8", "ts", "ogg", "flac",
             "woff", "woff2", "ttf", "otf", "eot"
         ])
     }()
@@ -826,7 +841,18 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         // Global kill-switch: when the SDK is fully stopped, do zero
         // interception — this is the real off-switch even though the swizzled
         // `protocolClasses` getter still lists us for already-created sessions.
-        guard SwiftyDebugRuntime.isActive, NetworkMonitor.shared.isNetworkEnable else {
+        // `networkRequestsEnabled` is the App tab's "Capture native app network
+        // requests" switch. It used to be read in exactly ONE place — the
+        // Network list's tab filter — so switching it off blanked the list while
+        // the SDK carried on intercepting every request, writing bodies to disk,
+        // applying mocks/blocks/redirects/rewrites and posting completions. A
+        // developer turning it off to rule the SDK out of a bug got a debugger
+        // that looked off and was fully active. It gates capture itself now.
+        // (WKWebView traffic has its own gate in the injected JS, so this covers
+        // native URLSession traffic only — which is exactly what the row says.)
+        guard SwiftyDebugRuntime.isActive,
+              NetworkMonitor.shared.isNetworkEnable,
+              Settings.shared.networkRequestsEnabled else {
             return false
         }
 
@@ -1038,32 +1064,32 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                                         forKey: CustomHTTPProtocol.kOurRecursiveRequestFlagProperty,
                                         in: recursiveRequest)
 
-        // Convert body stream to body data to avoid needNewBodyStream overhead.
-        // When a request with HTTPBodyStream is cloned, CFNetwork calls needNewBodyStream:
-        // which bounces through the demux delegate on another thread - 11.4% of CPU in traces.
-        // Reading the stream into HTTPBody eliminates this callback entirely.
-        if recursiveRequest.httpBodyStream != nil && recursiveRequest.httpBody == nil {
-            let stream = recursiveRequest.httpBodyStream!
-            let bodyData = NSMutableData()
-            var buffer = [UInt8](repeating: 0, count: 4096)
-            stream.open()
-            while stream.hasBytesAvailable {
-                let bytesRead = stream.read(&buffer, maxLength: buffer.count)
-                if bytesRead > 0 {
-                    bodyData.append(buffer, length: bytesRead)
-                } else {
-                    break
-                }
-            }
-            stream.close()
-            if bodyData.length > 0 {
-                recursiveRequest.httpBody = bodyData as Data
-            }
-        }
+        // A body STREAM is left exactly as the app set it: never opened, never
+        // read, never closed.
+        //
+        // This used to drain it into `httpBody` — to capture the body, and to
+        // skip the `needNewBodyStream` bounce the clone provokes. Both are real
+        // wins, and neither is worth what they cost, because an InputStream
+        // cannot be rewound. The drain stopped on `hasBytesAvailable`, which
+        // also goes false for a stream that is merely STARVED — the bound pair
+        // behind every streamed multipart upload reports exactly that while its
+        // producer is still writing — and the bytes already read were then
+        // dropped on the floor while the same, now partially consumed, stream
+        // stayed attached to the outgoing request. The host app's upload went
+        // out missing its head: a corrupted body, non-deterministically, in a
+        // debugger the app cannot see into.
+        //
+        // There is no way to know in advance which streams will reach EOF, and
+        // no way to put back what a read has taken. So the SDK does not read.
+        // The cost is that a streamed request body is not captured (the detail
+        // screen shows it as having no body); an uncaptured body is a missing
+        // feature, a corrupted one is a production incident.
+        //
+        // Requests that carry their body as `httpBody` — effectively all of
+        // them — are unaffected and still capture exactly as before.
 
-        // Capture the request body for the debug model.
-        // The original request's HTTPBody may be nil when the body was sent via
-        // HTTPBodyStream. recursiveRequest now has the stream data converted to HTTPBody.
+        // Capture the request body for the debug model. This is nil when the app
+        // sent its body via HTTPBodyStream; see above for why it stays nil.
         self.capturedRequestBody = recursiveRequest.httpBody
 
         // --- Interception: check for matching intercept rules ---
@@ -1080,13 +1106,22 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                         self.breakpointSkipReason = reason
                         BreakpointCenter.shared.note(reason, for: url)
                     }
-                    let error = NSError(
+                    // A mock and any armed response rewrites are preempted by
+                    // the block exactly as the breakpoint above is, and were the
+                    // only preemption in this file that said nothing anywhere —
+                    // the rule row showed both armed while neither ever ran.
+                    // `stopLoading` copies `rewriteReport` onto the transaction,
+                    // so this surfaces on the request detail screen with no new
+                    // field.
+                    if rule.mock.isEnabled || rule.hasActiveResponseRewrites {
+                        self.rewriteReport = RewriteReport(
+                            skippedReason: Self.blockPreemptedMockMessage(mockEnabled: rule.mock.isEnabled))
+                    }
+                    failLoad(NSError(
                         domain: NSURLErrorDomain,
                         code: NSURLErrorCancelled,
                         userInfo: [NSLocalizedDescriptionKey: "Blocked by SwiftyDebug intercept rule"]
-                    )
-                    markTerminated()
-                    self.client?.urlProtocol(self, didFailWithError: error)
+                    ))
                     return
                 }
                 // Apply header overrides
@@ -1128,13 +1163,11 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         // observed. Off by default.
         let preset = Settings.shared.networkConditionerPreset
         if preset.dropsAllRequests {
-            let error = NSError(
+            failLoad(NSError(
                 domain: NSURLErrorDomain,
                 code: NSURLErrorNotConnectedToInternet,
                 userInfo: [NSLocalizedDescriptionKey: "Dropped by SwiftyDebug network simulation (100% Loss)"]
-            )
-            markTerminated()
-            self.client?.urlProtocol(self, didFailWithError: error)
+            ))
             return
         }
 
@@ -1198,8 +1231,7 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             // What CFNetwork itself returns for a `.returnCacheDataDontLoad`
             // miss. Going to the network instead would defeat the whole point
             // of the policy.
-            markTerminated()
-            self.client?.urlProtocol(self, didFailWithError: NSError(
+            failLoad(NSError(
                 domain: NSURLErrorDomain,
                 code: NSURLErrorResourceUnavailable,
                 userInfo: [NSLocalizedDescriptionKey:
@@ -1230,8 +1262,7 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                 abort: { [weak self] in
                     guard let self else { return }
                     self.performOnThread(self.clientThread, modes: self.modes) {
-                        self.markTerminated()
-                        self.client?.urlProtocol(self, didFailWithError: NSError(
+                        self.failLoad(NSError(
                             domain: NSURLErrorDomain, code: NSURLErrorCancelled,
                             userInfo: [NSLocalizedDescriptionKey: "Aborted at breakpoint"]))
                     }
@@ -1359,6 +1390,17 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
             + "a blocked request is never sent. Turn off Block Request to use the breakpoint."
     }
 
+    /// Why a blocked rule's mock and response rewrites never ran. Pure, for the
+    /// same reason as the breakpoint message above.
+    static func blockPreemptedMockMessage(mockEnabled: Bool) -> String {
+        if mockEnabled {
+            return "This rule blocks the request, so the mock never answered it and "
+                 + "response rewrites never ran. Turn off Block Request to use the mock."
+        }
+        return "This rule blocks the request, so response rewrites never ran. "
+             + "Turn off Block Request to use them."
+    }
+
     static func mockPreemptedBreakpointMessage(_ mode: BreakpointMode) -> String {
         switch mode {
         case .off:
@@ -1414,6 +1456,25 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     /// Marks the load terminal. Call before (or immediately after) delivering a
     /// failure, so nothing scheduled can still fire.
     private func markTerminated() { isTerminated = true }
+
+    /// The single way this protocol fails a load: record the error, mark the
+    /// load terminal, then hand it to the client.
+    ///
+    /// Every failure SwiftyDebug itself synthesises — a blocking rule, the 100%
+    /// Loss preset, a `.returnCacheDataDontLoad` miss, a breakpoint abort —
+    /// delivered the error to the client without ever assigning `self.error`, so
+    /// `stopLoading` wrote the row with status 0 and both error fields empty:
+    /// indistinguishable from a request that simply timed out, and with nothing
+    /// anywhere naming the rule that killed it.
+    ///
+    /// The order is load-bearing too. `stopLoading` can be driven by the client
+    /// from inside `didFailWithError`, and that is where the transaction is
+    /// built, so the error has to be on the instance before the callback.
+    private func failLoad(_ error: Error) {
+        self.error = error
+        markTerminated()
+        client?.urlProtocol(self, didFailWithError: error)
+    }
 
     override func stopLoading() {
         // The implementation just cancels the current load (if it's still running).
@@ -1529,6 +1590,19 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         // Build the searchable metadata index once, while the response body is
         // still in memory (self.data). Avoids per-keystroke disk reads later.
         model.buildSearchIndex(responseBody: self.data as Data?)
+
+        // "Monitor Media" off means do not keep media. `canInit` can only judge
+        // by path extension, and the expensive case — a CDN serving
+        // `/photo?w=800&sig=…` with `Content-Type: image/jpeg` — has no
+        // extension to judge by, so it got captured, written to disk, and then
+        // listed in the Media tab with the switch showing OFF. This is the first
+        // point at which the Content-Type is known, so the decision belongs here.
+        // Everything above still ran: the app has its response, the task is torn
+        // down, a parked breakpoint is settled. Only the STORE is skipped.
+        if !SwiftyDebug.monitorMedia, Self.isMediaResponse(model) {
+            self.data = nil
+            return
+        }
 
         if NetworkRequestStore.shared.addHttpRequset(model) {
             NotificationCenter.default.post(
@@ -1856,11 +1930,48 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
         // Redirect: code >= 300 && < 400
         var redirectedRequest: URLRequest? = request
         if response.statusCode >= 300 && response.statusCode < 400 {
-            self.client?.urlProtocol(self, wasRedirectedTo: request, redirectResponse: response)
+            // CFNetwork carries this protocol's properties onto the request it
+            // synthesises for the redirect, the recursion flag included, so
+            // `canInit` refused the redirect target and CFNetwork's own protocol
+            // took the load: the hop that actually returns the data was never
+            // captured. Strip the flag off the copy the client re-issues.
+            let stripped = (request as NSURLRequest).mutableCopy() as! NSMutableURLRequest
+            CustomHTTPProtocol.removeProperty(forKey: CustomHTTPProtocol.kOurRecursiveRequestFlagProperty,
+                                              in: stripped)
+            // Record the 3xx itself, or `stopLoading` writes this hop's row from
+            // a nil response — status "0" and no response headers, which reads
+            // as a failed request rather than a redirect.
+            self.response = response
+            self.client?.urlProtocol(self, wasRedirectedTo: stripped as URLRequest, redirectResponse: response)
             // Remember to set to nil, otherwise the normal request will be requested twice
             redirectedRequest = nil
         }
         completionHandler(redirectedRequest)
+    }
+
+    /// CFNetwork asks for a fresh body stream whenever it has to REPLAY a
+    /// request — a 307/308 that preserves the method, an auth challenge, a
+    /// connection retried after a mid-flight failure. A stream cannot be
+    /// rewound, so only whoever still holds the bytes can answer.
+    ///
+    /// `QNSURLSessionDemux` answers `nil` for any delegate that does not
+    /// implement this selector, and `nil` means the replay goes out with NO
+    /// body at all — the app's retried POST silently becomes an empty one.
+    /// Every request whose body is plain `httpBody` (which is effectively all
+    /// of them) is one we do still hold, so those are answered properly.
+    ///
+    /// A body the app supplied as a STREAM is one the SDK deliberately never
+    /// reads — see `startLoading` — so there is nothing to hand back and `nil`
+    /// is both the previous answer and the only honest one.
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    needNewBodyStream completionHandler: @escaping (InputStream?) -> Void) {
+        guard let body = self.capturedRequestBody ?? self.request.httpBody,
+              !body.isEmpty else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(InputStream(data: body))
     }
 
     func urlSession(_ session: URLSession,
@@ -1953,10 +2064,7 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
             // The transaction always records it. The shared inbox does NOT get one
             // per asset: a scrolling image grid under a single host-wide rule would
             // post hundreds of identical notices and evict everything else in it.
-            if !Self.hasNotedStreamingSkip {
-                Self.hasNotedStreamingSkip = true
-                BreakpointCenter.shared.note(reason, for: requestURL)
-            }
+            Self.noteSkipOnce(reason, for: requestURL)
         }
         if holdForBreakpoint || holdForRewrites {
             self.isHoldingResponse = true
@@ -2041,9 +2149,7 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
             // has always promised this trap; it just was not here.) Redirects
             // report the same error for the same reason.
             guard !Self.isClientInitiatedCancellation(error, didCancel: self.didCancelOwnTask) else { return }
-            markTerminated()
-            self.client?.urlProtocol(self, didFailWithError: error)
-            self.error = error
+            failLoad(error)
             return
         }
 
@@ -2095,8 +2201,7 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
                 guard let self else { return }
                 self.performOnThread(self.clientThread, modes: self.modes) {
                     self.isHoldingResponse = false
-                    self.markTerminated()
-                    self.client?.urlProtocol(self, didFailWithError: NSError(
+                    self.failLoad(NSError(
                         domain: NSURLErrorDomain, code: NSURLErrorCancelled,
                         userInfo: [NSLocalizedDescriptionKey: "Aborted at breakpoint"]))
                 }
@@ -2226,9 +2331,38 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
              + "the whole download and stop the app\u{2019}s progress callbacks from firing."
     }
 
-    /// One inbox notice per launch for the streamed-response stand-down, however
-    /// many assets trigger it. Reset alongside the rest of the SDK's state.
-    static var hasNotedStreamingSkip = false
+    /// The stand-down reasons already posted to the breakpoint inbox.
+    ///
+    /// Keyed by the MESSAGE, not by a single process-wide Bool. The flag this
+    /// replaces suppressed the image-grid flood as intended and then suppressed
+    /// everything else too: after the first JPEG stood a breakpoint down, a
+    /// later stand-down on a genuinely different endpoint — a 15 MB JSON export
+    /// hitting the oversize path — posted nothing, and the developer was left
+    /// watching the empty inbox this mechanism exists to keep useful.
+    ///
+    /// Every JPEG produces the identical streaming message, so the flood stays
+    /// suppressed; the oversize message carries a byte count, so a genuinely
+    /// different stand-down still gets through.
+    ///
+    /// Written from the URLProtocol client threads, hence the lock: the plain
+    /// `static var` it replaces was a data race TSan flags in a host app.
+    private static let skipNoticeLock = NSLock()
+    private static var notedSkipMessages = Set<String>()
+
+    static func noteSkipOnce(_ reason: String, for url: URL?) {
+        skipNoticeLock.lock()
+        let isNew = notedSkipMessages.insert(reason).inserted
+        skipNoticeLock.unlock()
+        guard isNew else { return }
+        BreakpointCenter.shared.note(reason, for: url)
+    }
+
+    /// Lets the same stand-down be announced again after the SDK is reset.
+    static func resetSkipNotices() {
+        skipNoticeLock.lock()
+        notedSkipMessages.removeAll()
+        skipNoticeLock.unlock()
+    }
 
     /// Why a hold was refused for a body that is simply too big to buffer. The
     /// streaming wording would be false here, and a wrong explanation is worse
@@ -2241,6 +2375,25 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
     static func oversizeRewriteMessage(byteCount: Int64) -> String {
         "This response declares \(ByteCountFormatter().string(fromByteCount: byteCount)), more than "
         + "SwiftyDebug will buffer, so rewrites were skipped."
+    }
+
+    /// Whether a finished transaction is media, judged by everything now known
+    /// about it — the decoded image flag, the Content-Type, and the URL.
+    ///
+    /// Deliberately the SAME question `NetworkViewController.isMediaTransaction`
+    /// asks. When the capture gate and the display classifier disagreed, the
+    /// traffic in the gap was stored by one and shown by the other.
+    static func isMediaResponse(_ model: NetworkTransaction) -> Bool {
+        if model.isImage { return true }
+        if let mime = model.mineType?.lowercased(), !mime.isEmpty {
+            for prefix in ["image/", "video/", "audio/", "font/"] where mime.hasPrefix(prefix) {
+                return true
+            }
+        }
+        if let ext = (model.url as URL?)?.pathExtension.lowercased(), !ext.isEmpty {
+            return skippedExtensions.contains(ext)
+        }
+        return false
     }
 
     /// Why an armed response rewrite stood down on a streamed response.

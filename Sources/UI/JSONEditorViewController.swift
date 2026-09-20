@@ -42,10 +42,6 @@ final class JSONEditorViewController: UIViewController {
 
     private var isPicking: Bool { onPickPath != nil }
 
-    /// Offered on every scalar row when set, so a rewrite can be authored from
-    /// the response you are looking at rather than from the rules screen.
-    var onRequestRewrite: ((JSONPath) -> Void)?
-
     private let document: JSONDocument
     private let editorTitle: String
 
@@ -114,7 +110,6 @@ final class JSONEditorViewController: UIViewController {
     private var rows: [Row] = []
     /// Collapsed container paths (by display string).
     private var collapsed = Set<String>()
-    private var filterText = ""
 
     // MARK: - Inline editing state
     //
@@ -263,6 +258,14 @@ final class JSONEditorViewController: UIViewController {
     }
 
     private func refreshToolbar() {
+        // A picker shows a SAMPLE body: the path it hands back is applied to the
+        // real response, so anything typed here would only shift the meaning of
+        // that path. The bar itself has to stay — `layout()` pins the table's
+        // bottom to it — but it carries nothing that can mutate the document.
+        if isPicking {
+            toolbar.items = []
+            return
+        }
         func item(_ symbol: String, _ action: Selector, enabled: Bool = true) -> UIBarButtonItem {
             let i = UIBarButtonItem(image: UIImage(systemName: symbol), style: .plain, target: self, action: action)
             i.isEnabled = enabled
@@ -325,7 +328,7 @@ final class JSONEditorViewController: UIViewController {
                 showAlert("Invalid JSON", result.error ?? "Fix the JSON before switching to Tree.")
                 return
             }
-            document.setValue(parsed.root, at: [])
+            document.replaceAll(with: parsed)
         }
         // Going to Raw with a document that cannot be written as text would
         // render an EMPTY text view over a body that is still there — see
@@ -568,7 +571,7 @@ final class JSONEditorViewController: UIViewController {
         buildRows(value: document.root, path: [], label: "root", depth: 0, into: &out)
         // The synthetic root row is only useful when the root is a container.
         rows = out
-        // The edited node may have been deleted, filtered out, or collapsed away.
+        // The edited node may have been deleted or collapsed away.
         if let path = editingPath, !rows.contains(where: { $0.path == path }) {
             editingPath = nil
             editingDraft = ""
@@ -586,10 +589,6 @@ final class JSONEditorViewController: UIViewController {
         if let dict = value as? [String: Any] { childCount = dict.count }
         if let arr = value as? [Any] { childCount = arr.count }
 
-        // Filter: show a row when it or any descendant matches.
-        let matches = filterText.isEmpty || Self.subtree(value, label: label, contains: filterText)
-        guard matches else { return }
-
         out.append(Row(path: path, label: label, kind: kind, depth: depth,
                        isContainer: isContainer, isExpanded: expanded,
                        preview: Self.preview(of: value), childCount: childCount))
@@ -597,30 +596,13 @@ final class JSONEditorViewController: UIViewController {
         guard isContainer, expanded else { return }
 
         if let dict = value as? [String: Any] {
-            for key in dict.keys.sorted(by: { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }) {
+            for key in document.orderedKeys(at: path, of: dict) {
                 buildRows(value: dict[key]!, path: path + [.key(key)], label: key, depth: depth + 1, into: &out)
             }
         } else if let arr = value as? [Any] {
             for (i, element) in arr.enumerated() {
                 buildRows(value: element, path: path + [.index(i)], label: "[\(i)]", depth: depth + 1, into: &out)
             }
-        }
-    }
-
-    /// Does this node (or anything under it) match the filter?
-    private static func subtree(_ value: Any, label: String, contains needle: String) -> Bool {
-        if label.range(of: needle, options: .caseInsensitive) != nil { return true }
-        switch value {
-        case let dict as [String: Any]:
-            return dict.contains { subtree($0.value, label: $0.key, contains: needle) }
-        case let arr as [Any]:
-            return arr.contains { subtree($0, label: "", contains: needle) }
-        case let s as String:
-            return s.range(of: needle, options: .caseInsensitive) != nil
-        case let n as NSNumber:
-            return n.stringValue.range(of: needle, options: .caseInsensitive) != nil
-        default:
-            return false
         }
     }
 
@@ -656,7 +638,7 @@ final class JSONEditorViewController: UIViewController {
         guard let parsed = JSONDocument(text: rawTextView.text) else { return .doesNotParse }
         // Goes through the document, so it lands on the undo stack: the typing is
         // recoverable rather than replaced.
-        document.setValue(parsed.root, at: [])
+        document.replaceAll(with: parsed)
         return .committed
     }
 
@@ -741,7 +723,7 @@ final class JSONEditorViewController: UIViewController {
         confirm.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         confirm.addAction(UIAlertAction(title: "Replace", style: .destructive) { [weak self] _ in
             guard let self else { return }
-            self.document.setValue(parsed.root, at: [])
+            self.document.replaceAll(with: parsed)
             if self.mode == .raw { self.rawTextView.text = self.document.prettyText() }
         })
         present(confirm, animated: true)
@@ -775,7 +757,7 @@ final class JSONEditorViewController: UIViewController {
                 showAlert("Invalid JSON", result.error ?? "Fix the JSON before saving.")
                 return
             }
-            document.setValue(parsed.root, at: [])
+            document.replaceAll(with: parsed)
         }
         // EVERY caller of `onSave` writes `document.prettyText()` somewhere the
         // host app will read it — a mock body, a held request, a held response.
@@ -816,17 +798,6 @@ final class JSONEditorViewController: UIViewController {
         }()
 
         if !row.isContainer {
-            // Leads the menu when available: editing this value changes it once,
-            // rewriting it changes it on every future response. That is usually
-            // what you actually wanted after editing the same field twice.
-            if let requestRewrite = onRequestRewrite {
-                options.append(.init(title: "Rewrite this always\u{2026}",
-                                     subtitle: "Change it automatically on every response",
-                                     symbol: "wand.and.stars",
-                                     tint: DebugTheme.accentColor) {
-                    requestRewrite(path)
-                })
-            }
             options.append(.init(title: "Edit on its own page", subtitle: row.preview,
                                  symbol: "arrow.up.left.and.arrow.down.right",
                                  tint: DebugTheme.accentColor) { [weak self] in
@@ -866,11 +837,14 @@ final class JSONEditorViewController: UIViewController {
         }
         options.append(.init(title: "Copy value", subtitle: nil, symbol: "doc.on.doc") { [weak self] in
             guard let self else { return }
-            let value = self.document.value(at: path) ?? NSNull()
-            let node = JSONDocument(root: value)
+            // Through the parent document, so the copy carries the key order and
+            // number spelling the row is showing. A fresh `JSONDocument(root:)`
+            // around the sub-value has no source index and alphabetises it.
+            let text = self.document.prettyText(at: path)
             // Writing "" to the pasteboard is worse than not writing: the user
             // pastes an empty body somewhere and has no idea why.
-            guard let text = self.renderedText(of: node) else {
+            guard !text.isEmpty else {
+                let node = JSONDocument(root: self.document.value(at: path) ?? NSNull())
                 self.showAlert("Can't copy this value", self.unrepresentableReason(of: node))
                 return
             }
@@ -1040,7 +1014,8 @@ extension JSONEditorViewController: UITableViewDataSource, UITableViewDelegate {
         }
         cell.configure(label: row.label, preview: row.preview, kind: row.kind, depth: row.depth,
                        isContainer: row.isContainer, isExpanded: row.isExpanded,
-                       childCount: row.childCount, editing: editing)
+                       childCount: row.childCount, editing: editing,
+                       allowsExpand: !isPicking)
 
         cell.onDisclosureTapped = { [weak self] in
             guard let self else { return }
@@ -1050,11 +1025,16 @@ extension JSONEditorViewController: UITableViewDataSource, UITableViewDelegate {
             self.rebuildRows()
         }
         // The expand affordance: commit what's typed, then hand the node to the
-        // full-page editor, which writes back through the same path.
-        cell.onExpandTapped = { [weak self] in
-            guard let self else { return }
-            self.commitInlineEdit()
-            self.editValue(at: path)
+        // full-page editor, which writes back through the same path. Never in
+        // picker mode — that editor mutates a body the picker only samples.
+        if isPicking {
+            cell.onExpandTapped = nil
+        } else {
+            cell.onExpandTapped = { [weak self] in
+                guard let self else { return }
+                self.commitInlineEdit()
+                self.editValue(at: path)
+            }
         }
         cell.onTextChanged = { [weak self] text in
             guard let self, self.editingPath == path else { return }
@@ -1111,6 +1091,10 @@ extension JSONEditorViewController: UITableViewDataSource, UITableViewDelegate {
     }
 
     func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        // Deleting a row in the picker renumbers the ones after it, so the path
+        // picked next names a different element of the real response than the
+        // one on screen. No mutation is reachable while picking.
+        guard !isPicking else { return nil }
         guard rows.indices.contains(indexPath.row) else { return nil }
         let path = rows[indexPath.row].path
         guard !path.isEmpty else { return nil }   // never delete the root
@@ -1135,6 +1119,8 @@ extension JSONEditorViewController: UITableViewDataSource, UITableViewDelegate {
     }
 
     func tableView(_ tableView: UITableView, leadingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        // "More" is the single funnel into Delete / Change type / Add key.
+        guard !isPicking else { return nil }
         guard rows.indices.contains(indexPath.row) else { return nil }
         let row = rows[indexPath.row]
         let more = UIContextualAction(style: .normal, title: "More") { [weak self] _, _, done in

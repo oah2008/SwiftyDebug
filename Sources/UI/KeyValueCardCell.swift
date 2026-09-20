@@ -161,9 +161,13 @@ final class KeyValueCardCell: UITableViewCell {
         // Vertical stack: key caption row / key / separator / value caption / value
         stack.axis = .vertical
         stack.spacing = 5
-        stack.setCustomSpacing(10, after: keyField)
         stack.translatesAutoresizingMaskIntoConstraints = false
         [keyRow, keyField, separator, valueCaption, valueField].forEach { stack.addArrangedSubview($0) }
+        // Both custom gaps are set AFTER the views are arranged: UIStackView
+        // drops setCustomSpacing(_:after:) for a view that is not yet one of its
+        // arranged subviews, which is why the 10pt gap under the key field went
+        // missing while the one under the separator — set after the add — held.
+        stack.setCustomSpacing(10, after: keyField)
         stack.setCustomSpacing(10, after: separator)
         card.addSubview(stack)
 

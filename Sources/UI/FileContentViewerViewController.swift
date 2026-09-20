@@ -28,10 +28,24 @@ final class FileContentViewerViewController: UIViewController {
     // MARK: Content
 
     private enum Content {
-        case text(String, truncated: Bool, isJSON: Bool)
+        /// `label` is what the bytes turned out to be once decoded, which is not
+        /// what the extension guessed: a `.plist` in Library/Preferences is a
+        /// binary plist rendered as XML, so the header must say PLIST, not TEXT.
+        case text(String, truncated: Bool, isJSON: Bool, label: String)
         case image(UIImage)
         case hex(String)
         case unreadable(String)
+
+        /// Header label for what is actually on screen. A payload only a hex
+        /// dump can show must never claim to be TEXT. (See FILE-BROWSER.)
+        var label: String {
+            switch self {
+            case .text(_, _, _, let label): return label
+            case .image:                    return "IMAGE"
+            case .hex:                      return "HEX"
+            case .unreadable:               return "UNREADABLE"
+            }
+        }
     }
 
     private let fileURL: URL
@@ -49,6 +63,12 @@ final class FileContentViewerViewController: UIViewController {
     private let imageView = UIImageView()
     private let spinner = UIActivityIndicatorView(style: .medium)
     private let toast = UILabel()
+    /// The INFO row's value label. The header card is built in `viewDidLoad`,
+    /// long before the background read finishes, so `apply` re-sets this label
+    /// with the kind the decoder settled on.
+    private var infoValueLabel: UILabel?
+    /// Everything in the INFO row after the kind — size and modification date.
+    private var metaTail: [String] = []
 
     private lazy var byteFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
@@ -140,16 +160,23 @@ final class FileContentViewerViewController: UIViewController {
 
         let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         let size = Int64(values?.fileSize ?? 0)
-        var metaParts = [kind.label, byteFormatter.string(fromByteCount: size)]
+        metaTail = [byteFormatter.string(fromByteCount: size)]
         if let modified = values?.contentModificationDate {
-            metaParts.append(dateFormatter.string(from: modified))
+            metaTail.append(dateFormatter.string(from: modified))
         }
 
-        headerStack.addArrangedSubview(makeRow(caption: "PATH", value: AppContainerPaths.shortPath(fileURL), lines: 3))
-        headerStack.addArrangedSubview(makeRow(caption: "INFO", value: metaParts.joined(separator: "  ·  "), lines: 2))
+        headerStack.addArrangedSubview(makeRow(caption: "PATH", value: AppContainerPaths.shortPath(fileURL), lines: 3).row)
+        // The extension's guess stands only until the read finishes.
+        let info = makeRow(caption: "INFO", value: infoText(label: kind.label), lines: 2)
+        infoValueLabel = info.value
+        headerStack.addArrangedSubview(info.row)
     }
 
-    private func makeRow(caption: String, value: String, lines: Int) -> UIView {
+    private func infoText(label: String) -> String {
+        ([label] + metaTail).joined(separator: "  ·  ")
+    }
+
+    private func makeRow(caption: String, value: String, lines: Int) -> (row: UIView, value: UILabel) {
         let captionLabel = UILabel()
         captionLabel.text = caption
         captionLabel.font = .systemFont(ofSize: 10, weight: .heavy)
@@ -165,7 +192,7 @@ final class FileContentViewerViewController: UIViewController {
         let stack = UIStackView(arrangedSubviews: [captionLabel, valueLabel])
         stack.axis = .vertical
         stack.spacing = 2
-        return stack
+        return (stack, valueLabel)
     }
 
     private func buildContentViews() {
@@ -251,8 +278,11 @@ final class FileContentViewerViewController: UIViewController {
 
     private func apply(_ content: Content) {
         self.content = content
+        // The header card was built from the extension before a single byte was
+        // read; the INFO row now says what was actually decoded.
+        infoValueLabel?.text = infoText(label: content.label)
         switch content {
-        case .text(let string, let truncated, _):
+        case .text(let string, let truncated, _, _):
             var display = string
             if truncated {
                 display += "\n\n— truncated at \(Self.maxTextBytes / 1024) KB —"
@@ -317,21 +347,52 @@ final class FileContentViewerViewController: UIViewController {
             }
             let (data, truncated) = chunk
             guard let string = decodeText(data) else {
-                // Not decodable as text after all — fall back to a hex preview.
-                return .hex(hexDump(data.prefix(maxHexBytes)))
+                // Not plain text — but "not UTF-8" is not the same as "opaque".
+                // Every `.plist` in Library/Preferences is a *binary* plist, and
+                // hex-dumping it here is what made the app’s own preferences
+                // unreadable. The progressive decoder takes it from here.
+                return decoded(data, truncated: truncated)
             }
             // Pretty-print only when the whole file was read (a truncated JSON
             // document would not parse).
             if kind == .json, !truncated, let pretty = JSONExporter.prettyJSONString(from: string) {
-                return .text(pretty, truncated: false, isJSON: true)
+                return .text(pretty, truncated: false, isJSON: true, label: "JSON")
             }
-            return .text(string, truncated: truncated, isJSON: false)
+            return .text(string, truncated: truncated, isJSON: false, label: kind.label)
 
-        case .database, .archive, .binary, .directory:
+        case .binary:
+            // No extension means `.binary`, which is exactly how URLCache and
+            // most hand-rolled disk caches name their entries — their contents
+            // are routinely plain JSON or text. Read a text-sized prefix, not a
+            // 2 KB one, or a multi-KB cache entry would never parse.
+            guard let chunk = readPrefix(of: url, maxBytes: maxTextBytes) else {
+                return .unreadable("Can’t read this file.\nIt may have been deleted or is not readable by the app.")
+            }
+            return decoded(chunk.data, truncated: chunk.truncated)
+
+        case .database, .archive, .directory:
+            // The head of a SQLite file or a zip is genuinely opaque; decoding
+            // it would only ever produce the same hex dump.
             guard let chunk = readPrefix(of: url, maxBytes: maxHexBytes) else {
                 return .unreadable("Can’t read this file.\nIt may have been deleted or is not readable by the app.")
             }
             return .hex(hexDump(chunk.data))
+        }
+    }
+
+    /// Hands bytes the extension could not classify to the same progressive
+    /// decoder the UserDefaults and Keychain inspectors use (JSON → property
+    /// list → keyed archive → UTF-8 → hex), so the rendering comes from what
+    /// the bytes *are* rather than from what the filename claimed.
+    private static func decoded(_ data: Data, truncated: Bool) -> Content {
+        let value = DataValueDecoder.decode(data)
+        switch value.representation {
+        case .json, .plist, .archive, .text:
+            return .text(value.text, truncated: truncated,
+                         isJSON: value.representation == .json,
+                         label: value.representation.rawValue)
+        case .binary:
+            return .hex(hexDump(data.prefix(maxHexBytes)))
         }
     }
 
@@ -385,14 +446,23 @@ final class FileContentViewerViewController: UIViewController {
                 UIPasteboard.general.image = image
                 showToast("Copied")
             }
-        case .text(let string, _, _)?:
+        case .text(let string, let truncated, _, _)?:
             // Both arms go through the one formatter. The branch used to be
             // inverted — JSON was copied raw (so a `.json` file saved with a BOM
             // or a leading blank line copied them intact) while only non-JSON was
             // handed to the JSON producer. `ClipboardFormatter` already does the
             // right thing for either kind. (See COPY.)
-            ClipboardFormatter.copy(string, from: self)
-            showToast("Copied")
+            // The toast belongs in the completion handler, not after the call:
+            // above the formatter's threshold the write happens on a background
+            // queue behind a blocking overlay, and "Copied" announced underneath
+            // that overlay was a lie for as long as the formatting took. The
+            // synchronous arm invokes `completion` inline, so a small file keeps
+            // its instant toast.
+            ClipboardFormatter.copy(string, from: self) { [weak self] in
+                // What is on the pasteboard is what was read, and a capped read
+                // is a fragment — saying just “Copied” would hide that.
+                self?.showToast(truncated ? "Copied \(Self.maxTextBytes / 1024) KB" : "Copied")
+            }
         case .hex(let dump)?:
             ClipboardFormatter.copyVerbatim(dump)
             showToast("Copied")
@@ -406,13 +476,22 @@ final class FileContentViewerViewController: UIViewController {
         var shareURL: URL?
 
         switch content {
-        case .text(let string, _, _)?:
-            let ext = fileURL.pathExtension.isEmpty ? "txt" : fileURL.pathExtension
-            shareURL = JSONExporter.writeTemporaryFile(
-                contents: string,
-                suggestedName: fileURL.deletingPathExtension().lastPathComponent,
-                fileExtension: ext
-            )
+        case .text(let string, let truncated, _, _)?:
+            if truncated {
+                // The view holds only the first `maxTextBytes`; rewriting those
+                // into a temp file under the original name exports a fragment
+                // that looks complete (and, for JSON, parses nowhere). The
+                // rewrite only earns its keep for a whole-file read, which is
+                // also the only case `readContent` pretty-prints.
+                shareURL = fileURL
+            } else {
+                let ext = fileURL.pathExtension.isEmpty ? "txt" : fileURL.pathExtension
+                shareURL = JSONExporter.writeTemporaryFile(
+                    contents: string,
+                    suggestedName: fileURL.deletingPathExtension().lastPathComponent,
+                    fileExtension: ext
+                )
+            }
         default:
             // Binary / image / unreadable: share the real file on disk.
             shareURL = fileURL

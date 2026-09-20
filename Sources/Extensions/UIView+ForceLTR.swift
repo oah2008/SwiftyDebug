@@ -9,6 +9,15 @@
 
 import UIKit
 
+/// Memo for `UIView.isRemoteContainer(_:)`.
+///
+/// Main-thread only by construction: every caller is on a UIKit layout path. A
+/// stored static cannot live in an extension, hence the holder. Bounded by the
+/// number of distinct view classes the SDK ever hosts.
+private enum RemoteContainerCache {
+    static var byClass: [ObjectIdentifier: Bool] = [:]
+}
+
 // MARK: - The one place SwiftyDebug's layout direction is decided
 
 /// Base class for every window SwiftyDebug puts on screen.
@@ -251,8 +260,20 @@ extension UIView {
     /// Only `.natural` is rewritten: a label the SDK deliberately centred or
     /// right-aligned keeps what it was given.
     /// A host for out-of-process content (`_UIRemoteView` and friends).
+    ///
+    /// Memoised per CLASS. The answer depends only on the class name, and
+    /// computing it is a metadata lookup, a demangle and a String allocation —
+    /// about a microsecond — which `pinLeftToRight()` paid for every view it
+    /// visited, on every window layout and from the ~60 `forceLTR()` call sites,
+    /// `cellForRowAt` included. Once per class is what the comments elsewhere in
+    /// this file already claim the cost is.
     static func isRemoteContainer(_ view: UIView) -> Bool {
-        String(describing: type(of: view)).contains("Remote")
+        let cls: AnyClass = type(of: view)
+        let key = ObjectIdentifier(cls)
+        if let cached = RemoteContainerCache.byClass[key] { return cached }
+        let result = String(describing: cls).contains("Remote")
+        RemoteContainerCache.byClass[key] = result
+        return result
     }
 
     private func pinNaturalTextAlignmentToLeft() {

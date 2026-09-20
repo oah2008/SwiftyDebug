@@ -706,6 +706,10 @@ final class KeychainBrowserViewController: UITableViewController {
     private let segment = UISegmentedControl(items: KeychainItemClass.allCases.map { $0.shortTitle })
     private let headerContainer = UIView()
     private let footerLabel = UILabel()
+
+    /// What `layoutFooter()` last measured, so a repeat pass costs one compare.
+    private var lastFooterWidth: CGFloat = -1
+    private var lastFooterText: String = ""
     private let footerContainer = UIView()
     private lazy var scopeButton = UIBarButtonItem(title: scope.buttonTitle, style: .plain,
                                                    target: self, action: #selector(scopeTapped))
@@ -867,7 +871,16 @@ final class KeychainBrowserViewController: UITableViewController {
 
     private func layoutFooter() {
         let width = max(tableView.bounds.width - 24, 1)
-        footerLabel.text = footerText
+        // `viewDidLayoutSubviews` on a UITableViewController fires on every table
+        // layout — including during scroll — so nothing expensive may run
+        // unconditionally here. Rebuilding the string and re-measuring it through
+        // TextKit every frame was per-frame work where the base did it once per
+        // appearance. Width unchanged means the measurement cannot have changed.
+        let text = footerText
+        if abs(lastFooterWidth - width) < 0.5, lastFooterText == text { return }
+        lastFooterWidth = width
+        lastFooterText = text
+        footerLabel.text = text
         let height = ceil(footerLabel.sizeThatFits(CGSize(width: width,
                                                           height: .greatestFiniteMagnitude)).height)
         footerLabel.frame = CGRect(x: 12, y: 16, width: width, height: height)
@@ -1513,6 +1526,17 @@ final class KeychainItemDetailViewController: UITableViewController {
     private var revealed = false
     private var rows: [(caption: String, value: String)] = []
 
+    /// The class explainer lives in a `tableFooterView`, not a section footer:
+    /// this is a `.plain` table, where section footers FLOAT over the bottom of
+    /// the list and would sit permanently on top of the last visible row.
+    /// (Same pattern as UserDefaultsBrowserViewController.)
+    private let footerContainer = UIView()
+    private let footerLabel = UILabel()
+
+    /// What `layoutFooter()` last measured, so a repeat pass costs one compare.
+    private var lastFooterWidth: CGFloat = -1
+    private var lastFooterText: String = ""
+
     init(item: KeychainItem) {
         self.item = item
         super.init(style: .plain)
@@ -1547,6 +1571,18 @@ final class KeychainItemDetailViewController: UITableViewController {
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 80
         tableView.contentInset.top = 8
+
+        // The class explainer. Without this the label is never added to the
+        // footer view and never configured, so `numberOfLines` stays 1 and
+        // `layoutFooter()` installs an empty 52pt gap where the explanation of
+        // whether this keychain class is editable used to be.
+        footerLabel.font = .systemFont(ofSize: 11)
+        footerLabel.textColor = UIColor(white: 0.45, alpha: 1)
+        footerLabel.numberOfLines = 0
+        footerLabel.autoresizingMask = [.flexibleWidth]
+        footerContainer.backgroundColor = .clear
+        footerContainer.addSubview(footerLabel)
+        tableView.tableFooterView = footerContainer
 
         rebuildRows()
         view.forceLTR()
@@ -1614,7 +1650,35 @@ final class KeychainItemDetailViewController: UITableViewController {
         return cell
     }
 
-    override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
-        item.itemClass.explainer
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        layoutFooter()
+    }
+
+    /// Sizes the explainer footer by hand. Re-assigning `tableFooterView` is what
+    /// makes the table pick up a new height, so that only happens when the height
+    /// actually changed — this runs from `viewDidLayoutSubviews`, and
+    /// re-assigning unconditionally would loop.
+    private func layoutFooter() {
+        let width = max(tableView.bounds.width - 24, 1)
+        let text = item.itemClass.explainer
+        // The height guard alone came too late: the TextKit measurement below
+        // ran on every call, and because this is a `UITableViewController` the
+        // controller's root view IS the table, so `viewDidLayoutSubviews` fires
+        // on every layout pass — during scrolling included. The explainer only
+        // changes when the item does, so measure once per (width, text).
+        if abs(lastFooterWidth - width) < 0.5, lastFooterText == text { return }
+        lastFooterWidth = width
+        lastFooterText = text
+        footerLabel.text = text
+        let height = ceil(footerLabel.sizeThatFits(CGSize(width: width,
+                                                          height: .greatestFiniteMagnitude)).height)
+        footerLabel.frame = CGRect(x: 12, y: 16, width: width, height: height)
+        let newHeight = height + 32
+        guard abs(footerContainer.bounds.height - newHeight) > 0.5 else { return }
+        footerContainer.frame = CGRect(x: 0, y: 0, width: tableView.bounds.width, height: newHeight)
+        footerContainer.forceLTR()
+        tableView.tableFooterView = footerContainer
     }
 }

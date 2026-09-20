@@ -36,14 +36,37 @@ class Bubble: UIView {
     private let counterLabel = UILabel()
     private var requestCount = 0
 
+    /// The drag recogniser, kept so the long press can be told to recognise
+    /// alongside it rather than cancelling it.
+    private weak var panRecognizer: UIPanGestureRecognizer?
+
+    /// Where the bubble starts, measured in the SDK WINDOW — never in
+    /// `UIScreen.main.bounds`.
+    ///
+    /// On iPad Split View and Slide Over the app's window is a fraction of the
+    /// screen, so a screen-derived y put the bubble below the window's bottom
+    /// edge, off-screen and untappable, with no way to get it back.
     static var originalPosition: CGPoint {
-        let safeTop = UIApplication.shared.connectedScenes
+        // The SDK window when it is usable, otherwise the host's key window.
+        //
+        // This is read from `SwiftyDebugViewController.viewDidLoad`, which runs
+        // synchronously while `DebugWindowPresenter.enable()` is still assigning
+        // `rootViewController` — the SDK window has no `windowScene` yet, so its
+        // `safeAreaInsets` are zero and its bounds are still the screen's. Asking
+        // it alone meant the notch offset could never apply and the Split View
+        // sizing never took effect at the one call site there is.
+        let sdkWindow = DebugWindowPresenter.shared.window
+        let hostWindow = UIApplication.shared.connectedScenes
             .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-            .first?.safeAreaInsets.top ?? 0
+            .first
+        let reference: UIWindow? = sdkWindow.windowScene != nil ? sdkWindow : hostWindow
+
+        let host = reference?.bounds ?? UIScreen.main.bounds
+        let safeTop = reference?.safeAreaInsets.top ?? 0
         let notchOffset: CGFloat = safeTop > 24.0 ? 16 : 0
         return CGPoint(
             x: 1.875 + bubbleSize / 2,
-            y: UIScreen.main.bounds.height / 2 - bubbleSize - notchOffset
+            y: host.height / 2 - bubbleSize - notchOffset
         )
     }
 
@@ -86,8 +109,18 @@ class Bubble: UIView {
 
     private func setupGestures() {
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTap)))
-        addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress)))
-        addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(handlePan)))
+
+        // The press and the drag share one 25x25 view, so UIKit makes them
+        // compete: a press wins after 0.5s and cancels the pan, and the bubble
+        // refuses to move for anyone who holds it to aim before dragging. The
+        // delegate below lets the drag carry on once the press has recognised.
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
+        longPress.delegate = self
+        addGestureRecognizer(longPress)
+
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan))
+        panRecognizer = pan
+        addGestureRecognizer(pan)
     }
 
     private func setupObservers() {
@@ -105,11 +138,20 @@ class Bubble: UIView {
 
     // MARK: - Orientation
 
+    /// Remaps the docked position into the post-rotation size.
+    ///
+    /// Both axes read the pre-rotation size from the superview, which is still
+    /// the old size while `viewWillTransition` is running. The horizontal one in
+    /// particular must use the old WIDTH: `center.x` is a coordinate in the old
+    /// width, and comparing it against half the old HEIGHT put every possible x
+    /// on a portrait device below the threshold, so a right-docked bubble was
+    /// thrown to the left edge by every portrait-to-landscape rotation. The
+    /// fallback keeps the plain 90-degree swap for a bubble with no superview.
     func updateOrientation(newSize: CGSize) {
-        let oldHeight = newSize.width // pre-rotation height
-        let yPercent = center.y / oldHeight
+        let oldSize = superview?.bounds.size ?? CGSize(width: newSize.height, height: newSize.width)
+        let yPercent = center.y / oldSize.height
         let newY = newSize.height * yPercent
-        let newX = frame.origin.x < oldHeight / 2
+        let newX = center.x < oldSize.width / 2
             ? Self.edgeInset
             : newSize.width - Self.edgeInset
         center = CGPoint(x: newX, y: newY)
@@ -216,7 +258,13 @@ class Bubble: UIView {
         delegate?.didTapBubble()
     }
 
-    @objc private func handleLongPress() {
+    /// Clearing every captured request is destructive and irreversible — each
+    /// dropped transaction takes its two body files off disk with it — so it
+    /// happens exactly once per press. A long press sends its action on `.began`,
+    /// on every `.changed` and again on `.ended`, so an ungated body wiped the
+    /// log two or more times for a single press.
+    @objc private func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+        guard recognizer.state == .began else { return }
         NetworkRequestStore.shared.reset()
         let pinnedCount = NetworkRequestStore.shared.httpModels.count
         NotificationCenter.default.post(name: .allLogsCleared, object: nil, userInfo: ["pinnedCount": pinnedCount])
@@ -235,18 +283,56 @@ class Bubble: UIView {
 
         guard panner.state == .ended || panner.state == .cancelled else { return }
 
-        let safeArea = UIApplication.shared.connectedScenes
-            .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-            .first?.safeAreaInsets ?? .zero
-
-        let screenBounds = UIScreen.main.bounds
+        // Measured in the view the bubble actually lives in — the SDK window's
+        // root view, which `location` and `velocity` are already reported in —
+        // and the insets of the window it is in, not some other scene's key
+        // window.
+        let containerBounds = superview?.bounds ?? UIScreen.main.bounds
+        let safeArea = window?.safeAreaInsets ?? .zero
         let location = panner.location(in: superview)
         let velocity = panner.velocity(in: superview)
 
+        let dock = Self.dockTarget(
+            location: location,
+            velocity: velocity,
+            containerBounds: containerBounds,
+            safeArea: safeArea
+        )
+        let finalCenter = dock.center
+
+        UIView.animate(
+            withDuration: dock.duration * 5,
+            delay: 0,
+            usingSpringWithDamping: 0.8,
+            initialSpringVelocity: 6,
+            options: .allowUserInteraction
+        ) { [weak self] in
+            self?.center = finalCenter
+            self?.transform = .identity
+        }
+    }
+
+    /// Where a finished drag docks the bubble, in the coordinate space of the
+    /// view it lives in, together with the duration the fling earned.
+    ///
+    /// `containerBounds` must be the SDK window's, never `UIScreen.main.bounds`:
+    /// in iPad Split View or Slide Over the app owns a narrow column of a much
+    /// wider display, so a snap target taken from the display lands hundreds of
+    /// points outside the window. That is fatal rather than cosmetic —
+    /// `SwiftyDebugViewController.shouldReceive(point:)` answers hit-testing
+    /// with `bubble.frame.contains(point)`, so a bubble parked outside the
+    /// window can never be tapped again and the debug UI is unreachable for the
+    /// rest of the session.
+    static func dockTarget(
+        location: CGPoint,
+        velocity: CGPoint,
+        containerBounds: CGRect,
+        safeArea: UIEdgeInsets
+    ) -> (center: CGPoint, duration: CGFloat) {
         // Snap to nearest horizontal edge
-        var finalX = location.x > screenBounds.width / 2
-            ? screenBounds.width - Self.edgeInset
-            : Self.edgeInset
+        let finalX = location.x > containerBounds.width / 2
+            ? containerBounds.width - edgeInset
+            : edgeInset
 
         var finalY = location.y
 
@@ -263,19 +349,25 @@ class Bubble: UIView {
         }
 
         // Clamp to safe area
-        let minY = Self.edgeInset + safeArea.top
-        let maxY = screenBounds.height - safeArea.bottom - Self.edgeInset
+        let minY = edgeInset + safeArea.top
+        let maxY = containerBounds.height - safeArea.bottom - edgeInset
         finalY = min(max(finalY, minY), maxY)
 
-        UIView.animate(
-            withDuration: duration * 5,
-            delay: 0,
-            usingSpringWithDamping: 0.8,
-            initialSpringVelocity: 6,
-            options: .allowUserInteraction
-        ) { [weak self] in
-            self?.center = CGPoint(x: finalX, y: finalY)
-            self?.transform = .identity
-        }
+        return (CGPoint(x: finalX, y: finalY), duration)
+    }
+}
+
+// MARK: - UIGestureRecognizerDelegate
+
+extension Bubble: UIGestureRecognizerDelegate {
+
+    /// Lets the drag keep running after the long press has recognised. Without
+    /// it UIKit cancels the pan the moment the press wins, so pressing the
+    /// bubble, aiming for half a second and then dragging moved nothing.
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        otherGestureRecognizer === panRecognizer
     }
 }

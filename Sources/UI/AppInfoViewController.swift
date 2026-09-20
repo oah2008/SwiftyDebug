@@ -32,12 +32,23 @@ class AppInfoViewController: UITableViewController {
         /// the instance, so a closure capturing `self` would be a retain cycle.
         let onChange: ((AppInfoViewController, Bool) -> Void)?
 
+        /// A HOST-app opt-out that outranks this switch, when the row has one.
+        ///
+        /// `SwiftyDebug.enableConsoleLog` is the only such flag today: an app
+        /// that sets it false is saying "never capture my console output", and
+        /// no debug switch may overrule that. Returning false here draws the
+        /// row off and disabled — the honest rendering — instead of showing an
+        /// ON switch over a capture that is not happening.
+        let hostGate: (() -> Bool)?
+
         init(title: String, subtitle: String,
              keyPath: ReferenceWritableKeyPath<Settings, Bool>,
+             hostGate: (() -> Bool)? = nil,
              onChange: ((AppInfoViewController, Bool) -> Void)? = nil) {
             self.title = title
             self.subtitle = subtitle
             self.keyPath = keyPath
+            self.hostGate = hostGate
             self.onChange = onChange
         }
     }
@@ -51,7 +62,8 @@ class AppInfoViewController: UITableViewController {
                    keyPath: \.webNetworkRequestsEnabled),
         ToggleItem(title: "Console Logs",
                    subtitle: "Capture console & print logs",
-                   keyPath: \.consoleLogsEnabled),
+                   keyPath: \.consoleLogsEnabled,
+                   hostGate: { SwiftyDebug.enableConsoleLog }),
         ToggleItem(title: "Web Logs",
                    subtitle: "Capture WKWebView console logs",
                    keyPath: \.webLogsEnabled),
@@ -177,6 +189,9 @@ class AppInfoViewController: UITableViewController {
 
     private var interceptRules: [InterceptRule] = []
 
+    /// True while a coalesced actions-section reload is already queued.
+    private var pendingActionsReload = false
+
     /// Block-based observer tokens, removed in `deinit`. See `viewDidLoad`.
     private var observerTokens: [NSObjectProtocol] = []
 
@@ -220,30 +235,60 @@ class AppInfoViewController: UITableViewController {
         tableView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 16, right: 0)
         tableView.showsVerticalScrollIndicator = false
 
-        // Notification for network updates.
+        // Deliberately NOT observing `.networkRequestCompleted`. Nothing this
+        // screen draws can change when a request finishes: MONITORED URLS is
+        // built from `SwiftyDebug.urls`, a list only the host app writes, and
+        // `viewWillAppear` rebuilds it on every appearance. Reloading on every
+        // completion meant `cellForRowAt` — which builds a brand-new cell and a
+        // brand-new `UISwitch` for each SETTINGS row — tore the switch out from
+        // under a finger that was still on it, so the touch was cancelled, the
+        // thumb sprang back and the setting was never written ("I turn it on
+        // and it doesn't turn on"). It also threw away every cached row height
+        // on a table of self-sizing cells, so the tab jumped while scrolling in
+        // any app with live traffic.
         //
-        // The token is kept: `removeObserver(self)` cannot unregister a
-        // block-based observer — the observer is the returned token object, not
-        // `self` — so without this every open of the debug UI left another live
-        // observer firing `reloadURLs()` on EVERY host-app request, forever.
-        observerTokens.append(NotificationCenter.default.addObserver(
-            forName: .networkRequestCompleted,
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.reloadURLs()
-        })
-
         // Rules change from screens this one does not own — the rule editor it
         // presents, the rule list tab, an import. Without this the section kept
         // rendering the copy it loaded on appear: an edited rule showed its old
         // title, a rule created from this very tab showed no row at all (so
         // people created it again), and the enable switch wrote the stale copy
         // back to the store, silently reverting the edit.
+        //
+        // The token is kept: `removeObserver(self)` cannot unregister a
+        // block-based observer — the observer is the returned token object, not
+        // `self` — so without this every open of the debug UI left another live
+        // observer behind, forever.
         observerTokens.append(NotificationCenter.default.addObserver(
             forName: .interceptRulesDidChange,
             object: nil, queue: .main
         ) { [weak self] _ in
             self?.reloadInterceptRules()
+        })
+
+        // The ACTIONS section alone is redrawn when a request completes: its
+        // "Clear Remembered Headers" subtitle counts what the SDK has learned
+        // from completed requests, and nothing else refreshed it between
+        // appearances.
+        //
+        // Only that section, and never `reloadData()`/`reloadURLs()`: those
+        // rebuild the SETTINGS switches, which tore a freshly built `UISwitch`
+        // out from under a finger mid-drag and discarded self-sizing row
+        // heights. The actions section contains no switch, so reloading it is
+        // safe where a full reload was not. Coalesced, because
+        // `.networkRequestCompleted` is posted once per request, uncoalesced.
+        observerTokens.append(NotificationCenter.default.addObserver(
+            forName: .networkRequestCompleted,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, !self.pendingActionsReload else { return }
+            self.pendingActionsReload = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self else { return }
+                self.pendingActionsReload = false
+                guard self.isViewLoaded, self.view.window != nil,
+                      self.tableView.numberOfSections > Section.actions.rawValue else { return }
+                self.tableView.reloadSections(IndexSet(integer: Section.actions.rawValue), with: .none)
+            }
         })
         view.forceLTR()
     }
@@ -373,11 +418,12 @@ class AppInfoViewController: UITableViewController {
             title: "Restart to Apply Everywhere",
             message: "Network sessions the app creates from now on already use the new timeout.\n\n"
                 + detail + "\n\n"
-                + "iOS cannot relaunch an app. \"Quit App Now\" closes it immediately; reopen it from the "
-                + "Home screen for the change to apply to every session.",
+                + Self.restartQuitAdvice(),
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "Not Now", style: .cancel))
+        // Same condition as `offersQuitAction`, which is what decides whether the
+        // message above is allowed to name this button.
         #if DEBUG
         alert.addAction(UIAlertAction(title: "Quit App Now", style: .destructive) { _ in
             // exit(0) bypasses the normal termination path, so flush the setting
@@ -389,6 +435,36 @@ class AppInfoViewController: UITableViewController {
         })
         #endif
         present(alert, animated: true)
+    }
+
+    /// Whether the restart alert carries a "Quit App Now" button.
+    ///
+    /// `exit(0)` must not ship in a Release-configured SDK build, so the action
+    /// is compiled out there — and `#if DEBUG` is evaluated against the
+    /// configuration SwiftyDebug itself is built in, not the host app's. A
+    /// prebuilt XCFramework, a release-configured SPM dependency or a pod that
+    /// builds Release therefore has no such button.
+    static var offersQuitAction: Bool {
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// The closing paragraph of the restart alert.
+    ///
+    /// Derived from `offersQuitAction` rather than hard-coded, because the
+    /// sentence names the button: in an SDK build where the action is compiled
+    /// out, a fixed message told the user to tap "Quit App Now" next to a lone
+    /// "Not Now", and offered no other way to make the change reach sessions the
+    /// app had already built.
+    static func restartQuitAdvice() -> String {
+        offersQuitAction
+            ? "iOS cannot relaunch an app. \"Quit App Now\" closes it immediately; reopen it from the "
+              + "Home screen for the change to apply to every session."
+            : "iOS cannot relaunch an app. Quit it yourself — swipe it away in the app switcher — and "
+              + "reopen it from the Home screen for the change to apply to every session."
     }
 
     /// Presents the picker for a fixed Network Link Conditioner preset.
@@ -566,7 +642,16 @@ class AppInfoViewController: UITableViewController {
             cell.detailTextLabel?.numberOfLines = 4
 
             let sw = UISwitch()
-            sw.isOn = Settings.shared[keyPath: toggle.keyPath]
+            // A host opt-out wins: the row shows what is actually happening, and
+            // cannot be used to overrule the app that embedded this SDK.
+            let hostAllows = toggle.hostGate?() ?? true
+            sw.isOn = Settings.shared[keyPath: toggle.keyPath] && hostAllows
+            sw.isEnabled = hostAllows
+            if !hostAllows {
+                cell.detailTextLabel?.text =
+                    toggle.subtitle + " — turned off by the app (SwiftyDebug.enableConsoleLog = false)."
+                cell.detailTextLabel?.textColor = UIColor(white: 0.45, alpha: 1)
+            }
             sw.onTintColor = DebugTheme.accentColor
             // The action carries the toggle it belongs to, not a row number.
             // These rows never move, but nothing about a switch should depend
@@ -1147,7 +1232,13 @@ private class AppURLCell: UITableViewCell {
         // Toggle tags row and URL top constraint
         let hasTags = !(hostTagLabel.isHidden && versionTagLabel.isHidden && betaTagLabel.isHidden)
         tagsStack.isHidden = !hasTags
-        urlBelowTagsConstraint.isActive = hasTags
-        urlToCardTopConstraint.isActive = !hasTags
+        // Both off first, then the one that applies. The two pin `urlLabel.top`
+        // to different anchors and cannot hold together, so activating one while
+        // the other is still installed — what a no-tags cell reused for a tagged
+        // row did — hands the engine an unsatisfiable pair, which it resolves by
+        // breaking one and logging "Unable to simultaneously satisfy
+        // constraints" on every reuse pass.
+        NSLayoutConstraint.deactivate([urlBelowTagsConstraint, urlToCardTopConstraint])
+        (hasTags ? urlBelowTagsConstraint! : urlToCardTopConstraint!).isActive = true
     }
 }

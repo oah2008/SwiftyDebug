@@ -14,12 +14,19 @@ class NetworkGroupDetailVC: UIViewController {
     var models: [NetworkTransaction] = []
     var groupKey: String = ""
     var isPathFilter: Bool = false
+    /// Whether this group was opened from the Web tab. The drill-down re-derives
+    /// its rows from the store, and the tag key alone does not say which side of
+    /// the App/Web split a request belongs to.
+    var isWebViewGroup: Bool = false
 
     // State
     private var filteredModels: [NetworkTransaction] = []
     private var searchText: String = ""
     private var selectedEndpoints = Set<String>()
     private var isAutoFollowing: Bool = true
+    /// Self-unregistering, so the live-traffic observers below cannot outlive a
+    /// screen the user has popped.
+    private let observers = NotificationObserverBag()
 
     // UI
     private var tableView: UITableView!
@@ -57,7 +64,25 @@ class NetworkGroupDetailVC: UIViewController {
         }
         tableView.showsVerticalScrollIndicator = false
 
+        // The endpoint sheet has nothing to show for a group whose requests all
+        // sit at the host root, and a fully styled button that does nothing on
+        // every tap reads as a broken screen rather than as an empty list.
+        updateFilterButtonAvailability()
+
         applyFilter()
+
+        // This screen used to be a snapshot taken at push time while shipping
+        // the whole live-tail apparatus (auto-follow, the chevron, the
+        // scroll-to-bottom): the list could never grow, and rows survived a
+        // clear that had already deleted their bodies from disk — the same hole
+        // that was closed for the Pinned tab.
+        observers.add(forName: .networkRequestCompleted) { [weak self] _ in
+            self?.scheduleReloadFromStore()
+        }
+        observers.add(forName: .allLogsCleared) { [weak self] _ in
+            self?.scheduleReloadFromStore()
+        }
+
         view.forceLTR()
 
         // Defer scroll to after layout
@@ -79,6 +104,69 @@ class NetworkGroupDetailVC: UIViewController {
             let last = IndexPath(row: count - 1, section: 0)
             tableView.scrollToRow(at: last, at: .bottom, animated: false)
         }
+    }
+
+    /// Re-derives the group's rows from the store, reproducing the split
+    /// `buildGroupedModels` grouped on: same tag key, same App/Web ownership,
+    /// and media still routed to the Media tab. Re-deriving rather than merging
+    /// is also what drops rows after a clear.
+    /// True while a coalesced reload is already queued for this run-loop turn.
+    private var reloadScheduled = false
+
+    /// Collapses a burst of captures into one reload per run-loop turn.
+    ///
+    /// `.networkRequestCompleted` is posted per request and uncoalesced, and
+    /// `reloadFromStore()` is not cheap: a snapshot of up to 1500 transactions,
+    /// a `TagResolver` lookup per model to filter them, `buildEndpoints()` over
+    /// the survivors, then a full `reloadData()`. Run per request on a chatty
+    /// host app that is the main thread's whole budget. The same idiom is
+    /// already used by `NetworkTimelineViewController` and
+    /// `AuthTokenInspectorViewController`.
+    private func scheduleReloadFromStore() {
+        guard !reloadScheduled else { return }
+        reloadScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.reloadScheduled = false
+            self.reloadFromStore()
+        }
+    }
+
+    private func reloadFromStore() {
+        models = NetworkRequestStore.shared.snapshot().filter { model in
+            guard TagResolver.tag(for: model.url)?.key == groupKey else { return false }
+            guard model.isWebViewRequest == isWebViewGroup else { return false }
+            guard !NetworkViewController.isMediaTransaction(model) else { return false }
+            // The rows this screen was opened on had already been through the
+            // list's own filters — the settings gate, the endpoint filter and the
+            // search text. Re-deriving from the store without them meant one
+            // unrelated completed request silently replaced a filtered set of
+            // three with every request under the tag, while the chips on the list
+            // behind still read as applied.
+            return parentPredicate?(model) ?? true
+        }
+        updateFilterButtonAvailability()
+        applyFilter()
+        tableView.reloadData()
+        if isAutoFollowing, !filteredModels.isEmpty {
+            let last = IndexPath(row: filteredModels.count - 1, section: 0)
+            tableView.scrollToRow(at: last, at: .bottom, animated: false)
+        }
+    }
+
+    /// The list's own predicate, carried in so live re-derivation keeps it.
+    ///
+    /// Captures VALUES only, never the parent controller — a closure holding the
+    /// pushing view controller would keep it alive for as long as this screen
+    /// exists.
+    var parentPredicate: ((NetworkTransaction) -> Bool)?
+
+    /// The filter button is enabled exactly when `didTapFilter` has endpoints to
+    /// offer, so the one case it bails on is visible before the tap.
+    private func updateFilterButtonAvailability() {
+        let hasEndpoints = !buildEndpoints().isEmpty
+        filterButton.isEnabled = hasEndpoints
+        filterButton.tintColor = hasEndpoints ? DebugTheme.accentColor : UIColor(white: 0.35, alpha: 1)
     }
 
     // MARK: - UI Setup
@@ -380,15 +468,12 @@ class NetworkGroupDetailVC: UIViewController {
         var seen = Set<String>()
         var entries: [FilterableEndpoint] = []
 
-        // Compute prefix to strip for relative display paths
-        var pathPrefix: String? = nil
-        if isPathFilter {
-            let parts = groupKey.components(separatedBy: "/")
-            if parts.count > 1 {
-                pathPrefix = "/" + parts.dropFirst().joined(separator: "/")
-            }
-        }
-
+        // No prefix stripping. `groupKey` is a namespaced TAG key now
+        // (`tag:<label>`, `api:<label>`, `host:<domain>`), not the stripped URL
+        // it used to be, so splitting it on "/" produced nothing for a user tag
+        // — and, for a label that happens to contain a slash, produced a prefix
+        // that stripped the wrong leading segment off every row. Full normalised
+        // paths, exactly as the main list's endpoint sheet shows them.
         for model in models {
             let fullPath = model.url?.path ?? ""
             guard !fullPath.isEmpty else { continue }
@@ -398,14 +483,7 @@ class NetworkGroupDetailVC: UIViewController {
             guard let filterPath = NetworkViewController.endpointKey(for: model.url as URL?),
                   seen.insert(filterPath).inserted else { continue }
 
-            // Compute relative display path (strip group prefix)
-            var displayPath = fullPath
-            if let prefix = pathPrefix,
-               fullPath.lowercased().hasPrefix(prefix.lowercased()) {
-                let relative = String(fullPath.dropFirst(prefix.count))
-                displayPath = relative.isEmpty ? "/" : relative
-            }
-            let normalizedDisplay = NetworkViewController.normalizeEndpoint(displayPath)
+            let normalizedDisplay = NetworkViewController.normalizeEndpoint(fullPath)
             if normalizedDisplay.isEmpty || normalizedDisplay == "/" { continue }
 
             entries.append(FilterableEndpoint(
@@ -460,12 +538,24 @@ class NetworkGroupDetailVC: UIViewController {
 extension NetworkGroupDetailVC: UISearchBarDelegate {
     func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
         self.searchText = searchText
+        // Symmetric: this search bar is built by hand, so it has no Cancel
+        // button and `searchBarCancelButtonClicked` never fires — clearing the
+        // field with its own clear button arrives here, and a one-sided `if`
+        // left auto-follow off and the chevron on screen for a list that was no
+        // longer filtered at all.
         if !searchText.isEmpty {
             isAutoFollowing = false
             setFollowButtonVisible(true, animated: true)
+        } else {
+            isAutoFollowing = true
+            setFollowButtonVisible(false, animated: true)
         }
         applyFilter()
         tableView.reloadData()
+        if searchText.isEmpty, !filteredModels.isEmpty {
+            let last = IndexPath(row: filteredModels.count - 1, section: 0)
+            tableView.scrollToRow(at: last, at: .bottom, animated: false)
+        }
     }
 
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {

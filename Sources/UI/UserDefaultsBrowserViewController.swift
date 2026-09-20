@@ -608,6 +608,16 @@ final class UserDefaultsBrowserViewController: UITableViewController {
     private let titleLabel = UILabel()
     private let searchController = UISearchController(searchResultsController: nil)
     private let toast = UILabel()
+    /// The explainer lives in a `tableFooterView`, not a section footer: this is
+    /// a `.plain` table, where section footers *float* over the bottom of the
+    /// list, and a paragraph this long would sit permanently on top of the last
+    /// visible card. (Same pattern as KeychainBrowserViewController.)
+    private let footerContainer = UIView()
+    private let footerLabel = UILabel()
+
+    /// What `layoutFooter()` last measured, so a repeat pass costs one compare.
+    private var lastFooterWidth: CGFloat = -1
+    private var lastFooterText: String = ""
 
     /// The app's own persisted defaults, or `nil` when there is no bundle
     /// identifier / no app domain at all. Never falls back to
@@ -672,6 +682,16 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         tableView.keyboardDismissMode = .interactive
         tableView.contentInset = UIEdgeInsets(top: 4, left: 0, bottom: 24, right: 0)
 
+        // Sized by hand in `layoutFooter()` — `tableFooterView` gets no
+        // automatic sizing, and `view.bounds` is still a placeholder here.
+        footerLabel.font = .systemFont(ofSize: 11)
+        footerLabel.textColor = UIColor(white: 0.45, alpha: 1)
+        footerLabel.numberOfLines = 0
+        footerLabel.autoresizingMask = [.flexibleWidth]
+        footerContainer.backgroundColor = .clear
+        footerContainer.addSubview(footerLabel)
+        tableView.tableFooterView = footerContainer
+
         // Toast
         toast.backgroundColor = UIColor(white: 0.16, alpha: 0.97)
         toast.textColor = .white
@@ -681,6 +701,12 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         toast.layer.cornerCurve = .continuous
         toast.clipsToBounds = true
         toast.alpha = 0
+        // The messages quote the key, and UserDefaults keys are reverse-DNS
+        // strings. A centred single-line label sized only by its intrinsic
+        // width runs off *both* edges of the screen, taking "Saved" and the
+        // type name with it — middle truncation inside the bubble keeps the
+        // start of the message and the distinguishing tail of the key.
+        toast.lineBreakMode = .byTruncatingMiddle
         toast.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(toast)
         NSLayoutConstraint.activate([
@@ -688,6 +714,7 @@ final class UserDefaultsBrowserViewController: UITableViewController {
             toast.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -28),
             toast.heightAnchor.constraint(equalToConstant: 38),
             toast.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
+            toast.widthAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.widthAnchor, constant: -32),
         ])
 
         reload()
@@ -698,6 +725,11 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         super.viewWillAppear(animated)
         installSearchControllerIfNeeded()
         reload()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        layoutFooter()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -743,6 +775,9 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         titleLabel.text = "User Defaults · \(domainCount)"
         titleLabel.sizeToFit()
         tableView.reloadData()
+        // The explainer counts the rows the search left, so it changes with the
+        // filter and has to be re-measured here.
+        layoutFooter()
     }
 
     private func entry(forKey key: String) -> UserDefaultsEntry? {
@@ -1070,18 +1105,35 @@ final class UserDefaultsBrowserViewController: UITableViewController {
 
     // MARK: Footer
 
-    override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+    private var footerText: String {
         let domain = Bundle.main.bundleIdentifier ?? "—"
         return "Showing \(entries.count) of \(domainCount) key\(domainCount == 1 ? "" : "s") in this app's own domain (\(domain)). System and global defaults are never listed. Tap a row to open the value editor — JSON values get the full tree editor, and every save keeps the original type. Data blobs are decoded (JSON → property list → keyed archive → UTF-8 text → hex) and saved back as Data in the same representation. Swipe left to delete."
     }
 
-    override func tableView(_ tableView: UITableView, willDisplayFooterView view: UIView, forSection section: Int) {
-        guard let footer = view as? UITableViewHeaderFooterView else { return }
-        footer.textLabel?.textColor = UIColor(white: 0.45, alpha: 1)
-        footer.textLabel?.font = .systemFont(ofSize: 11)
-        footer.textLabel?.numberOfLines = 0
-        footer.contentView.backgroundColor = .black
-        footer.forceLTR()
+    /// Sizes the explainer footer by hand — `tableFooterView` gets no automatic
+    /// sizing. Re-assigning it is what makes the table pick up a new height, so
+    /// that only happens when the height actually changed (this runs from
+    /// `viewDidLayoutSubviews`, and re-assigning unconditionally would loop).
+    private func layoutFooter() {
+        let width = max(tableView.bounds.width - 24, 1)
+        // `viewDidLayoutSubviews` on a UITableViewController fires on every table
+        // layout — including during scroll — so nothing expensive may run
+        // unconditionally here. Rebuilding the string and re-measuring it through
+        // TextKit every frame was per-frame work where the base did it once per
+        // appearance. Width unchanged means the measurement cannot have changed.
+        let text = footerText
+        if abs(lastFooterWidth - width) < 0.5, lastFooterText == text { return }
+        lastFooterWidth = width
+        lastFooterText = text
+        footerLabel.text = text
+        let height = ceil(footerLabel.sizeThatFits(CGSize(width: width,
+                                                          height: .greatestFiniteMagnitude)).height)
+        footerLabel.frame = CGRect(x: 12, y: 16, width: width, height: height)
+        let newHeight = height + 32
+        guard abs(footerContainer.bounds.height - newHeight) > 0.5 else { return }
+        footerContainer.frame = CGRect(x: 0, y: 0, width: tableView.bounds.width, height: newHeight)
+        footerContainer.forceLTR()
+        tableView.tableFooterView = footerContainer
     }
 
     // MARK: Feedback

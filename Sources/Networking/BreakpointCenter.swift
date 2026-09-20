@@ -167,6 +167,10 @@ final class BreakpointCenter {
         lock.lock()
         noticeLog.removeAll()
         lock.unlock()
+        // Emptying the inbox also forgets which stand-downs have been announced,
+        // so the next one is posted again. Without this, clearing the inbox left
+        // the suppression in place and the notice never came back.
+        CustomHTTPProtocol.resetSkipNotices()
         notifyChanged()
     }
 

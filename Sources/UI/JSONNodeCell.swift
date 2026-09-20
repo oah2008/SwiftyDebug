@@ -188,6 +188,16 @@ final class JSONNodeCell: UITableViewCell {
         disclosureWidth = disclosure.widthAnchor.constraint(equalToConstant: 26)
         editorHeightConstraint = valueEditor.heightAnchor.constraint(
             equalToConstant: JSONInlineEditMetrics.minHeight)
+        // Below required: starting an inline edit un-hides this field while the
+        // cell still carries the table's `UIView-Encapsulated-Layout-Height`
+        // from its collapsed size, and Auto Layout cannot satisfy both — it
+        // broke this constraint and logged a conflict on every "Edit in place".
+        // At 999 the transient encapsulated height wins that one pass cleanly,
+        // and during `systemLayoutSizeFitting` (where the table removes that
+        // constraint) this is still the only height driver, so the field
+        // measures and settles at the same size. Same technique as
+        // `JSONEditorCardView`'s pinning constraints.
+        editorHeightConstraint.priority = .init(999)
 
         NSLayoutConstraint.activate([
             indentConstraint,
@@ -298,14 +308,19 @@ final class JSONNodeCell: UITableViewCell {
 
     func configure(label: String, preview: String, kind: JSONValueKind, depth: Int,
                    isContainer: Bool, isExpanded: Bool, childCount: Int,
-                   editing: EditingState? = nil) {
+                   editing: EditingState? = nil,
+                   allowsExpand: Bool = true) {
         indentConstraint.constant = 10 + min(CGFloat(depth) * Self.indentPerLevel, Self.maxIndent)
         indentGuide.isHidden = (depth == 0)
 
         keyLabel.text = label
         badge.set(kind: kind)
         // Containers are edited in the tree, never on the value page.
-        expandButton.isHidden = isContainer
+        // Hidden, not merely unwired: in picker mode the control sits on exactly
+        // the scalar rows a picker exists to tap, and being a `UIButton` it also
+        // swallows the touch that would otherwise pick the row — a visible
+        // affordance that did nothing at all.
+        expandButton.isHidden = isContainer || !allowsExpand
 
         if isContainer {
             let cfg = UIImage.SymbolConfiguration(pointSize: 12, weight: .bold)

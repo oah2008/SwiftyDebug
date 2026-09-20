@@ -89,6 +89,18 @@ final class BodySearchCache {
     private var queryOrder: [String] = []
     private let lock = NSLock()
     private let maxQueries = 6
+
+    /// Insertion order of the ids inside each bucket, and the ceiling on it.
+    ///
+    /// The bucket COUNT was capped from the start; the ids inside a bucket were
+    /// not. `NetworkRequestStore` evicts transactions past its own 1500-row cap
+    /// but their memo entries stayed, and now that a rescan runs on every
+    /// capture a bucket accumulated an entry for every id ever scanned under
+    /// that query — an unbounded dictionary over a long session. The cap sits
+    /// well above the store's own so eviction here only ever costs a re-read of
+    /// the oldest bodies, which is the uncached path anyway.
+    private var idOrder: [String: [String]] = [:]
+    private let maxIdsPerQuery = 4000
     private var clearObserver: NSObjectProtocol?
 
     init(observesClear: Bool = true) {
@@ -121,24 +133,38 @@ final class BodySearchCache {
             while queryOrder.count > maxQueries {
                 let evicted = queryOrder.removeFirst()
                 buckets[evicted] = nil
+                idOrder[evicted] = nil
             }
         } else if let idx = queryOrder.firstIndex(of: query) {
             queryOrder.remove(at: idx)
             queryOrder.append(query)
         }
+        let isNewId = buckets[query]?[id] == nil
         buckets[query]?[id] = CachedBodySearchResult(match: match)
+        guard isNewId else { return }
+        idOrder[query, default: []].append(id)
+        while let order = idOrder[query], order.count > maxIdsPerQuery {
+            let oldest = order[0]
+            idOrder[query]?.removeFirst()
+            buckets[query]?[oldest] = nil
+        }
     }
 
     /// Drops everything. Called automatically when the capture store is cleared,
     /// because transaction ids (and their disk files) are no longer valid.
     func invalidateAll() {
-        lock.lock(); buckets.removeAll(); queryOrder.removeAll(); lock.unlock()
+        lock.lock()
+        buckets.removeAll()
+        queryOrder.removeAll()
+        idOrder.removeAll()
+        lock.unlock()
     }
 
     /// Drops the memo for a single query (e.g. to force a rescan).
     func invalidate(query: String) {
         lock.lock()
         buckets[query] = nil
+        idOrder[query] = nil
         if let idx = queryOrder.firstIndex(of: query) { queryOrder.remove(at: idx) }
         lock.unlock()
     }
@@ -190,6 +216,13 @@ enum ResponseBodySearch {
         /// Extra skip predicate — the UI passes `NetworkViewController.isMediaTransaction`
         /// so the engine stays UIKit-free while still honouring the list's media rules.
         var skipTransaction: ((NetworkTransaction) -> Bool)?
+        /// Read image/video/audio bodies too, which are otherwise skipped unread.
+        ///
+        /// Data rather than another closure, because the engine's own media gates
+        /// (`shouldSkip`, `findMatch`'s binary sniff) have to answer to it as
+        /// well — a flag carried only by `skipTransaction` left those two gates
+        /// skipping media no matter what the user asked for.
+        var includeMedia: Bool = false
 
         init() {}
 
@@ -202,6 +235,10 @@ enum ResponseBodySearch {
                 searchResponseBodies ? "res1" : "res0",
                 searchRequestBodies ? "req1" : "req0",
                 caseSensitive ? "cs1" : "cs0",
+                // Part of the key because a scan with media skipped records a
+                // `nil` (no match) for every media transaction. Without this
+                // component, turning media back on would be served those skips.
+                includeMedia ? "media1" : "media0",
                 "ctx\(snippetContext)",
             ].joined(separator: "\u{1}")
         }
@@ -371,9 +408,15 @@ enum ResponseBodySearch {
 
     // MARK: - Skipping
 
-    /// MIME types whose bodies are never worth decoding as text.
-    private static let binaryMimeFragments = [
+    /// MIME types the user can opt back into with `Options.includeMedia`, kept
+    /// apart from the fragments below precisely so the toggle can reach them.
+    private static let mediaMimeFragments = [
         "image/", "video/", "audio/", "font/",
+    ]
+
+    /// MIME types whose bodies are never worth decoding as text, whatever the
+    /// media setting says — no UI offers to search a zip or a wasm module.
+    private static let binaryMimeFragments = [
         "application/octet-stream", "application/zip", "application/gzip",
         "application/pdf", "application/x-protobuf", "application/protobuf",
         "application/wasm", "application/x-font",
@@ -383,7 +426,18 @@ enum ResponseBodySearch {
     /// media rule, media/binary MIME, or an empty pair of bodies.
     static func shouldSkip(_ model: NetworkTransaction, options: Options) -> Bool {
         if let custom = options.skipTransaction, custom(model) { return true }
-        if model.isImage { return true }
+
+        // The media gates read `includeMedia`. The sheet promises "turn this on
+        // to scan them anyway", and a gate that ignores the flag makes the
+        // toggle inert however many of the other gates are opened.
+        if !options.includeMedia {
+            if model.isImage { return true }
+            if let mime = model.mineType?.lowercased(), !mime.isEmpty {
+                for fragment in mediaMimeFragments where mime.contains(fragment) {
+                    return true
+                }
+            }
+        }
 
         if let mime = model.mineType?.lowercased(), !mime.isEmpty {
             for fragment in binaryMimeFragments where mime.contains(fragment) {
@@ -419,7 +473,10 @@ enum ResponseBodySearch {
         let isTruncated = data.count > options.byteCap
         let window = isTruncated ? data.prefix(options.byteCap) : data.prefix(data.count)
 
-        if isLikelyBinary(window) { return nil }
+        // The NUL sniff is the last media gate: every image, video and audio
+        // header carries a NUL in its first bytes, so leaving it unconditional
+        // would throw away exactly the bodies `includeMedia` asked to read.
+        if !options.includeMedia, isLikelyBinary(window) { return nil }
 
         // `String(decoding:)` never fails — invalid bytes (including a codepoint
         // cut in half by the cap) become replacement characters.

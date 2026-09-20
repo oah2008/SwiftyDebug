@@ -1621,6 +1621,36 @@ class InterceptRuleEditorViewController: UITableViewController {
                 return "This rule is switched OFF, so none of the above happens yet. "
                     + "Turn it on with the switch on its row in the rules list."
             }
+            // Blocking wins over everything the rule could otherwise return: the
+            // request is failed before a mock is consulted, before a breakpoint
+            // can hold it, and before a response exists to rewrite. All three are
+            // armed in this same section, so a rule that blocks AND mocks reads
+            // as if it does both.
+            //
+            // This is tested FIRST, ahead of the mock-vs-breakpoint note below.
+            // Placed after it, a rule that blocked and mocked and had a
+            // breakpoint armed was told "a mock answers before the request is
+            // sent — edit the mock body instead", which is false on every count:
+            // nothing is sent, nothing is mocked, and editing the mock body
+            // changes nothing.
+            if isBlocked,
+               mock.isEnabled || breakpointMode != .off || responseRewrites.contains(where: { $0.isEnabled }) {
+                var swallowed: [String] = []
+                if mock.isEnabled { swallowed.append("mock") }
+                if breakpointMode != .off { swallowed.append("breakpoint") }
+                if responseRewrites.contains(where: { $0.isEnabled }) { swallowed.append("response rewrites") }
+                let list: String
+                switch swallowed.count {
+                case 1: list = swallowed[0]
+                case 2: list = swallowed.joined(separator: " and the ")
+                default: list = swallowed.dropLast().joined(separator: ", the ") + " and the " + swallowed[swallowed.count - 1]
+                }
+                // Singular agreement: "the mock ... never runs", not "never run".
+                let plural = swallowed.count > 1 || swallowed[0] == "response rewrites"
+                return "This rule blocks the request, so the \(list) below \(plural ? "never run" : "never runs") — "
+                    + "nothing is sent and no response comes back. "
+                    + "Switch blocking off to use \(plural ? "them" : "it")."
+            }
             // A mock answers from `startLoading` and never touches the network, so
             // the breakpoint parked further down that path never fires. Say so
             // HERE, while both are being armed — the paused inbox reports it
@@ -1629,6 +1659,15 @@ class InterceptRuleEditorViewController: UITableViewController {
             if mock.isEnabled, breakpointMode != .off {
                 return "This rule returns a mock, so the breakpoint never pauses — "
                     + "a mock answers before the request is sent. Edit the mock body instead."
+            }
+            // Mocks and breakpoints are applied by the native URLProtocol. WebView
+            // traffic is captured by injected JavaScript, which has no code to
+            // answer a request locally or to hold one, so a rule scoped widely
+            // enough to cover web views still does neither there.
+            if matchMode == .global || matchMode == .host, mock.isEnabled || breakpointMode != .off {
+                return "Inside a WKWebView this rule still rewrites headers and query parameters, "
+                    + "but its mock and breakpoint do not apply — web view traffic is captured by "
+                    + "injected JavaScript, which cannot answer or pause a request."
             }
             return nil
         }

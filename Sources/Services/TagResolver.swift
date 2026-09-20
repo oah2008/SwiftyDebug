@@ -104,6 +104,7 @@ enum TagResolver {
             cache.removeAll(keepingCapacity: true)
             regexCache.removeAll(keepingCapacity: true)
             compiledKeywords = nil
+            compiledAllowList = nil
             cacheGeneration = generation
         }
         if let hit = cache[urlString] { return hit.tag }
@@ -375,23 +376,61 @@ enum TagResolver {
                                    hasWildcard: hasWildcard,
                                    matchesQuery: keyword.contains("?"))
         }
-        compiledKeywords = compiled
-        return compiled
+        // Labels that differ only in case are ONE tag.
+        //
+        // `resolveUncached` keys a user tag by `label.lowercased()`, so two
+        // keywords labelled "Algolia" and "algolia" already produced a single
+        // filter row, a single group and a single colour — but carried two
+        // different pill texts, and which one the sheet showed depended on which
+        // keyword happened to match first. Agreeing on one spelling at compile
+        // time makes the label a pure function of the key, which is the
+        // invariant `NetworkTag` documents, and fixes pill, group header and
+        // filter row together with no change at any call site.
+        //
+        // The lexicographically-first raw spelling wins: an arbitrary rule, but
+        // a STABLE one, which is the property that was missing. The ordinary
+        // one-spelling case is untouched.
+        var canonicalLabels: [String: String] = [:]
+        for entry in compiled {
+            let key = entry.label.lowercased()
+            if let existing = canonicalLabels[key] {
+                if entry.label < existing { canonicalLabels[key] = entry.label }
+            } else {
+                canonicalLabels[key] = entry.label
+            }
+        }
+        let normalized = compiled.map { entry -> CompiledKeyword in
+            let canonical = canonicalLabels[entry.label.lowercased()] ?? entry.label
+            guard canonical != entry.label else { return entry }
+            return CompiledKeyword(keyword: entry.keyword,
+                                   label: canonical,
+                                   specificity: entry.specificity,
+                                   hasWildcard: entry.hasWildcard,
+                                   matchesQuery: entry.matchesQuery)
+        }
+        compiledKeywords = normalized
+        return normalized
     }
 
     /// The longest `SwiftyDebug.urls` entry that this request sits under.
     /// Path-boundary matched and query-tolerant, like every other comparison here.
     private static func bestAllowListEntry(hostPath: String) -> String? {
-        var best: String?
-        for raw in SwiftyDebug.urlsForTagging {
-            let candidate = canonicalKeyword(raw)
-            guard !candidate.isEmpty, boundaryPrefix(hostPath, candidate) else { continue }
-            if best == nil || candidate.count > best!.count
-                || (candidate.count == best!.count && candidate < best!) {
-                best = candidate
-            }
+        // Ordered longest-first, then lexicographically — exactly the tie-break
+        // the linear scan used to apply — so the FIRST hit is the answer and the
+        // scan short-circuits. Compiled once per generation like the keywords
+        // beside it; this was the one hot path in this file still re-doing its
+        // trim/lowercase/strip work on every uncached resolution, inside the lock.
+        let list: [String]
+        if let compiled = compiledAllowList {
+            list = compiled
+        } else {
+            list = SwiftyDebug.urlsForTagging
+                .map(canonicalKeyword)
+                .filter { !$0.isEmpty }
+                .sorted { $0.count != $1.count ? $0.count > $1.count : $0 < $1 }
+            compiledAllowList = list
         }
-        return best
+        return list.first { boundaryPrefix(hostPath, $0) }
     }
 
     /// Which matcher a keyword gets.
@@ -497,6 +536,16 @@ enum TagResolver {
                 return nil   // a glob is never a literal substring
             }
             if boundaryPrefix(subject, candidate.keyword) { return .structured }
+            // A keyword that carries its OWN query can never continue at a `/`
+            // or `?` boundary once the request adds another parameter — the next
+            // character is `&` — and parameter order is not ours to predict. So
+            // for those only, fall back to the substring rule `addTag` documents
+            // and that shipped before this engine existed. Query-free path
+            // keywords keep the no-fallback rule, so `/1/index` still cannot
+            // claim `/1/indexes`.
+            if candidate.matchesQuery {
+                return subject.contains(candidate.keyword) ? .substring : nil
+            }
         case .hostLike:
             // A host keyword matches the host and its subdomains, never a host
             // that merely ends with the same letters: `algolia.net` must not
@@ -664,6 +713,11 @@ enum TagResolver {
     private static var cache: [String: CacheEntry] = [:]
     private static var cacheGeneration: UInt64 = .max
     private static var compiledKeywords: [CompiledKeyword]?
+
+    /// `SwiftyDebug.urls`, canonicalised and ordered. Invalidated with
+    /// `compiledKeywords` — `SwiftyDebug.urls`' own `didSet` bumps the same
+    /// generation counter, so there is nothing else to hook.
+    private static var compiledAllowList: [String]?
     private static let cacheCeiling = 5000
 
     /// Drops everything resolved so far. Called when the tag table changes.
@@ -672,6 +726,7 @@ enum TagResolver {
         cache.removeAll(keepingCapacity: false)
         regexCache.removeAll(keepingCapacity: false)
         compiledKeywords = nil
+        compiledAllowList = nil
         cacheGeneration = SwiftyDebug.tagGeneration
         lock.unlock()
     }

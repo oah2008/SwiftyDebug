@@ -51,6 +51,45 @@ enum ClipboardFormatter {
         UIPasteboard.general.string = text.map(ClipboardText.normalized)
     }
 
+    /// Puts a verbatim payload on the clipboard, *building* it off the main
+    /// thread when it is big enough to stall one.
+    ///
+    /// Same contract as `copyVerbatim(_:)` — the bytes reach the pasteboard
+    /// unchanged apart from the affix trim — but the string is produced by
+    /// `makeText` rather than handed in, so a caller that has to concatenate
+    /// megabytes to produce it does that concatenation on the background queue
+    /// too. The request diff is the case that needs it: when two bodies are too
+    /// big to diff line-by-line, a single "(body)" row carries both of them
+    /// whole, and a tap on it used to join and copy tens of megabytes inside
+    /// `didSelectRowAt`.
+    ///
+    /// - Parameter byteCount: the size the finished string will be, give or
+    ///   take — it only picks the path, so an estimate is enough. Pass `0` and
+    ///   nothing is copied.
+    static func copyVerbatim(byteCount: Int,
+                             from presenter: UIViewController?,
+                             completion: (() -> Void)? = nil,
+                             makeText: @escaping () -> String?) {
+        guard needsProgressUI(byteCount: byteCount), let presenter else {
+            copyVerbatim(makeText())
+            completion?()
+            return
+        }
+
+        let overlay = FormattingOverlayView(
+            message: "Copying \(sizeDescription(byteCount: byteCount)) to the clipboard.")
+        overlay.present(over: presenter)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let value = makeText().map(ClipboardText.normalized)
+            DispatchQueue.main.async {
+                UIPasteboard.general.string = value
+                overlay.dismiss()
+                completion?()
+            }
+        }
+    }
+
     /// Puts `text` on the clipboard byte-for-byte, with NO trimming.
     ///
     /// For the inspectors whose entire job is to reveal exactly what is stored — a

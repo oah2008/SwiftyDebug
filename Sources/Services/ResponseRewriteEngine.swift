@@ -171,10 +171,19 @@ enum ResponseRewriteEngine {
                          error: shown.isEmpty ? "No path pattern set" : "\"\(shown)\" is not a valid path pattern")
         }
 
-        let paths = pattern.matches(in: document.root)
+        let (paths, wasTruncated) = pattern.matchesReporting(in: document.root)
+        // A walk that hit the traversal limit found only part of what the pattern
+        // addresses, so "matched N, changed N" would report a half-applied
+        // rewrite as a complete one — the exact silence this report exists to
+        // break. It travels in the error channel the UI already renders.
+        let truncationNote = wasTruncated
+            ? "stopped after \(paths.count) values — this pattern reached SwiftyDebug's traversal limit, "
+              + "so the rest of the body was left alone"
+            : nil
+
         guard !paths.isEmpty else {
             // Not an error — but `matched: 0` is the thing the UI must show.
-            return .init(rewriteId: rewrite.id, matched: 0, changed: 0)
+            return .init(rewriteId: rewrite.id, matched: 0, changed: 0, error: truncationNote)
         }
 
         // Everything that can fail for the whole rewrite (empty target, bad
@@ -217,8 +226,9 @@ enum ResponseRewriteEngine {
             }
         }
 
+        let problems = [summarize(errors), truncationNote].compactMap { $0 }
         return .init(rewriteId: rewrite.id, matched: paths.count, changed: changed,
-                     error: summarize(errors))
+                     error: problems.isEmpty ? nil : problems.joined(separator: "; "))
     }
 
     /// One message for the report entry: the first problem, plus how many values
@@ -233,12 +243,28 @@ enum ResponseRewriteEngine {
     /// Before/after pairs for the editor's live preview, in document order.
     /// Rows whose value cannot be rewritten are still listed, with the reason in
     /// `after` — an empty result means the pattern matched nothing at all.
+    ///
+    /// `changed` is the engine's own verdict on the value, never a comparison of
+    /// the two rendered strings: `displayText` caps at 200 characters and flattens
+    /// newlines, so an edit landing past that cap renders identically on both
+    /// sides. Counting rows by `before != after` therefore reported "nothing
+    /// changes" for rewrites that the wire path does apply.
     static func preview(_ rewrite: ResponseRewrite, on data: Data,
-                        limit: Int) -> [(path: String, before: String, after: String)] {
+                        limit: Int) -> [(path: String, before: String, after: String, changed: Bool)] {
         guard limit > 0, !data.isEmpty, data.count <= maxBodyBytes,
-              let pattern = JSONPathPattern(rewrite.pattern),
               let root = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
         else { return [] }
+        return preview(rewrite, root: root, sourceText: String(data: data, encoding: .utf8), limit: limit)
+    }
+
+    /// The same preview against an ALREADY PARSED body.
+    ///
+    /// The editor keeps the response parsed for the life of the screen and asks
+    /// for a preview on every keystroke; re-parsing the `Data` here spent a full
+    /// JSON parse per character on the main thread, on top of the walk.
+    static func preview(_ rewrite: ResponseRewrite, root: Any, sourceText: String?,
+                        limit: Int) -> [(path: String, before: String, after: String, changed: Bool)] {
+        guard limit > 0, let pattern = JSONPathPattern(rewrite.pattern) else { return [] }
 
         let paths = pattern.matches(in: root, limit: limit)
         guard !paths.isEmpty else { return [] }
@@ -250,29 +276,40 @@ enum ResponseRewriteEngine {
         case .ready(let compiled):  regex = compiled
         }
 
-        let document = JSONDocument(root: root, sourceText: String(data: data, encoding: .utf8))
-        var rows: [(path: String, before: String, after: String)] = []
+        let document = JSONDocument(root: root, sourceText: sourceText)
+        var rows: [(path: String, before: String, after: String, changed: Bool)] = []
         // Same bound as `apply`, for the same reason — this one runs while the
         // user is typing the pattern, which is when a runaway pattern first
-        // exists. See `computePreview()`'s caller: it must not run on the main
-        // thread either.
+        // exists, and the editor's caller debounces rather than dispatching, so
+        // a single run is all the main thread ever gives up.
         let budget = RegexBudget()
 
         for path in paths {
             guard let current = document.value(at: path) else { continue }
             let before = displayText(for: current)
             let after: String
+            let changed: Bool
             if let message = preparationError {
                 after = "(unchanged — \(message))"
+                changed = false
             } else {
                 switch outcome(of: rewrite.action, on: current, regex: regex, budget: budget) {
-                case .remove:              after = "(removed)"
-                case .newValue(let value): after = isSameJSON(value, current) ? before : displayText(for: value)
-                case .unchanged:           after = before
-                case .failed(let message): after = "(unchanged — \(message))"
+                case .remove:
+                    after = "(removed)"
+                    changed = true
+                case .newValue(let value):
+                    let same = isSameJSON(value, current)
+                    after = same ? before : displayText(for: value)
+                    changed = !same
+                case .unchanged:
+                    after = before
+                    changed = false
+                case .failed(let message):
+                    after = "(unchanged — \(message))"
+                    changed = false
                 }
             }
-            rows.append((path: path.display, before: before, after: after))
+            rows.append((path: path.display, before: before, after: after, changed: changed))
         }
         return rows
     }

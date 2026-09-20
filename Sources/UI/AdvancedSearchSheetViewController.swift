@@ -19,7 +19,9 @@ struct AdvancedSearchOptions: Equatable {
     var searchResponseBodies = false
     /// Look inside what the app sent.
     var searchRequestBodies = false
-    /// Match capitalisation exactly.
+    /// Match capitalisation exactly when scanning bodies. The URL/metadata list
+    /// search is index-backed and case-folded at build time, so it never sees
+    /// this — which is why the sheet groups the toggle with the body scopes.
     var caseSensitive = false
     /// Include image/video/audio responses, which are normally skipped.
     var includeMedia = false
@@ -37,6 +39,11 @@ struct AdvancedSearchOptions: Equatable {
         options.searchRequestBodies = (side == .request)
         options.caseSensitive = caseSensitive
         if scanWholeBodies { options.byteCap = .max }
+        // As data, not only as the presence of a predicate: the engine's own
+        // media gates (`shouldSkip`, the binary sniff in `findMatch`) and its
+        // cache key all have to see the flag, or removing the predicate alone
+        // changes nothing for a media transaction.
+        options.includeMedia = includeMedia
         if !includeMedia {
             // Reuse the list's own media rule so the two can never disagree.
             options.skipTransaction = { NetworkViewController.isMediaTransaction($0) }
@@ -93,14 +100,14 @@ final class AdvancedSearchSheetViewController: UITableViewController {
                            symbol: "arrow.up.doc",
                            get: { $0.searchRequestBodies },
                            set: { $0.searchRequestBodies = $1 }),
-                ]
-            ),
-            Group(
-                header: "HOW TO MATCH",
-                footer: nil,
-                toggles: [
+                    // Lives here, not under a "HOW TO MATCH" heading of its own:
+                    // it reaches `ResponseBodySearch.Options.caseSensitive` and
+                    // nothing else, and a heading that implied it governed the
+                    // whole search promised a rule the case-folded URL index
+                    // cannot keep.
                     Toggle(title: "Case sensitive",
-                           detail: "Match capitalisation exactly. Off, \u{201C}Token\u{201D} also finds \u{201C}token\u{201D} and \u{201C}TOKEN\u{201D}.",
+                           detail: "Match capitalisation exactly when scanning bodies. Off, \u{201C}Token\u{201D} also finds "
+                                 + "\u{201C}token\u{201D} and \u{201C}TOKEN\u{201D}. The URL list always ignores case.",
                            symbol: "textformat",
                            get: { $0.caseSensitive },
                            set: { $0.caseSensitive = $1 }),

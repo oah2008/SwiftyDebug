@@ -22,6 +22,12 @@ class RuleTransferViewController: UITableViewController {
     private var rules: [InterceptRule] = []
     /// Keyed by rule id — rows are recreated on every reload, so an index-based selection would drift.
     private var selectedIds: Set<String> = []
+    /// Whether the "everything is selected" default has already been applied.
+    /// An empty `selectedIds` is a legitimate state — it is what "Select None"
+    /// produces — so it cannot double as "not initialised yet": `viewWillAppear`
+    /// reloads on every return from the paste screen, the import preview and the
+    /// document picker, and re-checked every row the user had just cleared.
+    private var hasSeededSelection = false
 
     // MARK: - Lifecycle
 
@@ -62,8 +68,13 @@ class RuleTransferViewController: UITableViewController {
     private func reloadRules() {
         rules = InterceptRuleStore.shared.allRules()
         let liveIds = Set(rules.map { $0.id })
-        if selectedIds.isEmpty {
+        if !hasSeededSelection {
             selectedIds = liveIds
+            // Latch only when there was something to select. Latching on an empty
+            // store meant rules IMPORTED during the same visit fell into the
+            // intersect branch, which can only shrink the set, so they came back
+            // with every checkbox clear and Export said "Nothing Selected".
+            hasSeededSelection = !liveIds.isEmpty
         } else {
             selectedIds.formIntersection(liveIds)
         }

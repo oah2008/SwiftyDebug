@@ -38,6 +38,13 @@ class NetworkDetailCell: UITableViewCell {
     /// Copy button trailing when preview is NOT visible
     private var copyTrailingToCard: NSLayoutConstraint!
 
+    /// The decoded image's own aspect ratio, rebuilt on every `configure()`.
+    /// Held so it can be torn down again — a required 1:1 constraint baked into
+    /// `setupViews()` reserved a full screen-wide square for a 1200x300 banner
+    /// and kept solving that square on every plain-text row, where the image
+    /// view is hidden.
+    private var imageAspectConstraint: NSLayoutConstraint?
+
     // MARK: - Colors
 
     private static let cardColor = UIColor(white: 0.11, alpha: 1)       // #1C1C1C
@@ -218,7 +225,10 @@ class NetworkDetailCell: UITableViewCell {
             imgView.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
             imgView.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 4),
             imgView.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -4),
-            imgView.heightAnchor.constraint(equalTo: imgView.widthAnchor),
+            // A hard ceiling so a very tall portrait image cannot make a card
+            // several screens high. The per-image aspect constraint is 999, so
+            // it yields to this rather than conflicting with it.
+            imgView.heightAnchor.constraint(lessThanOrEqualToConstant: 400),
 
             // Default bottom
             contentBottomConstraint,
@@ -270,7 +280,10 @@ class NetworkDetailCell: UITableViewCell {
         let isCollapsed = model.blankContent == "..."
         let hasImage = model.image != nil
         let hasContent = !(model.content?.isEmpty ?? true)
-        let showPreview = model.showPreview && hasContent
+        // An image response carries its body in `image`, not `content` — gating
+        // Preview on text alone left the RESPONSE card for every image with no
+        // control at all: no Preview, no copy, and the row is not selectable.
+        let showPreview = model.showPreview && (hasContent || hasImage)
         let mustInPreview = model.mustInPreview
 
         // Title (with optional size annotation pill)
@@ -316,13 +329,26 @@ class NetworkDetailCell: UITableViewCell {
         if isCollapsed {
             contentTextView.isHidden = true
             imgView.isHidden = true
+            clearImageAspect()
         } else if hasImage {
             contentTextView.isHidden = true
             imgView.isHidden = false
             imgView.image = model.image
+            // Size the card to the image the response actually contains. Every
+            // branch resets this, so a reused cell never keeps the previous
+            // image's ratio — or stacks a second one on top of it.
+            clearImageAspect()
+            if let img = model.image, img.size.width > 0 {
+                let c = imgView.heightAnchor.constraint(equalTo: imgView.widthAnchor,
+                                                        multiplier: img.size.height / img.size.width)
+                c.priority = UILayoutPriority(999)
+                c.isActive = true
+                imageAspectConstraint = c
+            }
         } else {
             imgView.isHidden = true
             contentTextView.isHidden = !hasContent
+            clearImageAspect()
 
             if hasContent {
                 let content = model.content!
@@ -373,6 +399,14 @@ class NetworkDetailCell: UITableViewCell {
         // sections appear to vanish on scroll. Let automaticDimension +
         // systemLayoutSizeFitting handle height calculation instead.
         contentTextView.invalidateIntrinsicContentSize()
+    }
+
+    /// Drops the current image's aspect constraint. Called from all three
+    /// layout branches of `configure()` so the constraint never survives cell
+    /// reuse into a row that shows different content.
+    private func clearImageAspect() {
+        imageAspectConstraint?.isActive = false
+        imageAspectConstraint = nil
     }
 
     /// The view controller hosting this cell, for presenting the copy overlay.

@@ -138,17 +138,27 @@ class ConsoleCell: UITableViewCell {
 
     static func applySearchHighlight(to source: NSAttributedString, query: String, isCurrentMatch: Bool) -> NSAttributedString {
         let mutable = NSMutableAttributedString(attributedString: source)
-        let nsText = mutable.string.lowercased() as NSString
-        let queryLower = query.lowercased() as NSString
-        let queryLen = queryLower.length
-        guard queryLen > 0 else { return mutable }
+        // The search runs over the ORIGINAL string, not a lowercased copy, so
+        // every range it returns indexes the same string the attribute is
+        // applied to. `lowercased()` is not length-preserving in Unicode —
+        // "İ" (U+0130) is one UTF-16 unit and lowercases to two — so ranges
+        // found in a lowercased copy drift right of the real text and a match
+        // near the end of the line runs past `mutable.length`, which makes
+        // `addAttribute` raise NSRangeException: an ObjC exception no `try?`
+        // can catch, killing the host app mid-scroll.
+        let nsText = mutable.string as NSString
+        guard !query.isEmpty else { return mutable }
 
         let color = isCurrentMatch ? currentMatchColor : searchHighlightColor
         var searchRange = NSRange(location: 0, length: nsText.length)
 
         while searchRange.location < nsText.length {
-            let found = nsText.range(of: queryLower as String, options: [], range: searchRange)
-            guard found.location != NSNotFound else { break }
+            // `.caseInsensitive` folds case without rewriting the string, which
+            // keeps the match case-insensitive as before.
+            let found = nsText.range(of: query, options: [.caseInsensitive], range: searchRange)
+            // A zero-length match would never advance `searchRange` and would
+            // spin this loop forever.
+            guard found.location != NSNotFound, found.length > 0 else { break }
             mutable.addAttribute(.backgroundColor, value: color, range: found)
             searchRange.location = found.location + found.length
             searchRange.length = nsText.length - searchRange.location

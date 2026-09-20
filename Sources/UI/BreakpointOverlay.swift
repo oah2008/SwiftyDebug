@@ -23,6 +23,11 @@ final class BreakpointOverlay {
     private var banner: BannerView?
     private var observer: NSObjectProtocol?
 
+    /// Set while a tap is bringing the presenter's window back and retrying, so
+    /// a window that still cannot present ends the attempt instead of reviving
+    /// on every retry for ever.
+    private var isRevivingPresenter = false
+
     /// Starts listening. Safe to call more than once.
     func start() {
         guard observer == nil else { return }
@@ -136,9 +141,28 @@ final class BreakpointOverlay {
         guard Self.canPresentInbox(from: presenter.vc) else {
             // Nothing was presented, so nothing may be swallowing touches:
             // if an earlier attempt left the flag set, this takes it back.
-            // The banner stays on screen — tapping again once the app has a
-            // live window is the whole recovery path.
             releaseTouchesIfNothingPresented()
+
+            // The banner outlives the overlay window — it must stay up for a
+            // request that is holding the host app hostage even after the bubble
+            // was hidden (shake-to-hide, `Settings.bubbleVisible = false`) tore
+            // the presenter's window down. Tapping it is then the only offered
+            // way to release that request, so the tap revives the presenter
+            // rather than giving up: `bubbleVisible`'s observer runs
+            // `updateBubblePresentation()`, which is what calls `enable()`. The
+            // retry is delayed because `enable()` attaches the windowScene on a
+            // staggered async schedule, so the next runloop can still find no
+            // scene; the flag is only cleared after that one retry, which is
+            // what stops a window that stays unpresentable from looping.
+            if presenter.window.rootViewController == nil || presenter.window.isHidden,
+               !isRevivingPresenter {
+                isRevivingPresenter = true
+                Settings.shared.bubbleVisible = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.openInbox()
+                    self?.isRevivingPresenter = false
+                }
+            }
             return
         }
 

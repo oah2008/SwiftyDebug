@@ -30,6 +30,10 @@ final class RedirectEditorViewController: UIViewController, UITextViewDelegate {
     private let stack = UIStackView()
     private let segment = UISegmentedControl(items: ["Off", "Host", "Host + Path"])
     private let targetView = UITextView()
+    /// The hint text drawn inside the empty destination field. A `UITextView`
+    /// has no placeholder of its own, so it is a real label pinned to the text
+    /// container's own insets and hidden the moment there is text.
+    private let targetPlaceholder = UILabel()
     private let targetCard = UIView()
     private let hintLabel = UILabel()
     private let beforeLabel = UILabel()
@@ -166,6 +170,30 @@ final class RedirectEditorViewController: UIViewController, UITextViewDelegate {
             targetView.bottomAnchor.constraint(equalTo: card.bottomAnchor),
             targetView.heightAnchor.constraint(greaterThanOrEqualToConstant: 52),
         ])
+
+        // Inset to match where the text itself starts: `textContainerInset.left`
+        // (10) plus the text container's default 5pt line-fragment padding, so
+        // the hint and the first typed character sit on the same baseline.
+        targetPlaceholder.font = targetView.font
+        targetPlaceholder.textColor = UIColor(white: 0.38, alpha: 1)
+        // One line, truncated in the MIDDLE so both the host being replaced and
+        // the tail of the path stay readable. `numberOfLines = 0` was inert here:
+        // the only horizontal bound was an inequality against a UITextView's own
+        // anchor — a scroll view, whose content area simply grows — so nothing
+        // ever forced a wrap and a long sample path was clipped at the card edge.
+        // The 52pt field could not show a second line anyway.
+        targetPlaceholder.numberOfLines = 1
+        targetPlaceholder.lineBreakMode = .byTruncatingMiddle
+        targetPlaceholder.isUserInteractionEnabled = false
+        targetPlaceholder.translatesAutoresizingMaskIntoConstraints = false
+        targetView.addSubview(targetPlaceholder)
+        NSLayoutConstraint.activate([
+            targetPlaceholder.topAnchor.constraint(equalTo: targetView.topAnchor, constant: 12),
+            targetPlaceholder.leadingAnchor.constraint(equalTo: targetView.leadingAnchor, constant: 15),
+            // Width off the CARD, which does not scroll, rather than the text
+            // view's content area.
+            targetPlaceholder.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -30),
+        ])
         stack.addArrangedSubview(targetCard)
     }
 
@@ -239,13 +267,17 @@ final class RedirectEditorViewController: UIViewController, UITextViewDelegate {
             hintLabel.text = "Only the host changes. The path and query string are kept exactly as they were."
             targetCard.isHidden = false
             previewCard.isHidden = false
-            targetView.attributedPlaceholderIfEmpty("beta.\(sampleHost)")
+            targetPlaceholder.text = "beta.\(sampleHost)"
         case .hostAndPath:
             hintLabel.text = "The host AND path are replaced. The original query string is still preserved. Applies to every request matching this rule — not just this one."
             targetCard.isHidden = false
             previewCard.isHidden = false
-            targetView.attributedPlaceholderIfEmpty("beta.\(sampleHost)\(samplePath)")
+            targetPlaceholder.text = "beta.\(sampleHost)\(samplePath)"
         }
+        // `textViewDidChange` routes back through here, so the hint disappears
+        // with the first character and returns when the field is cleared.
+        targetPlaceholder.isHidden = !targetView.text.isEmpty
+        targetView.accessibilityHint = targetPlaceholder.text
 
         // Live preview through the real redirect logic.
         if mode != .none {
@@ -292,18 +324,5 @@ final class RedirectEditorViewController: UIViewController, UITextViewDelegate {
         } else {
             navigationController?.popViewController(animated: true)
         }
-    }
-}
-
-// MARK: - Placeholder helper
-
-private extension UITextView {
-    /// UITextView has no placeholder; show grey hint text only while empty.
-    func attributedPlaceholderIfEmpty(_ placeholder: String) {
-        guard text.isEmpty else { return }
-        // Keep it simple: use the tint-less hint via `text` only when the user
-        // hasn't typed. We avoid overwriting real input.
-        if let existing = accessibilityHint, existing == placeholder { return }
-        accessibilityHint = placeholder
     }
 }

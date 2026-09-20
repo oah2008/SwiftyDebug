@@ -57,9 +57,23 @@ extension SwiftyDebug {
     }
 
     static func deinitializationMethod() {
+        // `disable()` is the only off-switch a host app has, and it used to undo
+        // two of the six subsystems `initializationMethod()` starts: the runtime
+        // gate stayed open, so every live WKWebView kept injecting capture JS,
+        // stdout stayed dup2'd into the SDK's pipe and the OSLogStore poll timer
+        // kept re-arming for the life of the process — all of it feeding the
+        // stores after the app asked for the SDK to be off. `fullStop()` is the
+        // complete teardown and already exists; delegate rather than keep a
+        // partial copy of it here. It covers the runtime gate, breakpoint
+        // release, the overlay, `NetworkMonitor.disable()`, `NSLogHook.disable()`,
+        // the print interceptor and the web-view push, so none of those are
+        // repeated below.
+        //
+        // Safe to re-enter: `initializationMethod()` opens with
+        // `activateRuntimeForEnable()` and re-runs the hooks, so `enable()` after
+        // `disable()` fully resumes.
+        fullStop()
         DebugWindowPresenter.shared.disable()
-        NetworkMonitor.shared.disable()
-        PrintInterceptor.shared.enable = false
         Settings.shared.shakeGestureEnabled = false
     }
 
@@ -154,6 +168,19 @@ extension SwiftyDebug {
         } else {
             SwiftyDebug.monitorMedia = settings.monitorMediaEnabled
         }
+
+        // Console capture is deliberately NOT reconciled here.
+        //
+        // `SwiftyDebug.enableConsoleLog` is the host app's own opt-out and it
+        // belongs to the host app. Writing it into `settings.consoleLogsEnabled`
+        // persists it to `UserDefaults` under the same key a USER choice writes,
+        // so the two become indistinguishable: a host that set the opt-out for
+        // one build turned console capture off permanently, on every later
+        // launch, including ones where the opt-out had been removed.
+        //
+        // The switch instead reads `consoleLogsEnabled && SwiftyDebug.enableConsoleLog`
+        // and is drawn disabled while the host opts out, so it tells the truth
+        // without either side overwriting the other.
     }
 
     // MARK: - Full stop / resume (kill-switch)
@@ -165,6 +192,13 @@ extension SwiftyDebug {
     /// costs ~zero CPU — as if it were never included. Reverses with
     /// `resumeFromFullStop()`, or with `SwiftyDebug.enable()`.
     static func fullStop() {
+        // Give the host app its User-Agent back BEFORE the gate closes. The
+        // override is installed by a rule and only reverted by the code that
+        // installs it, so a full stop used to leave every web view in the app
+        // advertising the debugger's UA until the process restarted — an SDK
+        // that is "off" still changing what the server sees.
+        WKWebViewSwizzling.revertNativeForbiddenHeaders()
+
         // Flip the global gate first so in-flight hot paths stop doing work
         // immediately.
         SwiftyDebugRuntime.markStopped()

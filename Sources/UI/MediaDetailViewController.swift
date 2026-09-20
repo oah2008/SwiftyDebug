@@ -325,7 +325,10 @@ final class MediaDetailViewController: UIViewController {
         previewSpinner.startAnimating()
 
         let maxPixel = max(600, UIScreen.main.bounds.width * UIScreen.main.scale)
-        previewToken = ImageLoader.shared.loadImage(urlString: item.urlString, maxPixel: maxPixel) { [weak self] image in
+        // `animated: true` so a GIF plays here as it does in the pager and in the
+        // request detail. Without it this one screen decoded only frame 0 and the
+        // same image was frozen here and animated everywhere else.
+        previewToken = ImageLoader.shared.loadImage(urlString: item.urlString, maxPixel: maxPixel, animated: true) { [weak self] image in
             guard let self = self else { return }
             self.previewSpinner.stopAnimating()
             self.previewImageView.image = image

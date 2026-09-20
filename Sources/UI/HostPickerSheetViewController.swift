@@ -64,6 +64,9 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         struct RawEntry {
             let display: String
             let filterKey: String // stripped URL
+            /// What rows merge on. Not always the display label — see
+            /// `rowIdentity(forURLString:fallback:)`.
+            let mergeKey: String
         }
 
         var rawEntries: [RawEntry] = []
@@ -89,8 +92,10 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
 
             if hasMatch {
                 if addedKeys.insert(key).inserted {
-                    let display = tagLabel(forURLString: urlString) ?? stripped
-                    rawEntries.append(RawEntry(display: display, filterKey: stripped))
+                    let identity = rowIdentity(forURLString: urlString, fallback: stripped)
+                    rawEntries.append(RawEntry(display: identity.display,
+                                               filterKey: stripped,
+                                               mergeKey: identity.mergeKey))
                 }
             }
         }
@@ -108,9 +113,11 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
             if coveredHosts.contains(host) || seenTrafficHosts.contains(host) { continue }
             seenTrafficHosts.insert(host)
 
-            let display = tagLabel(forHost: host) ?? host
+            let identity = rowIdentity(forURLString: "https://" + host, fallback: host)
             if addedKeys.insert(host).inserted {
-                rawEntries.append(RawEntry(display: display, filterKey: host))
+                rawEntries.append(RawEntry(display: identity.display,
+                                           filterKey: host,
+                                           mergeKey: identity.mergeKey))
             }
         }
 
@@ -118,8 +125,11 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         for key in ruleSelectedKeys {
             if !addedKeys.contains(key) {
                 if addedKeys.insert(key).inserted {
-                    let display = tagLabel(forHost: key.components(separatedBy: "/").first ?? key) ?? key
-                    rawEntries.append(RawEntry(display: display, filterKey: key))
+                    let host = key.components(separatedBy: "/").first ?? key
+                    let identity = rowIdentity(forURLString: "https://" + host, fallback: key)
+                    rawEntries.append(RawEntry(display: identity.display,
+                                               filterKey: key,
+                                               mergeKey: identity.mergeKey))
                 }
             }
         }
@@ -127,21 +137,22 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
         // Sort alphabetically by display
         let sorted = rawEntries.sorted { $0.display.lowercased() < $1.display.lowercased() }
 
-        // Merge by display label (same tag → one row)
-        var displayOrder: [String] = []
+        // Merge on the row's merge key — the developer's own tag label, or the
+        // host itself for everything else. (See `rowIdentity`.)
+        var displayOrder: [(display: String, mergeKey: String)] = []
         var mergedMap: [String: [String]] = [:]
 
         for entry in sorted {
-            let key = entry.display.lowercased()
+            let key = entry.mergeKey
             if mergedMap[key] == nil {
-                displayOrder.append(entry.display)
+                displayOrder.append((entry.display, key))
                 mergedMap[key] = []
             }
             mergedMap[key]!.append(entry.filterKey)
         }
 
-        entries = displayOrder.map { display in
-            let filterKeys = mergedMap[display.lowercased()]!
+        entries = displayOrder.map { (display, mergeKey) in
+            let filterKeys = mergedMap[mergeKey]!
             // Show first URL as subtitle (like filter sheet)
             let subtitle: String?
             if let first = filterKeys.first, first.lowercased() != display.lowercased() {
@@ -181,6 +192,31 @@ class HostPickerSheetViewController: UIViewController, UITableViewDataSource, UI
 
     private func tagLabel(forHost host: String) -> String? {
         tagLabel(forURLString: "https://" + host)
+    }
+
+    /// A row's display label, and the key rows are merged on.
+    ///
+    /// These are the same string ONLY for a tag the developer configured with
+    /// `addTag(keyword:label:)` — that call is exactly the statement "these
+    /// hosts are one thing to me", so merging them into one row is what it asks
+    /// for. A label that came from the built-in catalog, or from an allow-list
+    /// entry, was never such a statement: merging on it collapsed unrelated
+    /// hosts (every Firebase service, say) into a single row, and because
+    /// `didSelectRowAt` writes ALL of a row's `filterKeys` into
+    /// `InterceptRule.matchHosts`, one tap armed a rule against hosts the
+    /// developer never picked and could not see.
+    ///
+    /// So catalog- and allow-list-labelled rows keep the shared label for
+    /// display — the labels still read the same here as on a request row — and
+    /// merge on their own host. (See TAGS-FILTER.)
+    private func rowIdentity(forURLString urlString: String,
+                             fallback: String) -> (display: String, mergeKey: String) {
+        guard let tag = TagResolver.tag(forURLString: urlString),
+              tag.origin != .derivedHost else {
+            return (fallback, fallback.lowercased())
+        }
+        return (tag.label,
+                tag.origin == .userTag ? "tag:" + tag.label.lowercased() : fallback.lowercased())
     }
 
     // MARK: - UI Setup

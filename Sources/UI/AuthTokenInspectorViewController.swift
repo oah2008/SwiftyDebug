@@ -344,16 +344,24 @@ final class AuthTokenInspectorViewController: UIViewController {
 
     // MARK: Scanning
 
+    /// `.networkRequestCompleted` is posted synchronously from whatever thread
+    /// finished the request, so the coalescing flag has to be read and written on
+    /// main only — otherwise two URL loading threads both see `false`, both
+    /// schedule, and the 1-second window promises a single scan while running
+    /// several full passes over the capture list back to back.
     @objc private func capturedRequestsChanged() {
         guard SwiftyDebugRuntime.isActive else { return }
-        guard !rescanScheduled else { return }
-        rescanScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self else { return }
-            self.rescanScheduled = false
-            guard self.view.window != nil else { return }
-            self.rescan()
+        let work = { [weak self] in
+            guard let self, !self.rescanScheduled else { return }
+            self.rescanScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self else { return }
+                self.rescanScheduled = false
+                guard self.view.window != nil else { return }
+                self.rescan()
+            }
         }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
 
     @objc private func logsCleared() {
@@ -1034,7 +1042,7 @@ private final class AuthTokenDetailViewController: UITableViewController {
                 tableView?.reloadRows(at: [indexPath], with: .fade)
             }
             cell.onCopy = { [weak self] in
-                ClipboardFormatter.copyVerbatim(copy)
+                ClipboardFormatter.copyExactly(copy)
                 self?.presentAuthToast("Copied")
             }
             return cell
@@ -1075,6 +1083,8 @@ private final class AuthTokenCompareViewController: UITableViewController {
     private var rows: [AuthTokenScanner.ClaimDiff] = []
     private var differencesOnly = true
     private let segment = UISegmentedControl(items: ["Differences", "All claims"])
+    private let headerContainer = UIView()
+    private var lastHeaderWidth: CGFloat = 0
 
     init(left: AuthCredential, right: AuthCredential) {
         self.left = left
@@ -1109,7 +1119,7 @@ private final class AuthTokenCompareViewController: UITableViewController {
     }
 
     private func buildHeader() {
-        let container = UIView()
+        let container = headerContainer
 
         let card = UIView()
         card.backgroundColor = AuthPalette.cardBG
@@ -1154,17 +1164,37 @@ private final class AuthTokenCompareViewController: UITableViewController {
             segment.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10),
         ])
 
-        let width = view.bounds.width > 0 ? view.bounds.width : UIScreen.main.bounds.width
-        container.frame = CGRect(x: 0, y: 0, width: width, height: 1)
-        container.setNeedsLayout()
-        container.layoutIfNeeded()
-        let height = container.systemLayoutSizeFitting(
+        container.forceLTR()
+        sizeHeader()
+    }
+
+    /// A tableHeaderView keeps the height it was given while the table forces its
+    /// width, so a rotation leaves the A/B labels re-wrapped inside a frame sized
+    /// for the old width: the closed constraint chain down to the segmented
+    /// control becomes unsatisfiable and UIKit breaks one, displacing the only
+    /// control that switches between Differences and All claims.
+    private func sizeHeader() {
+        let width = tableView.bounds.width > 0 ? tableView.bounds.width : UIScreen.main.bounds.width
+        guard width > 0 else { return }
+        headerContainer.frame = CGRect(x: 0, y: 0, width: width, height: 1)
+        headerContainer.setNeedsLayout()
+        headerContainer.layoutIfNeeded()
+        let height = headerContainer.systemLayoutSizeFitting(
             CGSize(width: width, height: 0),
             withHorizontalFittingPriority: .required,
             verticalFittingPriority: .fittingSizeLevel).height
-        container.frame.size.height = height
-        container.forceLTR()
-        tableView.tableHeaderView = container
+        headerContainer.frame.size.height = height
+        tableView.tableHeaderView = headerContainer
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        // Re-measure on a width change only; re-assigning the header view every
+        // pass would loop the layout.
+        if tableView.bounds.width != lastHeaderWidth {
+            lastHeaderWidth = tableView.bounds.width
+            sizeHeader()
+        }
     }
 
     private func sideRow(tag: String, credential: AuthCredential) -> UIView {

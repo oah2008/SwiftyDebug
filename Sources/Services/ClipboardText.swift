@@ -67,12 +67,21 @@ enum ClipboardText {
     /// removes a *leading* or *trailing* scalar that is itself invisible.
     static func normalized(_ text: String) -> String {
         var scalars = Substring(text).unicodeScalars
+        var trimmed = false
         while let first = scalars.first, strippableAffixes.contains(first) {
             scalars = scalars.dropFirst()
+            trimmed = true
         }
         while let last = scalars.last, strippableAffixes.contains(last) {
             scalars = scalars.dropLast()
+            trimmed = true
         }
+        // Having nothing to strip is the normal case, and rebuilding the string
+        // from its scalar view copies every byte of it. Hand the original back
+        // instead, so a clean multi-megabyte body costs two scalar comparisons
+        // rather than a full copy. The returned value is identical either way,
+        // which is what `hasStrippableAffix` below compares against.
+        guard trimmed else { return text }
         return String(String.UnicodeScalarView(scalars))
     }
 

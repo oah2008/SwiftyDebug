@@ -309,14 +309,25 @@ final class RequestDiffTests: XCTestCase {
 
     // MARK: - Value shortening
 
+    /// Shortening happens at RENDER time, not when the row is built.
+    ///
+    /// The row is also what a tap copies to the clipboard, so a row carrying the
+    /// shortened string put "…(1250 chars)" on the clipboard instead of the
+    /// value — a half-copied token that looks whole. The row keeps the full
+    /// value; `display(_:)` is what shortens.
     func testOversizedValuesAreShortenedForDisplayButStillCompared() {
         let long = String(repeating: "x", count: RequestDiff.maxDisplayLength + 50)
         let other = String(repeating: "x", count: RequestDiff.maxDisplayLength + 49) + "y"
 
         let rows = RequestDiff.diffPairs(old: [("blob", long)], new: [("blob", other)])
-        XCTAssertEqual(rows.first?.change, .changed)
-        XCTAssertTrue(rows.first!.oldValue!.count < long.count)
-        XCTAssertTrue(rows.first!.oldValue!.hasSuffix("chars)"))
+        XCTAssertEqual(rows.first?.change, .changed, "comparison still runs on the full value")
+
+        XCTAssertEqual(rows.first?.oldValue, long,
+                       "the row carries the full value — it is what a tap copies")
+
+        let shown = RequestDiff.display(rows.first!.oldValue!)
+        XCTAssertTrue(shown.count < long.count)
+        XCTAssertTrue(shown.hasSuffix("chars)"))
     }
 
     // MARK: - Export

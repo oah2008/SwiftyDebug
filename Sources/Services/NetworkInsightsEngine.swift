@@ -75,22 +75,36 @@ enum InsightsStatusBucket: Int, CaseIterable {
         }
     }
 
+    /// The status code decides the bucket whenever there is one, and the `error*`
+    /// fields only get a say when it cannot.
+    ///
+    /// They are not transport errors: `CustomHTTPProtocol.handleError` runs when
+    /// the transport *succeeded* and fills both with human-readable prose for
+    /// every 1xx/3xx/4xx/5xx response ("Not Found", "Moved Permanently"). Reading
+    /// them first bucketed every captured non-2xx as `.failed`, so the 3xx/4xx/5xx
+    /// rows never rendered and a cached 304 was counted into the error rate.
+    /// A 2xx still consults them, because `handleError` writes nothing for 2xx —
+    /// so a 2xx carrying an error description really did fail mid-body.
     static func classify(_ model: NetworkTransaction) -> InsightsStatusBucket {
+        let raw = (model.statusCode ?? "").trimmingCharacters(in: .whitespaces)
+        if let code = Int(raw), code >= 200 {
+            switch code {
+            case 200..<300: break
+            case 300..<400: return .redirect
+            case 400..<500: return .clientError
+            default:        return .serverError
+            }
+        }
         if let err = model.errorDescription, !err.trimmingCharacters(in: .whitespaces).isEmpty {
             return .failed
         }
         if let err = model.errorLocalizedDescription, !err.trimmingCharacters(in: .whitespaces).isEmpty {
             return .failed
         }
-        let raw = (model.statusCode ?? "").trimmingCharacters(in: .whitespaces)
-        guard let code = Int(raw), code > 0 else { return .failed }
-        switch code {
-        case 200..<300: return .success
-        case 300..<400: return .redirect
-        case 400..<500: return .clientError
-        case 500..<600: return .serverError
-        default:        return code < 200 ? .failed : .serverError
-        }
+        // A missing, "0" or sub-200 status is a transport failure or a redirect
+        // that never produced a response of its own.
+        guard let code = Int(raw), code >= 200 else { return .failed }
+        return .success
     }
 }
 

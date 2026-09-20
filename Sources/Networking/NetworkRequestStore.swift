@@ -192,7 +192,14 @@ class NetworkRequestStore: NSObject {
 
         dropped.removeAll()
 
-        NotificationCenter.default.post(name: .allLogsCleared, object: nil)
+        // Carry the surviving count, like every other poster of this
+        // notification. The bubble reads it as `userInfo["pinnedCount"] ?? 0`,
+        // so a bare post told it "there are none" and the badge dropped to 0
+        // after clearing three pinned rows out of two hundred. `transactionCount`
+        // takes the store's own lock rather than reading `storage` off-lock.
+        NotificationCenter.default.post(name: .allLogsCleared,
+                                        object: nil,
+                                        userInfo: ["pinnedCount": transactionCount])
     }
 
     func remove(_ model: NetworkTransaction) {

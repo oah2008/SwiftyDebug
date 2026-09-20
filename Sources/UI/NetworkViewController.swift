@@ -50,6 +50,13 @@ private final class TabFilterState {
     /// side -> hit count. nil (absent) means "never scanned for this query",
     /// which is what makes a side count as stale and worth (re)scanning.
     var countsBySide: [BodySearchSide: Int] = [:]
+    /// side -> the transaction ids the last completed scan of that side covered.
+    ///
+    /// A scan is a snapshot of the tab taken when it started, so a request
+    /// captured afterwards has no entry in `matchesBySide` and its body hit can
+    /// never be merged into the list. This is what lets `scheduleAutoScan` see
+    /// that the tab now holds transactions the side has no verdict for.
+    var scannedIdsBySide: [BodySearchSide: Set<String>] = [:]
     /// One-line summary of the last scan, reported by the progress banner when
     /// the scan lands.
     var bodySearchSummary: String = ""
@@ -74,6 +81,7 @@ private final class TabFilterState {
         scannedQuery = ""
         matchesBySide.removeAll()
         countsBySide.removeAll()
+        scannedIdsBySide.removeAll()
         bodySearchSummary = ""
     }
 
@@ -147,6 +155,14 @@ class NetworkViewController: UIViewController {
     private var scanTotal = 0
     /// Typing never scans. This fires once the user pauses.
     private var scanDebounceTimer: Timer?
+
+    /// The query the pending debounce timer was armed for.
+    ///
+    /// `scheduleAutoScan()` is called from capture as well as from typing, and
+    /// re-arming on every captured request pushed the deadline out forever on a
+    /// host app with steady background traffic — the scan simply never ran, with
+    /// no banner and no explanation.
+    private var pendingScanQuery: String?
     private static let scanDebounceInterval: TimeInterval = 0.45
     /// Bumped every time the banner is shown, re-shown or hidden, so a pending
     /// auto-dismiss can tell whether it still owns what is on screen.
@@ -245,6 +261,11 @@ class NetworkViewController: UIViewController {
     /// The App/Web tabs show non-media traffic only; Pinned shows everything the
     /// user pinned. Shared by the list, the filter sheet and the endpoint sheet
     /// so a media host can never leak into one of them.
+    ///
+    /// The two settings flags read here are the DISPLAY half of those switches.
+    /// Capture itself is gated at the source — `CustomHTTPProtocol.canInit` for
+    /// native traffic, the injected JS for web views — so switching one off now
+    /// genuinely stops the SDK touching that traffic rather than just hiding it.
     private func tabModels(from cache: [NetworkTransaction]) -> [NetworkTransaction] {
         switch currentTab {
         case .app:
@@ -254,6 +275,35 @@ class NetworkViewController: UIViewController {
         case .web:
             return Settings.shared.webNetworkRequestsEnabled
                 ? cache.filter { $0.isWebViewRequest && !Self.isMediaTransaction($0) }
+                : []
+        case .pinned:
+            return cache.filter { $0.isPinned }
+        }
+    }
+
+    /// The rows a body scan may read, and the rows its hits may be rendered on.
+    ///
+    /// Same tab ownership as `tabModels(from:)` but without the media filter,
+    /// for the one case the Advanced sheet promises: "Include media" on, with a
+    /// query being matched. Both the scan's candidate list and `applyFilter`'s
+    /// row set have to widen together — a media body that is scanned but whose
+    /// row is filtered out produces a hit nothing can show.
+    ///
+    /// Gated on `isSearching` so the toggle widens what the SEARCH reaches and
+    /// not what the idle list shows, and `tabModels` itself is untouched: it is
+    /// the display filter for the list, the filter sheet and the endpoint sheet.
+    private func searchCandidates(from cache: [NetworkTransaction]) -> [NetworkTransaction] {
+        guard currentTabState.advanced.includeMedia, isSearching else {
+            return tabModels(from: cache)
+        }
+        switch currentTab {
+        case .app:
+            return Settings.shared.networkRequestsEnabled
+                ? cache.filter { !$0.isWebViewRequest }
+                : []
+        case .web:
+            return Settings.shared.webNetworkRequestsEnabled
+                ? cache.filter { $0.isWebViewRequest }
                 : []
         case .pinned:
             return cache.filter { $0.isPinned }
@@ -382,8 +432,10 @@ class NetworkViewController: UIViewController {
 
         // 1. Tab segment filter (respecting settings toggles). Media requests are
         //    routed to the Media tab and hidden here — except on Pinned, where a
-        //    pinned item is always shown.
-        var filtered = tabModels(from: cacheModels)
+        //    pinned item is always shown, and except while "Include media" is
+        //    scanning them, which is the only way a media body's hit can reach a
+        //    row (see `searchCandidates`).
+        var filtered = searchCandidates(from: cacheModels)
 
         // 2. Tag filter.
         //
@@ -594,7 +646,7 @@ class NetworkViewController: UIViewController {
         let state = currentTabState
         state.isBodySearchEnabled = false
         cancelActiveScan()
-        scanDebounceTimer?.invalidate()
+        cancelPendingAutoScan()
         state.resetBodySearch()
         updateAdvancedSearchButton()
         applyFilter()
@@ -605,7 +657,7 @@ class NetworkViewController: UIViewController {
     /// gone, so all tabs are reset.
     private func discardAllBodyResults() {
         cancelActiveScan()
-        scanDebounceTimer?.invalidate()
+        cancelPendingAutoScan()
         for (_, state) in Self.tabStates { state.resetBodySearch() }
         applyFilter()
         tableView.reloadData()
@@ -622,37 +674,83 @@ class NetworkViewController: UIViewController {
 
     /// Debounced auto-scan. Only ever scheduled while the tab is armed, and only
     /// for sides that have no fresh count — a repeat query costs nothing.
-    private func scheduleAutoScan() {
+    /// Cancels any pending debounced scan.
+    private func cancelPendingAutoScan() {
         scanDebounceTimer?.invalidate()
+        scanDebounceTimer = nil
+        pendingScanQuery = nil
+    }
+
+    private func scheduleAutoScan() {
         let state = currentTabState
-        guard state.isBodySearchEnabled else { return }
+        guard state.isBodySearchEnabled else { cancelPendingAutoScan(); return }
         let query = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard query.count >= 2 else { return }
+        guard query.count >= 2 else { cancelPendingAutoScan(); return }
+
+        // A timer already pending for THIS query keeps its deadline. Typing
+        // changes the query on every keystroke, so the typing debounce is
+        // unaffected; a capture arriving with the query unchanged no longer
+        // resets the clock.
+        if scanDebounceTimer?.isValid == true, pendingScanQuery == query { return }
+
+        cancelPendingAutoScan()
+        pendingScanQuery = query
 
         scanDebounceTimer = Timer.scheduledTimer(
             withTimeInterval: Self.scanDebounceInterval, repeats: false
         ) { [weak self] _ in
             guard let self = self else { return }
+            self.scanDebounceTimer = nil
+            self.pendingScanQuery = nil
             let state = self.currentTabState
             let query = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard state.isBodySearchEnabled, query.count >= 2 else { return }
 
-            let sides: [BodySearchSide] = [.response, .request].filter {
-                state.scannedQuery != query || state.countsBySide[$0] == nil
+            let currentIds = Set(
+                self.searchCandidates(from: self.cacheModels ?? []).map(ResponseBodySearch.identifier(for:))
+            )
+            let sides: [BodySearchSide] = BodySearchSide.allCases.filter { side in
+                // Armed scopes only. This is reached from a tab switch and from
+                // capture as well as from typing, and scanning a side the user
+                // never turned on reads that side's bodies off disk and pops the
+                // progress banner for a scope the list ignores.
+                guard state.isScopeOn(side) else { return false }
+                if state.scannedQuery != query || state.countsBySide[side] == nil { return true }
+                // The scan only ever saw the tab as it was when it started, so a
+                // transaction captured since has no verdict and its hit could
+                // never be merged. Anything it did not cover makes the side
+                // stale again; the (query, transaction) cache makes the rescan
+                // cost only the genuinely new bodies.
+                return !(state.scannedIdsBySide[side] ?? []).isSuperset(of: currentIds)
             }
             guard !sides.isEmpty else { return }
-            self.startBodySearch(query: query, sides: sides)
+            // A rescan the USER did not ask for — the query is unchanged and the
+            // side already has counts, so it is stale only because a new request
+            // arrived — runs silently. Under steady traffic this fires once a
+            // second, and tearing down and re-showing the banner over the list
+            // (plus a full reload) every time made the results unreadable.
+            let silent = sides.allSatisfy { side in
+                state.scannedQuery == query && state.countsBySide[side] != nil
+            }
+            self.startBodySearch(query: query, sides: sides, silent: silent)
         }
     }
 
     /// One `ResponseBodySearch.scan` per side, each with only that side's flag
     /// set, so the two counts are genuinely independent.
-    private func startBodySearch(query rawQuery: String, sides: [BodySearchSide]) {
+    private func startBodySearch(query rawQuery: String,
+                                 sides rawSides: [BodySearchSide],
+                                 silent: Bool = false) {
+        let state = currentTabState
+        // The scope filter belongs here, not at the callers: Return and the
+        // debounced auto-scan both ask for both sides unconditionally, and a
+        // scan of a side the user never armed reads every body of that side off
+        // disk and then overwrites the banner's summary with its own numbers.
+        let sides = rawSides.filter { state.isScopeOn($0) }
         guard SwiftyDebugRuntime.isActive, !sides.isEmpty else { return }
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return }
 
-        let state = currentTabState
         // A different query invalidates every count and hit we hold.
         if state.scannedQuery != query { state.resetScanResults() }
 
@@ -660,10 +758,14 @@ class NetworkViewController: UIViewController {
 
         // Snapshot of the current tab's transactions — the scan never touches the
         // live store, so new captures can keep arriving while it runs.
-        let candidates = tabModels(from: cacheModels ?? [])
+        let candidates = searchCandidates(from: cacheModels ?? [])
+        let candidateIds = Set(candidates.map(ResponseBodySearch.identifier(for:)))
         guard !candidates.isEmpty else {
             state.scannedQuery = query
-            for side in sides { state.countsBySide[side] = 0 }
+            for side in sides {
+                state.countsBySide[side] = 0
+                state.scannedIdsBySide[side] = []
+            }
             state.bodySearchSummary = "Nothing to scan on this tab."
             return
         }
@@ -675,7 +777,7 @@ class NetworkViewController: UIViewController {
         scanProgress = [:]
         scanTotal = candidates.count * sides.count
         state.scanningSides = Set(sides)
-        showScanBanner(total: scanTotal)
+        if !silent { showScanBanner(total: scanTotal) }
 
         for side in sides {
             ResponseBodySearch.scan(
@@ -692,7 +794,8 @@ class NetworkViewController: UIViewController {
                 },
                 completion: { [weak self] outcome in
                     guard let self = self, self.activeScanToken === token else { return }
-                    self.finishScan(outcome, side: side, query: query, state: state)
+                    self.finishScan(outcome, side: side, query: query, state: state,
+                                    scannedIds: candidateIds, silent: silent)
                 }
             )
         }
@@ -713,7 +816,9 @@ class NetworkViewController: UIViewController {
     private func finishScan(_ outcome: ResponseBodySearch.Outcome,
                             side: BodySearchSide,
                             query: String,
-                            state: TabFilterState) {
+                            state: TabFilterState,
+                            scannedIds: Set<String>,
+                            silent: Bool = false) {
         state.scanningSides.remove(side)
         pendingScanSides -= 1
         let isLastSide = pendingScanSides <= 0
@@ -733,15 +838,34 @@ class NetworkViewController: UIViewController {
             uniquingKeysWith: { first, _ in first }
         )
         state.countsBySide[side] = outcome.matches.count
-        state.bodySearchSummary = Self.summaryText(for: outcome)
+        // What this snapshot covered, so a later capture can be recognised as
+        // unscanned instead of silently missing from the merged list.
+        state.scannedIdsBySide[side] = scannedIds
+        // The cap actually used, not the default: "Scan whole bodies" lifts it,
+        // and a summary that still announced "first 2 MB each" read as the
+        // toggle having been ignored.
+        state.bodySearchSummary = Self.summaryText(
+            for: outcome,
+            byteCap: state.advanced.engineOptions(for: side).byteCap
+        )
 
         // With every side done, the banner stops reporting progress and reports
         // the result instead — the per-side hit counts used to live on the
         // inline scope card, and this is now the only place they surface.
-        if isLastSide { showScanResultInBanner(for: state) }
+        if isLastSide, !silent { showScanResultInBanner(for: state) }
+        if isLastSide, silent { hideScanBanner() }
 
+        // Keep the user's place. A rescan that lands while they are reading
+        // results must not scroll the list out from under them.
+        let offset = tableView.contentOffset
         applyFilter()
-        tableView.reloadData()
+        UIView.performWithoutAnimation {
+            tableView.reloadData()
+            tableView.layoutIfNeeded()
+        }
+        let maxY = max(0, tableView.contentSize.height - tableView.bounds.height
+                          + tableView.adjustedContentInset.bottom)
+        tableView.contentOffset = CGPoint(x: offset.x, y: min(offset.y, maxY))
     }
 
     /// Per-side hit counts for the query the scan just finished, e.g.
@@ -755,12 +879,15 @@ class NetworkViewController: UIViewController {
         return parts.isEmpty ? "Scan finished" : parts.joined(separator: " \u{00B7} ")
     }
 
-    private static func summaryText(for outcome: ResponseBodySearch.Outcome) -> String {
+    private static func summaryText(for outcome: ResponseBodySearch.Outcome,
+                                    byteCap: Int) -> String {
         var parts: [String] = ["\(outcome.scannedCount) bodies read"]
         if outcome.cacheHitCount > 0 { parts.append("\(outcome.cacheHitCount) cached") }
         if outcome.skippedCount > 0 { parts.append("\(outcome.skippedCount) skipped") }
         if outcome.truncatedCount > 0 { parts.append("\(outcome.truncatedCount) capped") }
-        parts.append("first \(ResponseBodySearch.byteCapDescription) each")
+        parts.append(byteCap == .max
+                     ? "whole bodies"
+                     : "first \(ResponseBodySearch.byteCapDescription) each")
         return parts.joined(separator: " · ")
     }
 
@@ -833,9 +960,28 @@ class NetworkViewController: UIViewController {
 
         return order.compactMap { key in
             guard let entry = byKey[key] else { return nil }
+            // The subtitle describes the GROUP, not the first row in it.
+            //
+            // `matchedKeyword` is what the tag matched, and for a catalog or
+            // user tag that is one member's own host — so a group spanning
+            // several hosts was labelled with whichever of them happened to be
+            // captured first, and the header changed between launches. An
+            // allow-list or host-derived tag IS the group's identity, so those
+            // keep it.
+            let subtitle: String
+            switch entry.tag.origin {
+            case .allowListURL, .derivedHost:
+                subtitle = entry.tag.matchedKeyword
+            case .knownAPI, .userTag:
+                let hosts = Set(entry.models.compactMap {
+                    $0.url?.host.map(TagResolver.normalizeHost)
+                })
+                subtitle = hosts.count == 1 ? (hosts.first ?? entry.tag.matchedKeyword)
+                                            : "\(hosts.count) hosts"
+            }
             return NetworkGroup(key: key,
                                 displayName: entry.tag.label,
-                                fullURL: entry.tag.matchedKeyword,
+                                fullURL: subtitle,
                                 tag: entry.tag.label,
                                 isPathFilter: entry.tag.origin == .userTag,
                                 count: entry.models.count,
@@ -893,6 +1039,14 @@ class NetworkViewController: UIViewController {
         self.cacheModels = self.models
 
         applyFilter()
+
+        // The finished scan only knows the transactions it was handed, so a
+        // request captured after it landed can never contribute a body hit —
+        // its row silently loses its snippet, and drops out of the list
+        // entirely when its URL alone does not match. The debounce coalesces
+        // bursts and the (query, transaction) cache means the rescan reads only
+        // the genuinely new bodies; on an unarmed tab this is a no-op.
+        scheduleAutoScan()
 
         if isAutoFollowing && !isShowingDetail {
             self.tableView.reloadData()
@@ -1057,6 +1211,35 @@ class NetworkViewController: UIViewController {
 
         reloadHttp()
         view.forceLTR()
+    }
+
+    /// Re-applies the filter whenever this tab is shown again.
+    ///
+    /// The settings that gate this list live on a SIBLING tab, and the tab bar
+    /// keeps one long-lived `NetworkViewController`. Nothing re-ran `applyFilter`
+    /// on return, so flipping "Network Requests" and walking back left the list
+    /// showing whatever it had — and once an unrelated request emptied it, an
+    /// idle app left it blank indefinitely with the switch reading ON.
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        // Returning from a pushed detail screen must not move the list. This runs
+        // on every appearance, including that one, and an unconditional reload
+        // threw away the scroll position the user came back to.
+        let offset = tableView.contentOffset
+        applyFilter()
+        UIView.performWithoutAnimation {
+            tableView.reloadData()
+            tableView.layoutIfNeeded()
+        }
+        let maxY = max(0, tableView.contentSize.height - tableView.bounds.height
+                          + tableView.adjustedContentInset.bottom)
+        // Clamp the LOW end to the top content inset, not to 0: a list sitting
+        // at the top has a negative offset.y equal to that inset, and clamping
+        // it to 0 pulled the list up under the search bar on every return from a
+        // detail screen.
+        tableView.contentOffset = CGPoint(
+            x: offset.x,
+            y: min(max(-tableView.adjustedContentInset.top, offset.y), maxY))
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -1318,7 +1501,7 @@ class NetworkViewController: UIViewController {
 
     deinit {
         activeScanToken?.cancel()
-        scanDebounceTimer?.invalidate()
+        cancelPendingAutoScan()
         // Selector-based registrations only. The block-based ones are the bag's,
         // and it unregisters them when it deallocates with this controller.
         NotificationCenter.default.removeObserver(self)
@@ -1450,7 +1633,7 @@ class NetworkViewController: UIViewController {
 
         // A scan belongs to the tab it was started on — leaving the tab cancels it.
         cancelActiveScan()
-        scanDebounceTimer?.invalidate()
+        cancelPendingAutoScan()
 
         currentTab = NetworkTab(rawValue: sender.selectedSegmentIndex) ?? .app
         NetworkViewController.savedTab = currentTab
@@ -1469,6 +1652,12 @@ class NetworkViewController: UIViewController {
         applyFilter()
         tableView.reloadData()
         tableView.layoutIfNeeded()
+
+        // Leaving a tab cancelled its scan above, which left `scannedQuery`
+        // empty while the scopes and the Advanced pill still claimed body
+        // search was on. Nothing else re-armed it, so the tab sat with dead
+        // scopes until the query was retyped.
+        scheduleAutoScan()
 
         // Restore new tab's scroll position & follow state
         if newState.isAutoFollowing {
@@ -1555,12 +1744,32 @@ extension NetworkViewController: UISearchBarDelegate {
             state.resetScanResults()
         }
 
+        // Symmetric, because clearing the field with its own clear button or by
+        // backspacing goes through here and nowhere else — these search bars are
+        // built by hand rather than by a `UISearchController`, so there is no
+        // Cancel button and `searchBarCancelButtonClicked` never fires. A
+        // one-sided `if` left auto-follow off and the chevron on screen for a
+        // list that was no longer filtered at all.
         if !searchText.isEmpty {
             isAutoFollowing = false
             setFollowButtonVisible(true, animated: true)
+        } else {
+            isAutoFollowing = true
+            setFollowButtonVisible(false, animated: true)
         }
         applyFilter()
         tableView.reloadData()
+
+        // Following again only means "stick to the bottom from the next request
+        // on", so without this the restored list stays parked wherever the
+        // filtered one left it until new traffic happens to arrive.
+        if searchText.isEmpty {
+            let count = tableView.numberOfRows(inSection: 0)
+            if count > 0 {
+                tableView.scrollToRow(at: IndexPath(row: count - 1, section: 0),
+                                      at: .bottom, animated: false)
+            }
+        }
 
         // The scan itself is debounced, and only when the tab is armed.
         scheduleAutoScan()
@@ -1573,7 +1782,7 @@ extension NetworkViewController: UISearchBarDelegate {
         guard currentTabState.isBodySearchEnabled else { return }
         let query = (searchBar.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return }
-        scanDebounceTimer?.invalidate()
+        cancelPendingAutoScan()
         startBodySearch(query: query, sides: [.response, .request])
     }
 
@@ -1582,7 +1791,7 @@ extension NetworkViewController: UISearchBarDelegate {
         currentTabState.searchText = ""
         searchBar.resignFirstResponder()
         cancelActiveScan()
-        scanDebounceTimer?.invalidate()
+        cancelPendingAutoScan()
         currentTabState.resetScanResults()
         isAutoFollowing = true
         setFollowButtonVisible(false, animated: true)
@@ -1658,6 +1867,25 @@ extension NetworkViewController: UITableViewDelegate {
             vc.models = group.models
             vc.groupKey = group.key
             vc.isPathFilter = group.isPathFilter
+            // The drill-down re-reads the store for live traffic, and the tag
+            // key alone does not carry the App/Web split this tab applied.
+            vc.isWebViewGroup = currentTab == .web
+            // Carry the list's applied filters in, by VALUE — capturing `self`
+            // here would keep this controller alive behind the pushed screen.
+            let endpoints = currentTabState.selectedEndpoints
+            let query = currentTabState.searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            vc.parentPredicate = { model in
+                if !endpoints.isEmpty {
+                    guard let key = Self.endpointKey(for: model.url as URL?),
+                          endpoints.contains(key) else { return false }
+                }
+                guard !query.isEmpty else { return true }
+                // Metadata/URL match only. A row that matched solely inside a
+                // body cannot be reproduced without the scan results, and this
+                // is the same fallback `applyFilter` uses when no scan is fresh.
+                if let index = model.searchIndex { return index.matches(query) }
+                return (model.url?.absoluteString ?? "").lowercased().contains(query)
+            }
             isShowingDetail = true
             navigationController?.pushViewController(vc, animated: true)
         } else {

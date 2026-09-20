@@ -187,6 +187,28 @@ class NSLogHook: NSObject {
         }
     }
 
+    /// Writes a line straight to the host's real stdout, bypassing the capture
+    /// pipe. Returns false when capture is not installed, in which case the
+    /// caller must fall back to `Swift.print`.
+    ///
+    /// The SDK's `print` overload writes the line to stdout *and* hands it to
+    /// `PrintInterceptor`. While the pipe is installed, stdout is `dup2`'d into
+    /// it, so the same statement landed in the Console tab twice: once raw from
+    /// the pipe reader, a flush interval later, and once timestamped from the
+    /// interceptor. Sending the Xcode copy to the saved descriptor instead
+    /// leaves `PrintInterceptor` as the single Console-tab writer for `print`,
+    /// while every other stdout writer still flows through the pipe.
+    ///
+    /// Takes `stdoutFDLock` for the same reason the readability handler does:
+    /// `disable()` can be closing that descriptor on another thread.
+    static func writeBypassingPipe(_ line: String) -> Bool {
+        stdoutFDLock.lock()
+        defer { stdoutFDLock.unlock() }
+        guard hooked, savedStdoutFD >= 0, let data = line.data(using: .utf8) else { return false }
+        writeAll(fd: savedStdoutFD, data: data)
+        return true
+    }
+
     private static func redirectStdout() {
         let pipe = Pipe()
         stdoutPipe = pipe
@@ -447,10 +469,16 @@ class NSLogHook: NSObject {
         ) { _ in
             guard isPaused, hooked, SwiftyDebugRuntime.isActive else { return }
             isPaused = false
-            // Reset to appropriate polling — catch entries from background period
+            // Reset to appropriate polling. The watermark is deliberately left
+            // alone: the next poll resumes from the last entry actually
+            // ingested, which is what genuinely catches up the background
+            // period. Rewinding it by two seconds re-admitted entries captured
+            // just before backgrounding — nothing de-duplicates, so a quick
+            // app-switch printed the last second of output twice — while an
+            // absence of more than two seconds jumped the watermark forward past
+            // everything logged while away.
             currentInterval = effectiveMinInterval
             consecutiveEmptyPolls = 0
-            lastPollDate = Date().addingTimeInterval(-2)
             scheduleNextPoll()
         }
 

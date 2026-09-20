@@ -151,7 +151,17 @@ final class NetworkSearchResultCell: UITableViewCell {
         hostTagLabel.layer.cornerRadius = 4
         hostTagLabel.clipsToBounds = true
         hostTagLabel.setContentHuggingPriority(.required, for: .horizontal)
-        hostTagLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        // Below the rest of the row, so the pill is the one thing Auto Layout
+        // compresses instead of breaking a constraint.
+        //
+        // The pill text used to be capped at 12 characters; it now carries the
+        // resolved tag label verbatim, which for a catalog entry runs to 25
+        // ("Firebase App Distribution") plus the " · web" suffix every webview
+        // request adds. At `.required` the row simply could not fit on a narrow
+        // device and something had to give, unpredictably. Truncating the pill
+        // is the one outcome that is always readable.
+        hostTagLabel.setContentCompressionResistancePriority(.defaultLow + 1, for: .horizontal)
+        hostTagLabel.lineBreakMode = .byTruncatingTail
 
         let topSpacer = UIView()
         topSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)

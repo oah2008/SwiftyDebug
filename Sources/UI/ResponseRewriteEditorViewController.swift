@@ -13,9 +13,9 @@ import UIKit
 ///
 /// The screen is built so that a path never has to be typed:
 ///
-/// * opened from a value in a real response ("Rewrite this always…"), the path,
-///   the action and its target arrive already filled in — changing
-///   `google.com` to `salla.com` and tapping Save is the whole interaction;
+/// * opened with a seeded path (from a rule's rewrites list against a captured
+///   body), the path, the action and its target arrive already filled in —
+///   changing `google.com` to `salla.com` and tapping Save is the whole interaction;
 /// * WHICH VALUES offers plain-language scopes from `JSONPathPattern.scopeOptions`
 ///   with a **live match count against this very body** ("Every \"url\" anywhere
 ///   (14 values)") — a bare pattern string is never shown on its own;
@@ -101,9 +101,23 @@ final class ResponseRewriteEditorViewController: UITableViewController {
         return try? JSONSerialization.jsonObject(with: body, options: [.fragmentsAllowed])
     }()
 
-    private var scopeChoices: [(label: String, pattern: String, count: Int?)] = []
+    private var scopeChoices: [(label: String, pattern: String, count: Int?, isPartialCount: Bool)] = []
     private var preview = PreviewState()
     private var sections: [SectionModel] = []
+    /// The pending debounced preview, cancelled by the next keystroke and by
+    /// leaving the screen.
+    private var previewWork: DispatchWorkItem?
+
+    /// The picked value was too big to seed — the VALUE row says so instead of
+    /// appearing mysteriously empty.
+    private var seededValueWasTooLarge = false
+
+    /// A debounced preview was cancelled by leaving the screen, so what is on
+    /// screen no longer reflects the current input.
+    private var previewIsStale = false
+
+    /// How long typing has to pause before the preview is recomputed.
+    private static let previewDebounce: TimeInterval = 0.2
 
     // MARK: - Init
 
@@ -205,6 +219,29 @@ final class ResponseRewriteEditorViewController: UITableViewController {
         didAutoFocus = true
         focusPrimaryField()
     }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // Nothing left on screen to preview, and a pending walk of a megabyte
+        // body is work the pop should not still be paying for.
+        //
+        // Remember that it WAS cancelled: nothing else recomputes the preview, so
+        // leaving and coming back inside the debounce window (push the value
+        // picker, then Back) otherwise left PREVIEW describing the text as it was
+        // before the last keystroke.
+        previewIsStale = previewWork != nil
+        previewWork?.cancel()
+        previewWork = nil
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        guard previewIsStale else { return }
+        previewIsStale = false
+        reloadPreviewSection()
+    }
+
+    deinit { previewWork?.cancel() }
 
     /// The single field a seeded rewrite still needs filled in, if there is one.
     private func focusPrimaryField() {
@@ -314,7 +351,48 @@ final class ResponseRewriteEditorViewController: UITableViewController {
             seededCurrentHost = Self.host(of: text)
         } else {
             actionKind = .setValue
-            fixedValue = ResponseRewriteEngine.displayText(for: value, limit: 400)
+            // Bounded. `seedText` returns the WHOLE value, which is what makes a
+            // seeded rewrite write back exactly what was picked — but this field
+            // is a single-line `UITextField`, and `viewDidAppear` focuses it and
+            // calls `selectAll`. Seeding a picked container from a 2 MB body laid
+            // out megabytes of text on the main thread and froze the host app on
+            // one tap. Past the cap the field stays empty and says why.
+            let text = Self.seedText(for: value)
+            if text.utf8.count <= Self.maxSeededValueBytes {
+                fixedValue = text
+                seededValueWasTooLarge = false
+            } else {
+                fixedValue = ""
+                seededValueWasTooLarge = true
+            }
+        }
+    }
+
+    /// The largest value that is seeded into the single-line VALUE field.
+    ///
+    /// Comfortably past any realistic hand-edited value, and far below the point
+    /// where laying the string out costs a frame.
+    static let maxSeededValueBytes = 8 * 1024
+
+    /// The picked value as text the engine can write back unchanged.
+    ///
+    /// `ResponseRewriteEngine.displayText` is a *display* helper: it flattens
+    /// newlines to spaces and appends "…" past its limit. Seeding the VALUE
+    /// field from it armed a rewrite that wrote that truncated, newline-stripped
+    /// text — ellipsis and all — into every matching response, and a container
+    /// clipped that way stops being the valid JSON the engine requires.
+    static func seedText(for value: Any) -> String {
+        switch JSONValueKind.of(value) {
+        case .null:
+            return "null"
+        case .object, .array:
+            guard JSONSerialization.isValidJSONObject(value),
+                  let data = try? JSONSerialization.data(withJSONObject: value,
+                                                         options: [.withoutEscapingSlashes, .fragmentsAllowed]),
+                  let text = String(data: data, encoding: .utf8) else { return "" }
+            return text
+        default:
+            return JSONInlineValueCoder.text(for: value)
         }
     }
 
@@ -341,24 +419,29 @@ final class ResponseRewriteEditorViewController: UITableViewController {
     private func rebuildScopeChoices() {
         guard let path = seedPath, !path.isEmpty else { scopeChoices = []; return }
         scopeChoices = JSONPathPattern.scopeOptions(for: path).map { option in
-            (option.label, option.pattern, matchCount(for: option.pattern))
+            let counted = matchCount(for: option.pattern)
+            return (option.label, option.pattern, counted?.count, counted?.wasTruncated ?? false)
         }
     }
 
-    private func matchCount(for text: String) -> Int? {
+    private func matchCount(for text: String) -> (count: Int, wasTruncated: Bool)? {
         guard let root = sampleRoot, let pattern = JSONPathPattern(text) else { return nil }
-        return pattern.matches(in: root).count
+        let matched = pattern.matchesReporting(in: root)
+        return (matched.paths.count, matched.wasTruncated)
     }
 
     /// "Just this one (1 value)" — the count is what makes the choice obvious,
     /// so a scope is never offered as a bare pattern string.
-    private func scopeTitle(_ choice: (label: String, pattern: String, count: Int?)) -> String {
+    private func scopeTitle(_ choice: (label: String, pattern: String, count: Int?, isPartialCount: Bool)) -> String {
         guard let count = choice.count else { return choice.label }
-        return "\(choice.label) (\(countPhrase(count)))"
+        return "\(choice.label) (\(countPhrase(count, isPartial: choice.isPartialCount)))"
     }
 
-    private func countPhrase(_ count: Int) -> String {
-        let capped = count >= JSONPathPattern.maxMatches
+    /// - Parameter isPartial: the walk stopped early. It stops on a node budget
+    ///   as well as on `maxMatches`, and a node-budget stop lands on an ordinary
+    ///   looking number — printed bare it claims the whole body was searched.
+    private func countPhrase(_ count: Int, isPartial: Bool = false) -> String {
+        let capped = isPartial || count >= JSONPathPattern.maxMatches
         let number = capped ? "\(count)+" : "\(count)"
         return count == 1 ? "1 value" : "\(number) values"
     }
@@ -366,7 +449,7 @@ final class ResponseRewriteEditorViewController: UITableViewController {
     // MARK: - Preview
 
     private struct PreviewState {
-        var rows: [(path: String, before: String, after: String)] = []
+        var rows: [(path: String, before: String, after: String, changed: Bool)] = []
         var totalMatches = 0
         var changedCount = 0
         /// The loud line. Always present when something is wrong.
@@ -382,7 +465,7 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
         guard let body = sampleBody, !body.isEmpty else {
             state.note = "No captured response to check this against, so there is nothing to preview. "
-                + "Open a request, tap a value in its response and choose \u{201C}Rewrite this always…\u{201D} to see live matches."
+                + "Capture a request this rule matches, then reopen this editor to see live matches."
             return state
         }
         guard body.count <= ResponseRewriteEngine.maxBodyBytes else {
@@ -409,22 +492,29 @@ final class ResponseRewriteEditorViewController: UITableViewController {
             return state
         }
 
-        let matches = jsonPattern.matches(in: root)
-        state.totalMatches = matches.count
-        guard !matches.isEmpty else {
+        let matched = jsonPattern.matchesReporting(in: root)
+        let phrase = countPhrase(matched.paths.count, isPartial: matched.wasTruncated)
+        state.totalMatches = matched.paths.count
+        guard !matched.paths.isEmpty else {
             state.note = "This matches nothing in this response. " + missReason(for: text)
             state.isProblem = true
             return state
         }
 
-        state.rows = ResponseRewriteEngine.preview(currentRewrite, on: body, limit: Self.previewLimit)
-        state.changedCount = state.rows.filter { $0.before != $0.after }.count
+        // The already-parsed tree, not `body`: this runs on the main thread on
+        // every typing pause and re-parsing the bytes here cost a full JSON
+        // parse each time.
+        state.rows = ResponseRewriteEngine.preview(currentRewrite, root: root,
+                                                   sourceText: sampleBodyText, limit: Self.previewLimit)
+        // The engine's verdict, not `before != after`: the rendered strings are
+        // clipped at 200 characters, so a change past that cap read as no change.
+        state.changedCount = state.rows.filter { $0.changed }.count
 
         if state.changedCount == 0 {
-            state.note = "Matches \(countPhrase(matches.count)), but nothing changes. " + unchangedReason(state.rows)
+            state.note = "Matches \(phrase), but nothing changes. " + unchangedReason(state.rows)
             state.isProblem = true
-        } else if matches.count > state.rows.count {
-            state.note = "Showing the first \(state.rows.count) of \(countPhrase(matches.count))."
+        } else if matched.paths.count > state.rows.count {
+            state.note = "Showing the first \(state.rows.count) of \(phrase)."
         }
         return state
     }
@@ -446,7 +536,7 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
     /// Why matched values stayed the same. The engine already explains the
     /// per-value failures, so the first one it reported wins.
-    private func unchangedReason(_ rows: [(path: String, before: String, after: String)]) -> String {
+    private func unchangedReason(_ rows: [(path: String, before: String, after: String, changed: Bool)]) -> String {
         let marker = "(unchanged — "
         if let row = rows.first(where: { $0.after.hasPrefix(marker) }) {
             let reason = row.after.dropFirst(marker.count).dropLast()
@@ -551,7 +641,21 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
     /// Recomputes the preview without touching any other section, so the field
     /// being typed into keeps the keyboard and the caret.
+    ///
+    /// Coalesced: every field's `onChange` lands here, and one preview walks the
+    /// whole body twice and may spend the entire regex budget — tens of
+    /// milliseconds on a megabyte body, on the main thread, per character, which
+    /// dropped keystrokes. One preview per typing pause costs the same to read
+    /// and nothing to type. It stays on the main thread deliberately: it reads
+    /// `sampleRoot` and every draft field the keyboard is still writing to.
     private func refreshPreview() {
+        previewWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.reloadPreviewSection() }
+        previewWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.previewDebounce, execute: work)
+    }
+
+    private func reloadPreviewSection() {
         let before = sections.map { $0.rows.count }
         let previewIndex = sections.firstIndex { $0.id == .preview }
         rebuildSections()
@@ -673,9 +777,29 @@ final class ResponseRewriteEditorViewController: UITableViewController {
 
         case .valueField:
             let cell = fieldCell(ip)
+            // The footer states the engine's ACTUAL rule: `coerced` keeps the
+            // value's type only while the text fits it, and deliberately writes
+            // text it cannot parse as text rather than as 0 or false. Promising
+            // that a number stays a number hid that flip, and one mistyped
+            // character turning a typed field into a string fails the host app's
+            // decoding of the WHOLE response, not just that field.
+            // A VALUE holding line breaks is seeded in full and WRITTEN in full,
+            // but this is a single-line field: it can only render the value with
+            // its breaks collapsed, and editing it collapses them for real. Say
+            // so, rather than letting a value that looks right go out changed.
+            var valueFooter = "Written with the value's own type when the text fits it. "
+                + "Text that is not a number or a bool is written as text, which changes the field's type."
+            if seededValueWasTooLarge {
+                valueFooter = "The value you picked is too large to edit in this field, so it was not "
+                    + "filled in. Type the replacement value here. " + valueFooter
+            }
+            if fixedValue.contains("\n") {
+                valueFooter += " This value contains line breaks. They are kept as they are unless you edit "
+                    + "this field — a single-line field cannot hold them, so editing replaces them with spaces."
+            }
             cell.configure(caption: "VALUE", text: fixedValue, placeholder: "the value to write",
                            keyboard: .default,
-                           footer: "Written with the type the value already has — text stays text, a number stays a number.")
+                           footer: valueFooter)
             cell.onChange = { [weak self] text in
                 self?.fixedValue = text
                 self?.refreshPreview()
@@ -735,7 +859,7 @@ final class ResponseRewriteEditorViewController: UITableViewController {
                 withIdentifier: RewritePreviewCell.reuseID, for: ip) as! RewritePreviewCell
             guard preview.rows.indices.contains(index) else { return cell }
             let entry = preview.rows[index]
-            cell.configure(path: entry.path, before: entry.before, after: entry.after)
+            cell.configure(path: entry.path, before: entry.before, after: entry.after, changed: entry.changed)
             return cell
 
         case .appliesTo:
@@ -1369,9 +1493,11 @@ private final class RewritePreviewCell: UITableViewCell {
         afterLabel.text = nil
     }
 
-    func configure(path: String, before: String, after: String) {
+    /// - Parameter changed: the engine's verdict on the value. `before` and
+    ///   `after` are clipped to 200 characters, so comparing them here struck
+    ///   nothing through for a change landing past the clip.
+    func configure(path: String, before: String, after: String, changed: Bool) {
         pathLabel.text = path
-        let changed = (before != after)
         if changed {
             beforeLabel.attributedText = NSAttributedString(
                 string: before,

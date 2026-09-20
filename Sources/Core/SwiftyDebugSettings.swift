@@ -38,6 +38,16 @@ class Settings: NSObject {
     var consoleLogsEnabled: Bool = true {
         didSet {
             save(.consoleLogsEnabled, value: consoleLogsEnabled)
+            // `SwiftyDebug.enableConsoleLog` is the host app's opt-out, and it
+            // is ABSOLUTE: an app that keeps tokens or PII in its logs sets it
+            // and must not have that reversed from a debug switch. So this ANDs
+            // with it and never writes to it.
+            //
+            // The "lying switch" that a write-through was trying to cure — a row
+            // drawn ON over a capture the host had turned off — is a rendering
+            // problem, and it is fixed where it belongs: `AppInfoViewController`
+            // draws the row off and DISABLED when the host has opted out, so it
+            // states the truth and cannot be flipped.
             let on = consoleLogsEnabled && SwiftyDebug.enableConsoleLog
             PrintInterceptor.shared.enable = on
             // Start/stop the expensive OSLog poll timer + stdout pipe so turning
@@ -179,7 +189,13 @@ class Settings: NSObject {
     private func updateBubblePresentation() {
         let presenter = DebugWindowPresenter.shared
         let bubble = presenter.vc.bubble
-        let screenWidth = UIScreen.main.bounds.size.width
+        // The SDK WINDOW's width, not the screen's. On iPad Split View / Slide
+        // Over the two differ, and hiding then showing the bubble parked it at a
+        // screen-derived x outside the window, where nothing could tap it.
+        let hostWidth = presenter.window.bounds.width > 0
+            ? presenter.window.bounds.width
+            : UIScreen.main.bounds.size.width
+        let screenWidth = hostWidth
         let bubbleWidth = bubble.frame.size.width
         let isOnRightSide = bubble.frame.origin.x > screenWidth / 2
         let visibleOffset = bubbleWidth / 8 * 8.25

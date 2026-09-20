@@ -12,6 +12,10 @@ class SwiftyDebugViewController: UIViewController {
     var bubble = Bubble(frame: CGRect(origin: .zero, size: Bubble.size))
 
     override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        // Without `super`, nothing this controller presents is told the size is
+        // changing — a presented debug UI misses the rotation entirely, which is
+        // what left the media pager showing a black screen after a rotate.
+        super.viewWillTransition(to: size, with: coordinator)
         bubble.updateOrientation(newSize: size)
     }
 

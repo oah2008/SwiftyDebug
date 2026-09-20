@@ -142,11 +142,19 @@ final class LogModelDB {
         // Rich search: match the query against content AND the metadata columns
         // (source library, subsystem, category, type). Lets webview logs be found
         // by their source/subsystem too, not just message text. (See SEARCH.)
+        //
+        // `contentData` is searched too. `content` holds only the first 1000
+        // characters of an entry (see `LogRecord`); the full text lives in
+        // `contentData`, so searching `content` alone silently could not find a
+        // term past that cut-off in a long entry — which is exactly the entry
+        // somebody is searching for.
         sqlite3_prepare_v2(db,
             """
             SELECT COUNT(*) FROM logs WHERE logSource = ? AND (
-                content LIKE ?2 OR sourceName LIKE ?2 OR subsystem LIKE ?2
-                OR category LIKE ?2 OR logTypeName LIKE ?2 OR fileInfo LIKE ?2
+                content LIKE ?2 ESCAPE '\\' OR substr(CAST(contentData AS TEXT), 1, 8000) LIKE ?2 ESCAPE '\\'
+                OR sourceName LIKE ?2 ESCAPE '\\' OR subsystem LIKE ?2 ESCAPE '\\'
+                OR category LIKE ?2 ESCAPE '\\' OR logTypeName LIKE ?2 ESCAPE '\\'
+                OR fileInfo LIKE ?2 ESCAPE '\\'
             )
             """,
             -1, &searchCountStmt, nil)
@@ -154,8 +162,10 @@ final class LogModelDB {
             """
             SELECT rowid, content, contentData, color, fileInfo, date, sourceName, logTypeName, subsystem, category, logSource, logType, isTag, isPinned
             FROM logs WHERE logSource = ? AND (
-                content LIKE ?2 OR sourceName LIKE ?2 OR subsystem LIKE ?2
-                OR category LIKE ?2 OR logTypeName LIKE ?2 OR fileInfo LIKE ?2
+                content LIKE ?2 ESCAPE '\\' OR substr(CAST(contentData AS TEXT), 1, 8000) LIKE ?2 ESCAPE '\\'
+                OR sourceName LIKE ?2 ESCAPE '\\' OR subsystem LIKE ?2 ESCAPE '\\'
+                OR category LIKE ?2 ESCAPE '\\' OR logTypeName LIKE ?2 ESCAPE '\\'
+                OR fileInfo LIKE ?2 ESCAPE '\\'
             ) ORDER BY rowid LIMIT ?3 OFFSET ?4
             """,
             -1, &searchFetchRangeStmt, nil)
@@ -185,6 +195,9 @@ final class LogModelDB {
             sqlite3_bind_int(self.writeCountBySourceStmt, 1, Int32(source))
             sqlite3_step(self.writeCountBySourceStmt)
             let newCount = Int(sqlite3_column_int64(self.writeCountBySourceStmt, 0))
+            // Same reason as ConsoleLogDB: a parked SQLITE_ROW holds a read
+            // transaction open and blocks VACUUM / WAL checkpointing.
+            sqlite3_reset(self.writeCountBySourceStmt)
 
             DispatchQueue.main.async { [weak self] in
                 self?.cachedCount[source] = newCount
@@ -312,13 +325,32 @@ final class LogModelDB {
         }
     }
 
+    /// A LIKE pattern with the wildcards the user typed treated as literals.
+    ///
+    /// `%` and `_` are SQL wildcards, so an unescaped query matched rows the
+    /// highlighter then refused to highlight — the count and the jump-to-match
+    /// disagreed with what was on screen. The backslash must be doubled FIRST or
+    /// the escapes added after it would themselves be escaped. Paired with the
+    /// `ESCAPE` clause on every LIKE above.
+    static func escapedLike(_ q: String) -> String {
+        "%" + q.replacingOccurrences(of: "\\", with: "\\\\")
+               .replacingOccurrences(of: "%", with: "\\%")
+               .replacingOccurrences(of: "_", with: "\\_") + "%"
+    }
+
     // MARK: - Read methods (main thread only)
 
     func readCount(source: Int) -> Int {
         sqlite3_reset(readCountBySourceStmt)
         sqlite3_bind_int(readCountBySourceStmt, 1, Int32(source))
         sqlite3_step(readCountBySourceStmt)
-        return Int(sqlite3_column_int64(readCountBySourceStmt, 0))
+        let count = Int(sqlite3_column_int64(readCountBySourceStmt, 0))
+        // Reset immediately. A stepped-but-unreset statement holds its read
+        // transaction open until the next call resets it, and while any read
+        // transaction is open SQLite cannot checkpoint the WAL — so the log DB
+        // grows and a delete reclaims nothing.
+        sqlite3_reset(readCountBySourceStmt)
+        return count
     }
 
     func fetchRange(source: Int, offset: Int, limit: Int) -> [LogRecord] {
@@ -332,18 +364,20 @@ final class LogModelDB {
     func searchCount(source: Int, query: String) -> Int {
         sqlite3_reset(searchCountStmt)
         sqlite3_bind_int(searchCountStmt, 1, Int32(source))
-        let pattern = "%\(query)%"
+        let pattern = Self.escapedLike(query)
         pattern.withCString { cStr in
             sqlite3_bind_text(searchCountStmt, 2, cStr, -1, Self.SQLITE_TRANSIENT)
         }
         sqlite3_step(searchCountStmt)
-        return Int(sqlite3_column_int64(searchCountStmt, 0))
+        let count = Int(sqlite3_column_int64(searchCountStmt, 0))
+        sqlite3_reset(searchCountStmt)
+        return count
     }
 
     func searchFetchRange(source: Int, query: String, offset: Int, limit: Int) -> [LogRecord] {
         sqlite3_reset(searchFetchRangeStmt)
         sqlite3_bind_int(searchFetchRangeStmt, 1, Int32(source))
-        let pattern = "%\(query)%"
+        let pattern = Self.escapedLike(query)
         pattern.withCString { cStr in
             sqlite3_bind_text(searchFetchRangeStmt, 2, cStr, -1, Self.SQLITE_TRANSIENT)
         }

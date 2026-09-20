@@ -18,7 +18,30 @@ import WebKit
 /// cannot mutate page state.
 final class WebViewStoragePickerViewController: UITableViewController {
 
-    private var webViews: [WKWebView] = []
+    /// A web view held **weakly**.
+    ///
+    /// The list this screen shows is the HOST APP's web views. Holding one
+    /// strongly makes the debugger the reason the app's screen never
+    /// deallocates: a `WKWebView` retains its configuration, which retains its
+    /// `WKUserContentController`, which retains every registered message handler
+    /// — and for any app with a JS bridge that handler is usually the host
+    /// screen's own view controller. Listing something must never extend its
+    /// life. (See WEBVIEW-LEAK.)
+    private final class WeakWebViewRef {
+        weak var value: WKWebView?
+        init(_ value: WKWebView) { self.value = value }
+    }
+
+    private var webViewRefs: [WeakWebViewRef] = []
+
+    /// How many rows currently have a live web view behind them.
+    ///
+    /// Only for the title count — never for indexing. `webViewRefs` is the row
+    /// model, and a row addresses the SAME slot for as long as the table is not
+    /// reloaded: compacting the array on every access re-indexed the rows under
+    /// the cells already on screen, so tapping a row that read
+    /// `accounts.example.com` could open a different web view's storage.
+    private var liveWebViewCount: Int { webViewRefs.reduce(0) { $0 + ($1.value == nil ? 0 : 1) } }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -48,10 +71,27 @@ final class WebViewStoragePickerViewController: UITableViewController {
         refreshTapped()
     }
 
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        // Drop the references as soon as the screen is off. `viewWillAppear`
+        // repopulates them, so nothing is lost by coming back — and while the
+        // debug UI sits on another tab, or stays presented after
+        // `SwiftyDebug.disable()`, this screen holds nothing at all.
+        webViewRefs.removeAll()
+        tableView.reloadData()
+    }
+
     @objc private func refreshTapped() {
-        webViews = WKWebViewSwizzling.liveWebViews()
+        // Mapped to weak boxes immediately. Assigning the strong array returned
+        // by `liveWebViews()` to a stored property is what pinned the host's web
+        // views — and because the old value was still alive while the right-hand
+        // side was evaluated, a web view this screen was pinning was still listed
+        // in the weak tracking table and got re-captured on every refresh, so it
+        // could never be dropped.
+        webViewRefs = WKWebViewSwizzling.liveWebViews().map(WeakWebViewRef.init)
+        let count = liveWebViewCount
         if let label = navigationItem.titleView as? UILabel {
-            label.text = webViews.isEmpty ? "Web Views" : "Web Views · \(webViews.count)"
+            label.text = count == 0 ? "Web Views" : "Web Views · \(count)"
             label.sizeToFit()
         }
         tableView.reloadData()
@@ -60,14 +100,17 @@ final class WebViewStoragePickerViewController: UITableViewController {
     override func numberOfSections(in tableView: UITableView) -> Int { 1 }
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        max(webViews.count, 1)
+        max(webViewRefs.count, 1)
     }
 
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         // Bounds guard rather than `isEmpty` — the live web-view list can shrink
         // between the row count and this call (web views are weakly held and can
         // deallocate at any time).
-        if indexPath.row >= webViews.count {
+        // A slot whose web view has since died renders the placeholder rather
+        // than shifting every later row up under the drawn cells.
+        let webView = indexPath.row < webViewRefs.count ? webViewRefs[indexPath.row].value : nil
+        if webView == nil {
             let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "empty")
             cell.backgroundColor = .clear
             cell.selectionStyle = .none
@@ -83,15 +126,16 @@ final class WebViewStoragePickerViewController: UITableViewController {
             return cell
         }
         let cell = tableView.dequeueReusableCell(withIdentifier: "WVCard", for: indexPath) as! WebViewCardCell
-        cell.configure(webView: webViews[indexPath.row], index: indexPath.row)
+        cell.configure(webView: webView!, index: indexPath.row)
         return cell
     }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        guard !webViews.isEmpty, indexPath.row < webViews.count else { return }
+        guard indexPath.row < webViewRefs.count,
+              let webView = webViewRefs[indexPath.row].value else { return }
         navigationController?.pushViewController(
-            WebViewStorageViewController(webView: webViews[indexPath.row]), animated: true
+            WebViewStorageViewController(webView: webView), animated: true
         )
     }
 }

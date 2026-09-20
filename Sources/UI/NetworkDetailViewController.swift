@@ -43,6 +43,16 @@ class NetworkDetailViewController: UITableViewController {
     /// Released in `viewWillDisappear` with the rest of the big strings.
     private var cachedResponseBody: Data?
 
+    /// The rendered request / response bodies, produced once by `setupModels`.
+    ///
+    /// The export sheet needs them only to decide whether to offer the two
+    /// "Export … as .json file" actions. Asking `httpModel` for them again went
+    /// back to disk (both getters read the file on EVERY access) and re-printed
+    /// a multi-megabyte body on the main thread, just to build a menu the user
+    /// may cancel. Released in `viewWillDisappear` with `cachedResponseBody`.
+    private var cachedRequestText: String?
+    private var cachedResponseText: String?
+
     /// Whether the rewrite card can do anything, decided once at setup.
     private enum RewriteEntryState {
         /// Nothing worth saying — no body, an image, or a replay result.
@@ -177,6 +187,7 @@ class NetworkDetailViewController: UITableViewController {
         model_2.showPreview = true
 
         // Request body
+        cachedRequestText = requestContent
         var model_3 = NetworkDetailSection(title: "REQUEST", content: requestContent, url: urlStr, httpModel: httpModel)
         model_3.showPreview = true
         let reqBytes = Int(httpModel?.requestDataSize ?? 0)
@@ -215,6 +226,7 @@ class NetworkDetailViewController: UITableViewController {
             // button went through `dataToPrettyPrintString()` and printed it in
             // a different one. Preview and copy must be the same bytes.
             let prettyResponse = cachedResponseData?.dataToPrettyPrintString()
+            cachedResponseText = prettyResponse
             model_5 = NetworkDetailSection(title: "RESPONSE", content: prettyResponse, url: urlStr, httpModel: httpModel)
         }
         model_5.showPreview = true
@@ -582,7 +594,13 @@ class NetworkDetailViewController: UITableViewController {
               let root = try? JSONSerialization.jsonObject(with: body, options: [.fragmentsAllowed])
         else { return }
 
-        let picker = JSONEditorViewController(document: JSONDocument(root: root),
+        // Built from the BYTES, so the picker carries a source index and lists
+        // keys in the server's order. `JSONDocument(root:)` has no source text,
+        // so `orderedKeys` falls back to a plain sort — and this screen showed
+        // the same object alphabetically while the rules screen's picker, which
+        // does pass the text, showed it in server order.
+        let document = JSONDocument(data: body) ?? JSONDocument(root: root)
+        let picker = JSONEditorViewController(document: document,
                                               title: "Tap the value to rewrite")
         picker.onPickPath = { [weak self] path in
             guard let self = self else { return }
@@ -681,7 +699,27 @@ class NetworkDetailViewController: UITableViewController {
         var seenSections = Set<String>()
 
         for model in detailModels {
-            guard let title = model.title, let content = model.content, !content.isEmpty else { continue }
+            guard let title = model.title else { continue }
+            let content: String
+            if let text = model.content, !text.isEmpty {
+                content = text
+            } else if let image = model.image {
+                // An image body has no text to export, and a section that simply
+                // vanishes reads as "there was no response at all". Name it, with
+                // the size the screen already knows, so the exported details still
+                // account for the body that was there.
+                let bytes = Int(model.httpModel?.responseDataSize ?? 0)
+                let size = bytes > 0 ? formatBytes(bytes) : "unknown size"
+                content = "<image response, \(size), "
+                    // `UIImage.size` is POINTS. A multi-frame GIF is built with
+                    // `UIImage(cgImage:scale:orientation:)` at the SCREEN scale,
+                    // so printing its size as pixels understated the real
+                    // dimensions by 2-3x. Single-frame images come from
+                    // `UIImage(data:)` at scale 1, where this is a no-op.
+                    + "\(Int(image.size.width * image.scale))x\(Int(image.size.height * image.scale)) px>"
+            } else {
+                continue
+            }
             // Dedup by exact section identity, not substring-containment. The old
             // `body.contains(string)` check could silently drop a section whose
             // text happened to be a substring of an earlier one, producing an
@@ -772,6 +810,11 @@ class NetworkDetailViewController: UITableViewController {
 
         //header
         headerCell = NetworkCell(style: .default, reuseIdentifier: "NetworkCell")
+        // The number the card prints is the row this request occupies in the
+        // list it was tapped in. Left unset it printed "1" on every detail
+        // screen, so the card could never be matched back to its row. Set it
+        // BEFORE `httpModel`, which is the assignment that runs `configure()`.
+        headerCell?.index = httpModels?.firstIndex(where: { $0 === httpModel }) ?? 0
         headerCell?.httpModel = httpModel
         headerCell?.showCurlButton = true
         headerCell?.onCurlTapped = { [weak self] in
@@ -842,7 +885,34 @@ class NetworkDetailViewController: UITableViewController {
                 self.present(nav, animated: true)
             }
         }
+
+        // The header card draws the intercept bolt from the rule store, and it
+        // is the card's own "Intercept Request" button that opens the editor.
+        // The editor is a page-sheet, so this screen gets no appearance callback
+        // when it is dismissed — without this the badge on the very card that
+        // launched the flow stayed off until the screen was left and re-entered.
+        //
+        // The token is kept: `removeObserver(self)` cannot unregister a
+        // block-based observer — the observer is the returned token object, not
+        // `self`.
+        interceptRulesObserver = NotificationCenter.default.addObserver(
+            forName: .interceptRulesDidChange,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refreshHeaderCard()
+        }
+
         view.forceLTR()
+    }
+
+    /// Token for the `.interceptRulesDidChange` observer registered in
+    /// `viewDidLoad`, released in `deinit`.
+    private var interceptRulesObserver: NSObjectProtocol?
+
+    deinit {
+        if let interceptRulesObserver {
+            NotificationCenter.default.removeObserver(interceptRulesObserver)
+        }
     }
 
     private var hasPerformedInitialReload = false
@@ -919,6 +989,8 @@ class NetworkDetailViewController: UITableViewController {
         // is cancelled.
         detailModels.removeAll()
         cachedResponseBody = nil
+        cachedRequestText = nil
+        cachedResponseText = nil
         didReleaseCachedContent = true
     }
     
@@ -950,6 +1022,18 @@ class NetworkDetailViewController: UITableViewController {
         pinItem.image = model.isPinned
             ? UIImage(systemName: "pin.slash.fill")
             : UIImage(systemName: "pin.fill")
+        refreshHeaderCard()
+    }
+
+    /// Re-renders the header card from the current model state.
+    ///
+    /// `NetworkCell` draws its pin and intercept indicators only from
+    /// `configure()`, which runs from the `httpModel` setter — assigned once in
+    /// `viewDidLoad`. Without this the nav-bar button flipped while the pin
+    /// indicator on the card right below it stayed as it was until the screen
+    /// was left and re-entered.
+    private func refreshHeaderCard() {
+        headerCell?.httpModel = httpModel
     }
 
     /// Export/share menu for the current request. Offers exporting the response
@@ -959,7 +1043,9 @@ class NetworkDetailViewController: UITableViewController {
         let alert = UIAlertController(title: "Export / Share", message: nil, preferredStyle: .actionSheet)
 
         // Response JSON as a file (the primary new capability).
-        let responseString = httpModel?.responseData?.dataToPrettyPrintString()
+        // Both bodies come from what `setupModels` already rendered — see
+        // `cachedResponseText`; neither getter may be touched here.
+        let responseString = cachedResponseText
         if let responseString, !responseString.isEmpty {
             alert.addAction(UIAlertAction(title: "Export Response as .json file", style: .default) { [weak self] _ in
                 self?.shareAsFile(jsonText: responseString, kind: "response", sourceItem: sender)
@@ -967,7 +1053,7 @@ class NetworkDetailViewController: UITableViewController {
         }
 
         // Request body as a file, when present.
-        let requestString = httpModel?.requestData?.dataToPrettyPrintString()
+        let requestString = cachedRequestText
         if let requestString, !requestString.isEmpty {
             alert.addAction(UIAlertAction(title: "Export Request as .json file", style: .default) { [weak self] _ in
                 self?.shareAsFile(jsonText: requestString, kind: "request", sourceItem: sender)
@@ -1100,14 +1186,22 @@ extension NetworkDetailViewController {
             let cell = tableView.dequeueReusableCell(withIdentifier: "NetworkMediaGridCell", for: indexPath)
                 as! NetworkMediaGridCell
             cell.configure(imageURLs: mediaURLs)
-            let openGallery: (Int) -> Void = { [weak self] startIndex in
+            // The tile carries the index it was built with all the way here, so
+            // it opens the image that was tapped. Dropping it made every tile
+            // and "Show all" the same action — push the grid, find the same
+            // thumbnail, tap it a second time.
+            cell.onSelectImage = { [weak self] startIndex in
                 guard let self = self else { return }
-                let gallery = MediaGalleryViewController(imageURLs: mediaURLs, title: "Media")
-                self.navigationController?.pushViewController(gallery, animated: true)
-                _ = startIndex
+                let detail = MediaDetailViewController(
+                    items: mediaURLs.map { MediaItem(urlString: $0) },
+                    startIndex: startIndex)
+                self.navigationController?.pushViewController(detail, animated: true)
             }
-            cell.onSelectImage = openGallery
-            cell.onShowAll = { openGallery(0) }
+            cell.onShowAll = { [weak self] in
+                guard let self = self else { return }
+                self.navigationController?.pushViewController(
+                    MediaGalleryViewController(imageURLs: mediaURLs, title: "Media"), animated: true)
+            }
             return cell
         }
 
@@ -1145,6 +1239,17 @@ extension NetworkDetailViewController {
             if detailModel?.title == "REQUEST CURL" {
                 let vc = CurlPreviewViewController()
                 vc.curlString = self.rawCurlString
+                self.navigationController?.pushViewController(vc, animated: true)
+                return
+            }
+
+            // An image response has no text to hand the JSON viewer — push the
+            // section itself so the viewer takes its image branch. Going through
+            // `pushJSONViewerOrFallback` rebuilds a content-only section, which
+            // drops the image and shows an empty page.
+            if detailModel?.image != nil {
+                let vc = JsonViewController()
+                vc.detailModel = detailModel
                 self.navigationController?.pushViewController(vc, animated: true)
                 return
             }
@@ -1360,16 +1465,38 @@ import WebKit
 // Bridges navigator.clipboard.writeText() from WKWebView to UIPasteboard.
 // WKWebView blocks the Clipboard API when the page origin is null (loadHTMLString).
 private final class ClipboardMessageHandler: NSObject, WKScriptMessageHandler {
+
+    /// Weak: `WKUserContentController` retains whatever is registered with it,
+    /// so a strong reference here would be a retain cycle back into the screen.
+    weak var presenter: UIViewController?
+
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
         guard let text = message.body as? String else { return }
-        // The string arriving here is produced by a THIRD-PARTY web component
-        // rendering the body, not by SwiftyDebug — so it is the one copy path in
-        // the SDK whose exact bytes we do not control, and it landed on the
-        // pasteboard verbatim. That is how a copied request body acquired a
-        // leading invisible character and stopped pasting into Algolia. Route it
-        // through the same normaliser as every native copy. (See COPY.)
-        ClipboardFormatter.copyVerbatim(JSONExporter.clipboardString(from: text))
+
+        // A copied STRING value is unwrapped here and copied immediately — it is
+        // cheap, and it is the case the component gets wrong (see
+        // `unwrappedViewerStringLiteral`).
+        if let literal = JSONExporter.unwrappedViewerStringLiteral(text) {
+            // `copyExactly`, not `copyVerbatim`: the JSON quotes are already
+            // gone and what is left is the VALUE. Trimming it a second time
+            // strips whitespace that was INSIDE the string literal and is
+            // therefore part of the value. The viewer is exactly where a bearer
+            // token written as "eyJ…\n" gets copied from, and a token that works
+            // in curl and not in the app is the bug this SDK exists to find.
+            // The invisible-affix strip that motivated the trim still runs on
+            // the CONTAINER path below, which is where the component's own
+            // output reaches the pasteboard. (See COPY.)
+            ClipboardFormatter.copyExactly(literal)
+            return
+        }
+
+        // Anything else is a container, up to the whole document. Formatting it
+        // re-parses, re-indexes and re-prints with the size ceiling lifted, and
+        // this delegate runs on the MAIN thread — the host app's main thread.
+        // `ClipboardFormatter.copy` is the one path that thresholds that work
+        // and moves it off-main behind an overlay.
+        ClipboardFormatter.copy(text, from: presenter)
     }
 }
 
@@ -1380,7 +1507,38 @@ final class JSONViewerViewController: UIViewController, WKNavigationDelegate {
     private var pendingJSON: String?
     private let clipboardHandler = ClipboardMessageHandler()
 
-    private let initialHTML: String = """
+    /// The vendored renderer, read out of the SDK's own bundle.
+    ///
+    /// nil only when the package was built without its resources, which is a
+    /// packaging fault rather than a runtime condition. `initialHTML` then falls
+    /// back to the upstream URL so the screen still works — a degraded path, not
+    /// the intended one. Both SwiftPM (`.process("Resources")`) and CocoaPods
+    /// (`s.resources`) already ship this directory.
+    private static let vendoredViewerScript: String? = {
+        guard let url = SwiftyDebugResources.bundle.url(forResource: "andypf-json-viewer",
+                                                        withExtension: "js"),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        return text
+    }()
+
+    /// The renderer tag: the vendored script inlined, or — only if the bundle
+    /// is missing it — the upstream URL it was vendored from.
+    ///
+    /// Inlined rather than served over a custom scheme because this page is
+    /// loaded with `loadHTMLString`, whose origin is null: a `<script src>` to
+    /// any local URL would not resolve from there. The bundle is ~40 KB, which
+    /// WebKit parses in a frame.
+    private static var viewerScriptTag: String {
+        if let script = vendoredViewerScript {
+            // `</script>` inside the bundle would close this tag early. The
+            // upstream file contains none, but a future one costs nothing to
+            // guard against and a silent blank viewer is expensive.
+            return "<script>" + script.replacingOccurrences(of: "</script>", with: "<\\/script>") + "</script>"
+        }
+        return "<script defer src=\"https://pfau-software.de/json-viewer/dist/iife/index.js\"></script>"
+    }
+
+    private var initialHTML: String { """
     <!doctype html>
     <html lang="en" dir="ltr">
     <head>
@@ -1403,7 +1561,7 @@ final class JSONViewerViewController: UIViewController, WKNavigationDelegate {
         :root { direction: ltr; unicode-bidi: isolate; }
         body, #root, andypf-json-viewer { direction: ltr; text-align: left; }
       </style>
-      <script defer src="https://pfau-software.de/json-viewer/dist/iife/index.js"></script>
+      \(Self.viewerScriptTag)
     </head>
     <body>
       <div id="root">
@@ -1457,7 +1615,7 @@ final class JSONViewerViewController: UIViewController, WKNavigationDelegate {
       </script>
     </body>
     </html>
-    """
+    """ }
 
 
     override func viewDidLoad() {
@@ -1484,6 +1642,7 @@ final class JSONViewerViewController: UIViewController, WKNavigationDelegate {
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
+        clipboardHandler.presenter = self
         config.userContentController.addUserScript(clipboardOverride)
         config.userContentController.add(clipboardHandler, name: "nativeClipboard")
 
@@ -1506,9 +1665,29 @@ final class JSONViewerViewController: UIViewController, WKNavigationDelegate {
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
-        // Only tear down when actually leaving (popped/dismissed), not when pushing a child.
-        guard isMovingFromParent || isBeingDismissed else { return }
+        // Tear down when this screen is actually going away, not when it is merely
+        // covered by something pushed on top of it.
+        //
+        // This controller is a CHILD (see `DemoJSONViewerHostController`), and a
+        // child's own `isMovingFromParent` is false while its PARENT is the thing
+        // being popped — so testing only this controller's flags meant a pop left
+        // the web view, and the JS heap holding the whole body, alive until the
+        // host happened to deallocate. Ask the parent chain too.
+        guard isLeavingForGood else { return }
         tearDownWebView()
+    }
+
+    /// True when this controller, or any ancestor it is embedded in, is being
+    /// popped or dismissed.
+    private var isLeavingForGood: Bool {
+        var controller: UIViewController? = self
+        while let current = controller {
+            if current.isMovingFromParent || current.isBeingDismissed { return true }
+            controller = current.parent
+        }
+        // A child removed from its parent without the parent moving anywhere
+        // (`removeFromParent`) leaves `parent` nil while the view is off screen.
+        return parent == nil && view.window == nil
     }
 
     deinit {
@@ -1624,7 +1803,43 @@ final class DemoJSONViewerHostController: UIViewController {
         // Render JSON passed as STRING
 
         viewer.render(jsonString: jsonString)
+        installCopyButton()
         view.forceLTR()
+    }
+
+    /// A native Copy, next to the component's own per-node one.
+    ///
+    /// The component's copy builds the whole document with
+    /// `JSON.stringify(value, null, 2)` — a JavaScript re-serialisation, which
+    /// re-spells every number (`1250.00` comes back `1250`, a 19-digit id loses
+    /// precision to Double) and reorders any integer-like key, because that is
+    /// what JS objects do. This one copies the bytes the SDK captured, through
+    /// the same producer as every other copy in the app, so the whole body
+    /// arrives in the server's own key order and number spelling. (See COPY.)
+    private func installCopyButton() {
+        let item = UIBarButtonItem(image: UIImage(systemName: "doc.on.doc"),
+                                   style: .plain, target: self, action: #selector(copyWholeBody))
+        item.tintColor = DebugTheme.accentColor
+        item.accessibilityLabel = "Copy whole body"
+        navigationItem.rightBarButtonItem = item
+    }
+
+    @objc private func copyWholeBody() {
+        guard !jsonString.isEmpty else { return }
+        ClipboardFormatter.copy(jsonString, from: self) { [weak self] in
+            self?.flashCopied()
+        }
+    }
+
+    private func flashCopied() {
+        let item = navigationItem.rightBarButtonItem
+        item?.image = UIImage(systemName: "checkmark")
+        item?.tintColor = .systemGreen
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self else { return }
+            self.navigationItem.rightBarButtonItem?.image = UIImage(systemName: "doc.on.doc")
+            self.navigationItem.rightBarButtonItem?.tintColor = DebugTheme.accentColor
+        }
     }
 }
 

@@ -156,18 +156,34 @@ struct JSONPathPattern: Equatable {
     /// `maxVisitedNodes`; a truncated walk returns what it found rather than
     /// hanging or throwing.
     func matches(in root: Any, limit: Int = JSONPathPattern.maxMatches) -> [JSONPath] {
-        guard limit > 0 else { return [] }
+        matchesReporting(in: root, limit: limit).paths
+    }
+
+    /// The same walk, plus whether it stopped before the end of the document.
+    ///
+    /// A partial list of paths is indistinguishable from a complete one once the
+    /// paths are handed back on their own, and the node budget is not a
+    /// pathological-input guard in practice: `**` spends roughly two budget
+    /// units per tree node, so an ordinary few-hundred-KB body exhausts
+    /// `maxVisitedNodes` long before it reaches the engine's `maxBodyBytes`.
+    /// Anything that REPORTS what a rewrite did has to call this one, or it
+    /// prints a confident, wrong, exact count for a half-applied rewrite.
+    func matchesReporting(in root: Any, limit: Int = JSONPathPattern.maxMatches)
+        -> (paths: [JSONPath], wasTruncated: Bool) {
+        guard limit > 0 else { return ([], false) }
         var results: [JSONPath] = []
         var path: JSONPath = []
         var budget = Self.maxVisitedNodes
         walk(0, root, &path, &results, &budget, limit)
+        // Both stop conditions of `walk`: the node budget and the result cap.
+        let truncated = budget <= 0 || results.count >= limit
 
         // `**` in more than one position can reach the same node twice.
-        guard results.count > 1 else { return results }
+        guard results.count > 1 else { return (results, truncated) }
         var seen = Set<String>()
         var unique: [JSONPath] = []
         for p in results where seen.insert(p.display).inserted { unique.append(p) }
-        return unique
+        return (unique, truncated)
     }
 
     /// True when the pattern can match more than one node — the UI uses this to

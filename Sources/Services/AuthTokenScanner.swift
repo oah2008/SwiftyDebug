@@ -127,6 +127,11 @@ struct DebugJWT {
     private static let absoluteFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        // A fixed format string resolves against the current locale's calendar,
+        // so `exp` would render as 1448-… on a Hijri device while the epoch shown
+        // beside it says otherwise. POSIX pins it to the Gregorian calendar, the
+        // same way the Keychain and UserDefaults browsers do.
+        f.locale = Locale(identifier: "en_US_POSIX")
         return f
     }()
 

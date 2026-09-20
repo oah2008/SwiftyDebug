@@ -87,7 +87,13 @@ final class MediaTabViewController: MediaGalleryViewController {
     static func collectAllItems() -> [MediaItem] {
         guard SwiftyDebugRuntime.isActive else { return [] }
         let models = (NetworkRequestStore.shared.httpModels as NSArray as? [NetworkTransaction]) ?? []
-        var seen = Set<String>()
+        // Where each URL already landed in `result`, not just that it was seen:
+        // a captured request met later in the walk has to *upgrade* the entry a
+        // newer JSON body put there first. A plain seen-set drops the capture
+        // whenever any newer response body happens to mention the same image
+        // URL, and the details page then has no method/status/headers and no
+        // "View source request" for a request sitting in the store.
+        var indexByURL: [String: Int] = [:]
         var result: [MediaItem] = []
 
         // Newest first (the store appends, so iterate in reverse).
@@ -95,12 +101,21 @@ final class MediaTabViewController: MediaGalleryViewController {
             // (a) the media request itself
             if NetworkViewController.isMediaTransaction(model),
                let urlString = model.url?.absoluteString,
-               !urlString.isEmpty,
-               seen.insert(urlString).inserted {
-                result.append(MediaItem(urlString: urlString, transaction: model))
+               !urlString.isEmpty {
+                if let existing = indexByURL[urlString] {
+                    // The transaction-backed entry wins, in the placeholder's
+                    // position so the newest-first order is untouched.
+                    if result[existing].transaction == nil {
+                        result[existing] = MediaItem(urlString: urlString, transaction: model)
+                    }
+                } else {
+                    indexByURL[urlString] = result.count
+                    result.append(MediaItem(urlString: urlString, transaction: model))
+                }
             }
             // (b) images parsed out of this request's JSON response body
-            for urlString in model.imageURLs where seen.insert(urlString).inserted {
+            for urlString in model.imageURLs where indexByURL[urlString] == nil {
+                indexByURL[urlString] = result.count
                 result.append(MediaItem(urlString: urlString))
             }
         }

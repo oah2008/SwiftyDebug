@@ -325,13 +325,38 @@ extension RequestDiffViewController: UITableViewDelegate {
         guard let row = row(at: indexPath) else { return }
 
         // Copying the value is the reason you found the row in the first place.
+        // The row carries the untruncated value — only the cell shortens it —
+        // and when two bodies are too big to diff line-by-line, a single
+        // "(body)" row carries both of them WHOLE. Building that string is
+        // therefore a multi-megabyte concatenation, so size it first (a native
+        // String knows its own UTF-8 count; asking costs nothing) and let the
+        // formatter decide whether the work belongs on this thread.
+        let oldBytes = row.oldValue?.utf8.count ?? 0
+        let newBytes = row.newValue?.utf8.count ?? 0
+        let byteCount: Int
         switch row.change {
         case .added, .same:
-            ClipboardFormatter.copyVerbatim(row.newValue ?? row.oldValue ?? "")
+            // Mirrors `newValue ?? oldValue` below: an EMPTY newValue is still
+            // the chosen value, and must not fall through to oldValue here.
+            byteCount = row.newValue.map { $0.utf8.count } ?? oldBytes
         case .removed:
-            ClipboardFormatter.copyVerbatim(row.oldValue ?? "")
+            byteCount = oldBytes
         case .changed:
-            ClipboardFormatter.copyVerbatim("\(row.label)\n- \(row.oldValue ?? "")\n+ \(row.newValue ?? "")")
+            byteCount = oldBytes + newBytes + row.label.utf8.count + 6
+        }
+        // The "(none)" placeholder has nothing to copy, and writing "" to the
+        // pasteboard would silently destroy whatever the developer had on it.
+        guard byteCount > 0 else { return }
+
+        ClipboardFormatter.copyVerbatim(byteCount: byteCount, from: self) {
+            switch row.change {
+            case .added, .same:
+                return row.newValue ?? row.oldValue ?? ""
+            case .removed:
+                return row.oldValue ?? ""
+            case .changed:
+                return "\(row.label)\n- \(row.oldValue ?? "")\n+ \(row.newValue ?? "")"
+            }
         }
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
@@ -421,27 +446,31 @@ private class RequestDiffCell: UITableViewCell {
         labelLabel.isHidden = row.label.isEmpty
 
         // Old on one line, new on the next — never truncated side by side.
+        // The shortened forms are precomputed on the row (see
+        // `RequestDiffRow.displayOld`): shortening here walked the whole body on
+        // every cell configure. The row keeps the full value so tap-to-copy
+        // stays byte-exact.
         switch row.change {
         case .same:
             oldLabel.isHidden = false
-            oldLabel.text = row.newValue ?? row.oldValue ?? ""
+            oldLabel.text = row.displayNew ?? row.displayOld ?? ""
             oldLabel.textColor = row.isNote ? RequestDiffViewController.DiffColor.note : UIColor(white: 0.7, alpha: 1)
             newLabel.isHidden = true
         case .added:
             oldLabel.isHidden = true
             newLabel.isHidden = false
-            newLabel.text = "+ " + (row.newValue ?? "")
+            newLabel.text = "+ " + (row.displayNew ?? "")
             newLabel.textColor = color
         case .removed:
             oldLabel.isHidden = false
-            oldLabel.text = "− " + (row.oldValue ?? "")
+            oldLabel.text = "− " + (row.displayOld ?? "")
             oldLabel.textColor = color
             newLabel.isHidden = true
         case .changed:
             oldLabel.isHidden = false
             newLabel.isHidden = false
-            oldLabel.text = "− " + (row.oldValue ?? "")
-            newLabel.text = "+ " + (row.newValue ?? "")
+            oldLabel.text = "− " + (row.displayOld ?? "")
+            newLabel.text = "+ " + (row.displayNew ?? "")
             if row.isNote {
                 oldLabel.textColor = RequestDiffViewController.DiffColor.note
                 newLabel.textColor = RequestDiffViewController.DiffColor.note

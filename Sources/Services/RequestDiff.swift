@@ -29,16 +29,36 @@ struct RequestDiffRow {
     /// they always differ and would otherwise drown the real signal.
     let isNote: Bool
 
+    /// A note that must never be filtered away with its section. A note alone
+    /// scores no change, so a section holding nothing but the truncation warning
+    /// would vanish under "changes only" and report two partial bodies as equal.
+    let isWarning: Bool
+
+    /// The shortened forms, computed ONCE here.
+    ///
+    /// `display(_:)` walks the whole string twice (`count` for the test and
+    /// again for the message), so calling it from `cellForRowAt` put an O(n)
+    /// grapheme walk over a multi-megabyte body on the main thread every time a
+    /// row was configured — on load, on toggling CHANGES ONLY, on rotation, and
+    /// on every scroll back into view. `oldValue`/`newValue` stay untruncated so
+    /// tap-to-copy remains byte-exact.
+    let displayOld: String?
+    let displayNew: String?
+
     init(label: String,
          oldValue: String?,
          newValue: String?,
          change: RequestDiffChange,
-         isNote: Bool = false) {
+         isNote: Bool = false,
+         isWarning: Bool = false) {
         self.label = label
         self.oldValue = oldValue
         self.newValue = newValue
         self.change = change
         self.isNote = isNote
+        self.isWarning = isWarning
+        self.displayOld = oldValue.map(RequestDiff.display)
+        self.displayNew = newValue.map(RequestDiff.display)
     }
 }
 
@@ -65,9 +85,13 @@ struct RequestDiffResult {
     var hasChanges: Bool { changeCount > 0 }
 
     /// Sections that still have something to show under the current filter.
+    /// A warning survives on its own: two bodies truncated at capture compare as
+    /// identical, and dropping the section would answer "no differences" to a
+    /// question the diff cannot actually answer. Plain notes do not qualify —
+    /// TIMING & SIZE always carries one and would never be filtered out.
     func sections(changesOnly: Bool) -> [RequestDiffSection] {
         guard changesOnly else { return sections }
-        return sections.filter { $0.changeCount > 0 }
+        return sections.filter { $0.changeCount > 0 || $0.rows.contains { $0.isWarning } }
     }
 }
 
@@ -146,8 +170,9 @@ struct RequestSnapshot {
 
 enum RequestDiff {
 
-    /// Values longer than this are shortened for display only — comparison always
-    /// runs on the full value, so a change past the cut-off is still detected.
+    /// Values longer than this are shortened by `display(_:)` at render time.
+    /// Rows always carry the full value, because the row is also what a tap
+    /// copies to the clipboard and a half-copied token is worse than none.
     static let maxDisplayLength = 1200
 
     /// The LCS table is O(n*m); past this many entries per side we fall back to a
@@ -246,7 +271,8 @@ enum RequestDiff {
                                        oldValue: which,
                                        newValue: nil,
                                        change: .same,
-                                       isNote: true), at: 0)
+                                       isNote: true,
+                                       isWarning: true), at: 0)
         }
         return RequestDiffSection(title: title, rows: fill(rows))
     }
@@ -307,13 +333,13 @@ enum RequestDiff {
             switch (oldValue, newValue) {
             case let (.some(o), .some(n)):
                 rows.append(RequestDiffRow(label: label,
-                                           oldValue: display(o),
-                                           newValue: display(n),
+                                           oldValue: o,
+                                           newValue: n,
                                            change: o == n ? .same : .changed))
             case let (.some(o), .none):
-                rows.append(RequestDiffRow(label: label, oldValue: display(o), newValue: nil, change: .removed))
+                rows.append(RequestDiffRow(label: label, oldValue: o, newValue: nil, change: .removed))
             case let (.none, .some(n)):
-                rows.append(RequestDiffRow(label: label, oldValue: nil, newValue: display(n), change: .added))
+                rows.append(RequestDiffRow(label: label, oldValue: nil, newValue: n, change: .added))
             case (.none, .none):
                 continue
             }
@@ -352,8 +378,8 @@ enum RequestDiff {
 
         guard oldLines.count <= lcsLimit, newLines.count <= lcsLimit else {
             return [RequestDiffRow(label: "(body)",
-                                   oldValue: display(oldText),
-                                   newValue: display(newText),
+                                   oldValue: oldText,
+                                   newValue: newText,
                                    change: oldText == newText ? .same : .changed)]
         }
 
@@ -362,18 +388,18 @@ enum RequestDiff {
             switch operation {
             case let .common(oldIdx, _):
                 rows.append(RequestDiffRow(label: "line \(oldIdx + 1)",
-                                           oldValue: display(oldLines[oldIdx]),
-                                           newValue: display(oldLines[oldIdx]),
+                                           oldValue: oldLines[oldIdx],
+                                           newValue: oldLines[oldIdx],
                                            change: .same))
             case let .removed(oldIdx):
                 rows.append(RequestDiffRow(label: "line \(oldIdx + 1)",
-                                           oldValue: display(oldLines[oldIdx]),
+                                           oldValue: oldLines[oldIdx],
                                            newValue: nil,
                                            change: .removed))
             case let .added(newIdx):
                 rows.append(RequestDiffRow(label: "line \(newIdx + 1)",
                                            oldValue: nil,
-                                           newValue: display(newLines[newIdx]),
+                                           newValue: newLines[newIdx],
                                            change: .added))
             }
         }
@@ -565,11 +591,11 @@ enum RequestDiff {
         if old.isEmpty && new.isEmpty {
             return RequestDiffRow(label: label, oldValue: "--", newValue: "--", change: .same)
         }
-        if old.isEmpty { return RequestDiffRow(label: label, oldValue: nil, newValue: display(new), change: .added) }
-        if new.isEmpty { return RequestDiffRow(label: label, oldValue: display(old), newValue: nil, change: .removed) }
+        if old.isEmpty { return RequestDiffRow(label: label, oldValue: nil, newValue: new, change: .added) }
+        if new.isEmpty { return RequestDiffRow(label: label, oldValue: old, newValue: nil, change: .removed) }
         return RequestDiffRow(label: label,
-                              oldValue: display(old),
-                              newValue: display(new),
+                              oldValue: old,
+                              newValue: new,
                               change: old == new ? .same : .changed)
     }
 
@@ -580,8 +606,14 @@ enum RequestDiff {
     }
 
     static func display(_ value: String) -> String {
-        guard value.count > maxDisplayLength else { return value }
-        return String(value.prefix(maxDisplayLength)) + "… (\(value.count) chars)"
+        // `utf8.count` is O(1) on a native Swift string and can only
+        // over-estimate against `count`, so it is a free pre-filter: anything it
+        // clears is definitely short enough, and only a candidate pays for the
+        // one grapheme walk below.
+        guard value.utf8.count > maxDisplayLength else { return value }
+        let length = value.count
+        guard length > maxDisplayLength else { return value }
+        return String(value.prefix(maxDisplayLength)) + "… (\(length) chars)"
     }
 
     // MARK: Export
@@ -593,15 +625,15 @@ enum RequestDiff {
             for row in section.rows(changesOnly: changesOnly) {
                 switch row.change {
                 case .same:
-                    lines.append("  = \(row.label): \(row.newValue ?? row.oldValue ?? "")")
+                    lines.append("  = \(row.label): \(display(row.newValue ?? row.oldValue ?? ""))")
                 case .added:
-                    lines.append("  + \(row.label): \(row.newValue ?? "")")
+                    lines.append("  + \(row.label): \(display(row.newValue ?? ""))")
                 case .removed:
-                    lines.append("  - \(row.label): \(row.oldValue ?? "")")
+                    lines.append("  - \(row.label): \(display(row.oldValue ?? ""))")
                 case .changed:
                     lines.append("  ~ \(row.label)")
-                    lines.append("      - \(row.oldValue ?? "")")
-                    lines.append("      + \(row.newValue ?? "")")
+                    lines.append("      - \(display(row.oldValue ?? ""))")
+                    lines.append("      + \(display(row.newValue ?? ""))")
                 }
             }
             lines.append("")

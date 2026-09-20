@@ -176,6 +176,15 @@ final class NativeCookieOverrideStore {
     /// Makes `store` hold exactly `desired` of the SDK's cookies: writes the
     /// wanted ones, deletes the previously-written ones that are no longer
     /// wanted, and touches nothing else in the store.
+    /// Takes back every cookie the SDK wrote, in every store it wrote to.
+    ///
+    /// Snapshots first: `reconcile` mutates `entries`.
+    func revertAll() {
+        for entry in Array(entries.values) {
+            reconcile([], in: entry.store)
+        }
+    }
+
     func reconcile(_ desired: [NativeCookieOverride], in store: WKHTTPCookieStore) {
         let key = ObjectIdentifier(store)
         let plan = Self.reconciliation(previous: entries[key]?.written ?? [], desired: desired)
@@ -281,6 +290,15 @@ private let sdkInstrumentedKey = UnsafeRawPointer(
 private let sdkSetUserAgentKey = UnsafeRawPointer(
     UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1))
 
+/// The `customUserAgent` the HOST APP had before the SDK overrode it, so the
+/// revert gives that back rather than WebKit's default.
+///
+/// Stored as `[String]` — empty means "the app had no custom UA" — so
+/// "nothing stashed" (no associated object at all) stays distinguishable from
+/// "stashed a nil". Same raw-pointer key rule as above.
+private let sdkPriorUserAgentKey = UnsafeRawPointer(
+    UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1))
+
 extension WKUserContentController {
 
     /// The channels **this SDK** registered on this content controller. Anything
@@ -359,8 +377,14 @@ extension WKUserContentController {
         }
     }
 
-    /// Push latest intercept rules to all tracked WKWebViews.
-    private static func pushRulesToWebViews() {
+    /// Push latest intercept rules to all tracked WKWebViews, and re-reconcile
+    /// the native User-Agent / cookie overrides at the same time.
+    ///
+    /// Internal, not private, because it is also the resume path's reconcile:
+    /// while the SDK is stopped both the rule snapshot inside the page and the
+    /// native overrides go stale (a rule deleted during the stop is still
+    /// applied), and nothing else re-states either.
+    static func pushRulesToWebViews() {
         guard SwiftyDebugRuntime.isActive else { return }
         let json = InterceptRuleStore.shared.rulesAsJSONString()
         let js = "if(window.__cd_updateInterceptRules)window.__cd_updateInterceptRules(\(json));"
@@ -390,8 +414,13 @@ extension WKUserContentController {
         // natively at the web-view level, since `customUserAgent` is not
         // per-request. We can only set one per web view, so the last-writing rule
         // wins, matching the "later rule overrides" composition used elsewhere.
+        // Sorted with the store's canonical total order, not `allRules()`'s
+        // creation-date order: "last wins" has to mean the position the user
+        // dragged the rule to, the way `cookieOverridePlan` below and
+        // `resolvedRule(forURL:)` on the native path already read it.
         var userAgent: String?
-        for rule in InterceptRuleStore.shared.allRules() where rule.isEnabled {
+        for rule in InterceptRuleStore.shared.allRules().sorted(by: InterceptRuleStore.precedes)
+        where rule.isEnabled {
             guard rule.matchMode == .host || rule.matchMode == .global else { continue }
             for pair in rule.headerOverrides where pair.key.lowercased() == "user-agent" {
                 userAgent = pair.value
@@ -402,16 +431,46 @@ extension WKUserContentController {
         // clobber an app-set customUserAgent: only overwrite/clear the UA if
         // SwiftyDebug was the one that set it (tracked via associated object).
         if let userAgent {
-            webView.customUserAgent = userAgent
+            // Claim ownership BEFORE writing: taking ownership is what stashes
+            // the value being replaced, and doing it afterwards stashed the
+            // SDK's own User-Agent as if it were the app's.
             setUserAgentOwnedBySDK(webView, true)
+            webView.customUserAgent = userAgent
         } else if isUserAgentOwnedBySDK(webView) {
-            // A rule that used to set the UA was removed — restore the default.
-            webView.customUserAgent = nil
-            setUserAgentOwnedBySDK(webView, false)
+            // A rule that used to set the UA was removed — give the app its own
+            // User-Agent back, which is not the same as WebKit's default.
+            restoreHostUserAgent(webView)
         }
         // else: no UA rule and we never set one — leave the app's UA untouched.
 
         applyCookieOverrides(to: webView.configuration.websiteDataStore.httpCookieStore)
+    }
+
+    /// Gives back everything the SDK wrote into host web views: the User-Agent
+    /// override and every cookie deposited for a `Cookie:` header rule.
+    ///
+    /// Deliberately NOT gated on `SwiftyDebugRuntime.isActive`, unlike every
+    /// other writer here — it runs as the gate closes, and a gated revert is no
+    /// revert at all. `applyNativeForbiddenHeaders` is the only other code that
+    /// can clear the UA and it refuses to run once stopped, so without this the
+    /// host app kept a debugger's User-Agent (and the SDK's cookies) on every
+    /// request until it was killed, which is exactly what a full stop promises
+    /// it will not do.
+    static func revertNativeForbiddenHeaders() {
+        // Cookies come back from the SDK's OWN record, not from the live web
+        // views. `NativeCookieOverrideStore` holds each cookie store strongly for
+        // exactly this reason — a rule has to be undoable after the web view that
+        // triggered it is gone — and reverting per tracked web view threw that
+        // away: with no web view alive at stop time the loop body never ran, and
+        // the cookies the SDK wrote into the PERSISTENT default store outlived
+        // the stop, the session and the process.
+        NativeCookieOverrideStore.shared.revertAll()
+
+        // The User-Agent genuinely does need a live web view: it is a property on
+        // the instance, not something stored elsewhere.
+        for webView in trackedWebViews.allObjects where isUserAgentOwnedBySDK(webView) {
+            restoreHostUserAgent(webView)
+        }
     }
 
     /// True while `webView.customUserAgent` is a value **this SDK** wrote.
@@ -425,7 +484,34 @@ extension WKUserContentController {
     }
 
     private static func setUserAgentOwnedBySDK(_ webView: WKWebView, _ owned: Bool) {
+        // Stash on the false -> true edge only. Taking ownership twice (a second
+        // rule replacing the first) must not overwrite the stash with the SDK's
+        // own value — that is how the app's UA would be lost for good.
+        if owned {
+            if !isUserAgentOwnedBySDK(webView) {
+                objc_setAssociatedObject(webView, sdkPriorUserAgentKey,
+                                         webView.customUserAgent.map { [$0] } ?? [String](),
+                                         .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            }
+        } else {
+            objc_setAssociatedObject(webView, sdkPriorUserAgentKey, nil,
+                                     .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        }
         objc_setAssociatedObject(webView, sdkSetUserAgentKey, owned, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    }
+
+    /// Puts back whatever `customUserAgent` the host app had before the SDK
+    /// took it over, and drops the SDK's claim on it.
+    ///
+    /// Assigning `nil` is NOT the same thing: nil means WebKit's default, so an
+    /// app that had set its own User-Agent — a version string, an app
+    /// identifier the backend routes on — silently lost it the first time a
+    /// rule was removed, and (now that `disable()` walks every tracked web view)
+    /// on every full stop as well.
+    private static func restoreHostUserAgent(_ webView: WKWebView) {
+        let prior = objc_getAssociatedObject(webView, sdkPriorUserAgentKey) as? [String]
+        webView.customUserAgent = prior?.first
+        setUserAgentOwnedBySDK(webView, false)
     }
 
     /// Reconciles the Cookie header overrides into `store`: writes exactly the
@@ -541,6 +627,9 @@ extension WKUserContentController {
     /// All currently-live tracked WKWebViews (most recently created first), for
     /// the Storage editor's web-view picker. (See Phase 2 webview storage.)
     static func liveWebViews() -> [WKWebView] {
+        // The storage picker is the other natural moment to collect: it asks for
+        // the live list precisely when some of them have just died.
+        sweepOrphanedInstrumentation()
         // allObjects order isn't guaranteed; return as-is (UI sorts/labels).
         return trackedWebViews.allObjects
     }
@@ -569,14 +658,108 @@ extension WKUserContentController {
                 webView.evaluateJavaScript(js, completionHandler: nil)
                 let controller = webView.configuration.userContentController
                 if enabled {
-                    guard controller.isSwiftyDebugInstrumented else { continue }
+                    // Instrument, rather than skip: a web view created while the
+                    // SDK was stopped has never been hooked, and this is the only
+                    // pass that reaches it. Its scripts run from its next
+                    // navigation; its handlers and rules apply at once.
+                    instrumentIfNeeded(controller)
                     installMessageHandlers(on: controller)
+                    applyNativeForbiddenHeaders(to: webView)
                 } else {
                     controller.swiftyDebugRemoveOwnHandlers()
                 }
             }
         }
         if Thread.isMainThread { run() } else { DispatchQueue.main.async(execute: run) }
+    }
+
+    /// Installs the SDK's handlers and user scripts on `controller`, once.
+    ///
+    /// A `WKWebViewConfiguration` copy shares its `userContentController`, so
+    /// child web views opened by `window.open` / `target="_blank"` — and any app
+    /// that reuses one configuration — arrive with a controller that is already
+    /// hooked. Injecting again would append another copy of every script (and
+    /// re-register every handler) on every web view, forever, which is what the
+    /// `isSwiftyDebugInstrumented` mark prevents.
+    ///
+    /// Shared by web-view creation and by the resume path, which reaches web
+    /// views created while the SDK was stopped and therefore never hooked at
+    /// all. A view instrumented on resume needs one navigation (or a `reload()`)
+    /// before the `atDocumentStart` scripts run, but its handlers and rules
+    /// take effect immediately.
+    static func instrumentIfNeeded(_ controller: WKUserContentController) {
+        instrumentedControllers.add(controller)
+
+        // HANDLERS FIRST, and unconditionally — `swiftyDebugAddHandler` is
+        // already idempotent per name.
+        //
+        // Handlers and scripts have different lifetimes: a handler can be
+        // removed (and `sweepOrphanedInstrumentation()` removes them once no
+        // live web view uses this controller), while WebKit offers no way to
+        // remove ONE user script, so scripts must be added exactly once and then
+        // left alone. Gating both on `isSwiftyDebugInstrumented` meant a
+        // controller whose handlers had been swept could never get them back:
+        // a web view created later from the same configuration was captured by
+        // nothing. (See WEBVIEW-LEAK.)
+        //
+        // The shims are *weak* and point at the shared handler, so registering
+        // never keeps a per-web-view handler — or the host VC behind it — alive.
+        installMessageHandlers(on: controller)
+
+        guard !controller.isSwiftyDebugInstrumented else { return }
+        controller.isSwiftyDebugInstrumented = true
+
+        for consoleFunction in WebViewMessageChannel.consoleFunctions {
+            controller.addUserScript(WKUserScript(
+                source: WebViewInjectedScript.consoleHook(consoleFunction: consoleFunction),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true))
+        }
+
+        controller.addUserScript(WKUserScript(
+            source: WebViewInjectedScript.networkCapture,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false))
+
+        // Seed the rules so they are available in the very first line of the
+        // very first page, before the async refresh (see
+        // `WebViewMessageChannel.rulesRequest`) can come back.
+        let rulesJSON = InterceptRuleStore.shared.rulesAsJSONString()
+        controller.addUserScript(WKUserScript(
+            source: "if(window.__cd_updateInterceptRules)window.__cd_updateInterceptRules(\(rulesJSON));",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false))
+    }
+
+    /// Every content controller the SDK has registered handlers on, held weakly.
+    ///
+    /// Weak on purpose: this must never be the reason a controller survives. It
+    /// exists so `sweepOrphanedInstrumentation()` can find controllers whose web
+    /// views are gone and give WebKit back the last reference it is holding.
+    static let instrumentedControllers = NSHashTable<WKUserContentController>.weakObjects()
+
+    /// Removes the SDK's handlers from any content controller no live web view
+    /// is using any more.
+    ///
+    /// Registering a script message handler puts the controller in WebKit's own
+    /// message registry, and that reference outlives the `WKWebView` and the
+    /// `WKWebViewConfiguration`. So a host app that creates a web view per screen
+    /// accumulated one immortal `WKUserContentController` per configuration —
+    /// each still carrying the SDK's ~30 KB of injected scripts — for the life of
+    /// the process. None of that is retained when the SDK is not linked, which
+    /// makes it the SDK breaking the app it is meant to be observing.
+    ///
+    /// Only names the SDK recorded are removed, so an app's own bridge is never
+    /// touched. Main-thread only, like everything else here.
+    static func sweepOrphanedInstrumentation() {
+        let live = Set(trackedWebViews.allObjects.map {
+            ObjectIdentifier($0.configuration.userContentController)
+        })
+        for controller in instrumentedControllers.allObjects {
+            guard !live.contains(ObjectIdentifier(controller)) else { continue }
+            controller.swiftyDebugRemoveOwnHandlers()
+            instrumentedControllers.remove(controller)
+        }
     }
 
     /// Registers every channel the SDK owns on `controller`, each at most once.
@@ -810,52 +993,26 @@ extension WKWebView {
     @objc func replaced_init(frame: CGRect, configuration: WKWebViewConfiguration) -> WKWebView {
 
         // If the SDK is fully stopped, inject nothing — behave like a plain
-        // WKWebView so there is zero SwiftyDebug involvement.
+        // WKWebView so there is zero SwiftyDebug involvement. The view is still
+        // remembered: the table is weak and holding a reference does nothing on
+        // its own, and it is the ONLY way a later resume can find this web view
+        // to instrument it, push rules to it, or list it in the storage picker.
+        // A view created during a stop used to stay invisible and uncaptured for
+        // the rest of its life.
         guard SwiftyDebugRuntime.isActive else {
-            return replaced_init(frame: frame, configuration: configuration)
+            let webView = replaced_init(frame: frame, configuration: configuration)
+            WKWebViewSwizzling.trackedWebViews.add(webView)
+            return webView
         }
 
-        // Instrument the content controller once. A `WKWebViewConfiguration`
-        // copy shares its `userContentController`, so child web views opened by
-        // `window.open` / `target="_blank"` — and any app that reuses one
-        // configuration — arrive here with a controller that is already hooked.
-        // Injecting again would append another copy of every script (and
-        // re-register every handler) on every web view, forever.
-        let controller = configuration.userContentController
-        if !controller.isSwiftyDebugInstrumented {
-            controller.isSwiftyDebugInstrumented = true
-
-            // Register *weak* shims pointing at the shared handler. The content
-            // controller strongly retains whatever is registered; a weak shim
-            // therefore never keeps a per-web-view handler (or the VC behind it)
-            // alive, which is the WKWebView leak fix. (See WEBVIEW-LEAK.)
-            WKWebViewSwizzling.installMessageHandlers(on: controller)
-
-            for consoleFunction in WebViewMessageChannel.consoleFunctions {
-                controller.addUserScript(WKUserScript(
-                    source: WebViewInjectedScript.consoleHook(consoleFunction: consoleFunction),
-                    injectionTime: .atDocumentStart,
-                    forMainFrameOnly: true))
-            }
-
-            controller.addUserScript(WKUserScript(
-                source: WebViewInjectedScript.networkCapture,
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false))
-
-            // Seed the rules so they are available in the very first line of the
-            // very first page, before the async refresh (see
-            // `WebViewMessageChannel.rulesRequest`) can come back.
-            let rulesJSON = InterceptRuleStore.shared.rulesAsJSONString()
-            controller.addUserScript(WKUserScript(
-                source: "if(window.__cd_updateInterceptRules)window.__cd_updateInterceptRules(\(rulesJSON));",
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false))
-        }
+        WKWebViewSwizzling.instrumentIfNeeded(configuration.userContentController)
 
         // Call original init (swizzled)
         let webView = replaced_init(frame: frame, configuration: configuration)
         WKWebViewSwizzling.trackedWebViews.add(webView)
+        // Creating a web view is exactly when a previous one has usually gone, and
+        // the accumulating case — a web view per screen — is the one that matters.
+        WKWebViewSwizzling.sweepOrphanedInstrumentation()
         // Apply any User-Agent / Cookie rules natively (JS can't set these).
         WKWebViewSwizzling.applyNativeForbiddenHeaders(to: webView)
         return webView
@@ -939,6 +1096,18 @@ enum WebViewInjectedScript {
         &&window.webkit.messageHandlers.\(WebViewMessageChannel.networkCapture));}catch(e){return false;}}
         function cdOn(){return window.__cd_enabled!==false&&chanUp();}
         function trunc(s){if(typeof s==='string'&&s.length>MAX_BODY)return s.substring(0,MAX_BODY);return s;}
+        /* What goes in the LOG for a request body. `typeof body==='string'` on
+           its own threw away every other legal body — a form submitted as
+           URLSearchParams, a file upload as FormData, a Blob or a typed array —
+           and the request detail screen showed an empty body for a POST that
+           plainly had one. Log-only: no caller's argument is read, replaced or
+           consumed here, so what is actually sent is untouched. */
+        function logBody(b){if(b==null)return null;if(typeof b==='string')return trunc(b);
+        try{if(typeof URLSearchParams!=='undefined'&&b instanceof URLSearchParams)return trunc(b.toString());}catch(e){}
+        try{if(typeof FormData!=='undefined'&&b instanceof FormData){var p=[];b.forEach(function(v,k){p.push(k+'='+(typeof v==='string'?v:'[file '+((v&&v.name)||'')+']'));});return trunc(p.join('&'));}}catch(e){}
+        try{if(typeof Blob!=='undefined'&&b instanceof Blob)return '[blob '+b.size+' bytes]';}catch(e){}
+        try{if(b.byteLength!==undefined)return '[binary '+b.byteLength+' bytes]';}catch(e){}
+        return null;}
         function post(d){if(!cdOn())return;try{window.webkit.messageHandlers.\(WebViewMessageChannel.networkCapture).postMessage(JSON.stringify(d));}catch(e){}}
         function parseH(raw){var h={};if(!raw)return h;var lines=raw.trim().split('\\r\\n');
         for(var i=0;i<lines.length;i++){var idx=lines[i].indexOf(':');
@@ -1115,16 +1284,34 @@ enum WebViewInjectedScript {
         if(this._cd){
         var rule=this._cd.rule;
         if(rule){
-        if(rule.isBlocked){var d=this._cd;d.body=(typeof body==='string')?trunc(body):null;
+        if(rule.isBlocked){var d=this._cd;d.body=logBody(body);
         d.requestHeaders=d.headers;d.status=0;d.statusText='Blocked by SwiftyDebug';d.responseHeaders={};d.responseBody=null;
-        d.endTime=Date.now();d.type='xhr';d.intercepted=true;post(d);failBlocked(this);return;}
+        d.endTime=Date.now();d.type='xhr';d.intercepted=true;d.posted=true;post(d);failBlocked(this);return;}
         for(var i=0;i<rule.headerOverrides.length;i++){var ho=rule.headerOverrides[i];
         this._cd.headers[ho.key]=ho.value;origSetH.call(this,ho.key,ho.value);}
         this._cd.intercepted=true;}
-        this._cd.body=(typeof body==='string')?trunc(body):null;
-        var xhr=this;
+        this._cd.body=logBody(body);
+        var xhr=this,d0=this._cd;
+        /* `_cd.posted` is what makes this ONE row per request. `addEventListener`
+           only de-duplicates identical function references, so a page that reuses
+           one XMLHttpRequest — the standard polling pattern — accumulated a fresh
+           listener per send(), and every one of them read the CURRENT `_cd` and
+           posted it again: N identical rows, each with its own body file on disk,
+           growing without bound. `open()` builds a new `_cd` per request, so the
+           flag resets exactly once per request, and it also stops the synthetic
+           `loadend` from `failBlocked` re-posting a blocked request.
+
+           The context is bound here (`d0`) rather than re-read at fire time. Per
+           the XHR spec, calling open() on a request that is still in flight
+           ABORTS it, and that abort fires `loadend` from inside open() — after
+           the new `this._cd` has been installed. A listener left over from the
+           previous send() therefore saw the NEXT request's context, posted it
+           with status 0, and set `posted` on it; when that request really
+           finished, both listeners skipped and the row was lost outright. With
+           `d0`, a stale listener is inert: only the listener whose own request
+           is finishing has a matching context. */
         this.addEventListener('loadend',function(){
-        var d=xhr._cd;if(!d)return;
+        var d=xhr._cd;if(!d||d!==d0||d.posted)return;d.posted=true;
         d.url=xhr.responseURL||d.url;
         d.status=xhr.status;d.statusText=xhr.statusText||'';
         d.responseHeaders=parseH(xhr.getAllResponseHeaders());d.endTime=Date.now();
@@ -1162,9 +1349,30 @@ enum WebViewInjectedScript {
         window.fetch=function(input,init){
         var ctx=this||window;
         var url,method,headers={},body=null,reqObj=null;
+        /* A Request carries its body on the object, not in `init`, so every
+           `fetch(new Request(url,{method:'POST',body:…}))` logged nothing at all.
+           Drained off a CLONE and held here rather than returned: the caller's
+           Request is never touched and the call is never delayed — an in-memory
+           clone resolves long before the response does, so this is populated by
+           the time the log is posted. */
+        var bodyRef={log:null};
         if(typeof input==='string'){url=input;}
         else if(typeof Request!=='undefined'&&input instanceof Request){reqObj=input;url=input.url;method=input.method;
-        try{input.headers.forEach(function(v,k){headers[k]=v;});}catch(e){}}
+        try{input.headers.forEach(function(v,k){headers[k]=v;});}catch(e){}
+        /* Gated and TEXT-ONLY.
+           Ungated, this cloned and fully drained the body of every fetch(Request)
+           in the host app even after a full stop, whose contract is "as if the
+           SDK were never included". And `readBody` falls back to arrayBuffer()
+           for anything non-textual, so a multipart file upload was read entirely
+           into the WebContent process — concurrently with WebKit streaming the
+           same bytes to the network — and then thrown away, because only a
+           textual body produces a log. That is a WebContent jetsam mid-upload,
+           for no debugging benefit. The rule-matched path further down still
+           reads binary bodies, because there it has to carry them across to a
+           rebuilt Request. */
+        try{if(cdOn()){var _ct='';try{_ct=input.headers.get('content-type')||'';}catch(e){}
+        if(/json|text|xml|urlencoded|javascript|graphql/i.test(_ct))
+        readBody(input.clone()).then(function(r){if(r.log)bodyRef.log=r.log;},function(){});}}catch(e){}}
         else{url=String(input);}
         if(init){
         if(init.method)method=init.method;
@@ -1172,7 +1380,7 @@ enum WebViewInjectedScript {
         if(init.headers instanceof Headers){try{init.headers.forEach(function(v,k){headers[k]=v;});}catch(e){}}
         else if(typeof init.headers==='object'){var ks=Object.keys(init.headers);
         for(var i=0;i<ks.length;i++)headers[ks[i]]=init.headers[ks[i]];}}
-        if(init.body&&typeof init.body==='string')body=trunc(init.body);}
+        if(init.body!=null)body=logBody(init.body);}
         method=method||'GET';
         var fullUrl=resolveUrl(url);
         /* Same gate as the XHR hook: stopped means stopped. */
@@ -1180,18 +1388,18 @@ enum WebViewInjectedScript {
         /* One place that actually calls through and logs, so every path below —
            untouched, rewritten, or rebuilt-after-reading-the-body — reports the
            same way. */
-        function send(sendInput,sendInit,logUrl,logBody,intercepted){
+        function send(sendInput,sendInit,logUrl,logBody0,intercepted){
         var startTime=Date.now();
         return origFetch.call(ctx,sendInput,sendInit).then(function(response){
         var rh={};try{response.headers.forEach(function(v,k){rh[k]=v;});}catch(e){}
         try{response.clone().text().then(function(text){
         post({type:'fetch',url:response.url||logUrl,method:method.toUpperCase(),
-        requestHeaders:headers,body:logBody,status:response.status,
+        requestHeaders:headers,body:(logBody0!=null?logBody0:bodyRef.log),status:response.status,
         statusText:response.statusText||'',responseHeaders:rh,
         responseBody:trunc(text),startTime:startTime,endTime:Date.now(),intercepted:intercepted});}).catch(function(){});}catch(e){}
         return response;}).catch(function(err){
         post({type:'fetch',url:logUrl,method:method.toUpperCase(),
-        requestHeaders:headers,body:logBody,status:0,
+        requestHeaders:headers,body:(logBody0!=null?logBody0:bodyRef.log),status:0,
         statusText:err.message||'Network Error',responseHeaders:{},
         responseBody:null,startTime:startTime,endTime:Date.now(),intercepted:intercepted});
         throw err;});}

@@ -120,20 +120,42 @@ final class ConsoleLogDB {
             -1, &fetchRangeStmt, nil)
         sqlite3_prepare_v2(db,
             "SELECT COUNT(*) FROM entries", -1, &readCountStmt, nil)
+        // Every LIKE carries ESCAPE '\\' because the bound pattern comes from
+        // escapedLike(), which backslash-escapes the user's % and _ so a search
+        // for "access_token" cannot also match "access-token". Without the
+        // clause those backslashes would be matched as literal characters.
         sqlite3_prepare_v2(db,
-            "SELECT COUNT(*) FROM entries WHERE text LIKE ?",
+            "SELECT COUNT(*) FROM entries WHERE text LIKE ? ESCAPE '\\'",
             -1, &searchCountStmt, nil)
         sqlite3_prepare_v2(db,
-            "SELECT rowid, text, color FROM entries WHERE text LIKE ? ORDER BY rowid LIMIT ? OFFSET ?",
+            "SELECT rowid, text, color FROM entries WHERE text LIKE ? ESCAPE '\\' ORDER BY rowid LIMIT ? OFFSET ?",
             -1, &searchRangeStmt, nil)
 
         // Match navigation (read — main thread)
         sqlite3_prepare_v2(db,
-            "SELECT rowid FROM entries WHERE text LIKE ? ORDER BY rowid LIMIT 1 OFFSET ?",
+            "SELECT rowid FROM entries WHERE text LIKE ? ESCAPE '\\' ORDER BY rowid LIMIT 1 OFFSET ?",
             -1, &matchRowidStmt, nil)
         sqlite3_prepare_v2(db,
             "SELECT COUNT(*) FROM entries WHERE rowid < ?",
             -1, &displayRowStmt, nil)
+    }
+
+    // MARK: - Search pattern escaping
+
+    /// Wraps `q` in `%…%` for LIKE, neutralising the wildcards it may contain.
+    ///
+    /// In SQL LIKE, `_` matches any single character and `%` any run, so a raw
+    /// `"%\(query)%"` turned the user's literal text into a pattern: searching
+    /// `access_token` also matched `access-token`, and searching `%` matched
+    /// every row. The console highlighter (ConsoleCell.applySearchHighlight)
+    /// matches literally, so the count and navigation disagreed with what was
+    /// highlighted on screen. The backslash must be doubled FIRST, otherwise
+    /// the escapes added below would themselves get escaped.
+    /// Paired with the `ESCAPE '\\'` clause on every LIKE statement.
+    static func escapedLike(_ q: String) -> String {
+        "%" + q.replacingOccurrences(of: "\\", with: "\\\\")
+               .replacingOccurrences(of: "%", with: "\\%")
+               .replacingOccurrences(of: "_", with: "\\_") + "%"
     }
 
     // MARK: - Write methods (dispatched to writeQueue)
@@ -163,6 +185,13 @@ final class ConsoleLogDB {
             sqlite3_reset(self.writeCountStmt)
             sqlite3_step(self.writeCountStmt)
             let newCount = Int(sqlite3_column_int64(self.writeCountStmt, 0))
+            // Reset immediately. A statement left parked on SQLITE_ROW holds a
+            // read transaction open on this connection, and VACUUM refuses to
+            // run while one is — so "Clear Logs" returned SQLITE_ERROR and
+            // reclaimed nothing. Resetting only the READ statements was half the
+            // fix; this one is stepped on the write queue and was left until the
+            // next insert.
+            sqlite3_reset(self.writeCountStmt)
 
             DispatchQueue.main.async { [weak self] in
                 self?.cachedTotalCount = newCount
@@ -192,7 +221,14 @@ final class ConsoleLogDB {
     func readCount() -> Int {
         sqlite3_reset(readCountStmt)
         sqlite3_step(readCountStmt)
-        return Int(sqlite3_column_int64(readCountStmt, 0))
+        let count = Int(sqlite3_column_int64(readCountStmt, 0))
+        // A statement stepped to SQLITE_ROW and left there keeps a read
+        // transaction open on the shared connection: VACUUM then fails with
+        // "SQL statements in progress" and the WAL can never be checkpointed,
+        // so console.sqlite-wal grows without bound. This one is stepped once
+        // from init and never again, so it must be reset before returning.
+        sqlite3_reset(readCountStmt)
+        return count
     }
 
     func fetchRange(offset: Int, limit: Int) -> [(rowid: Int64, text: String, colorCode: Int)] {
@@ -216,17 +252,21 @@ final class ConsoleLogDB {
 
     func searchCount(query: String) -> Int {
         sqlite3_reset(searchCountStmt)
-        let likePattern = "%\(query)%"
+        let likePattern = Self.escapedLike(query)
         _ = likePattern.withCString { cStr in
             sqlite3_bind_text(searchCountStmt, 1, cStr, -1, Self.SQLITE_TRANSIENT)
         }
         sqlite3_step(searchCountStmt)
-        return Int(sqlite3_column_int64(searchCountStmt, 0))
+        let count = Int(sqlite3_column_int64(searchCountStmt, 0))
+        // Reset before returning — a statement parked on SQLITE_ROW holds a
+        // read transaction open and blocks VACUUM/WAL checkpointing.
+        sqlite3_reset(searchCountStmt)
+        return count
     }
 
     func searchRange(query: String, offset: Int, limit: Int) -> [(rowid: Int64, text: String, colorCode: Int)] {
         sqlite3_reset(searchRangeStmt)
-        let likePattern = "%\(query)%"
+        let likePattern = Self.escapedLike(query)
         _ = likePattern.withCString { cStr in
             sqlite3_bind_text(searchRangeStmt, 1, cStr, -1, Self.SQLITE_TRANSIENT)
         }
@@ -252,13 +292,20 @@ final class ConsoleLogDB {
     /// Returns the rowid of the Nth matching entry (0-based matchIndex).
     func matchRowid(query: String, matchIndex: Int) -> Int64? {
         sqlite3_reset(matchRowidStmt)
-        let likePattern = "%\(query)%"
+        let likePattern = Self.escapedLike(query)
         _ = likePattern.withCString { cStr in
             sqlite3_bind_text(matchRowidStmt, 1, cStr, -1, Self.SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(matchRowidStmt, 2, Int64(matchIndex))
-        guard sqlite3_step(matchRowidStmt) == SQLITE_ROW else { return nil }
-        return sqlite3_column_int64(matchRowidStmt, 0)
+        // Both exits reset: a statement left on SQLITE_ROW holds a read
+        // transaction open and blocks VACUUM/WAL checkpointing.
+        guard sqlite3_step(matchRowidStmt) == SQLITE_ROW else {
+            sqlite3_reset(matchRowidStmt)
+            return nil
+        }
+        let rowid = sqlite3_column_int64(matchRowidStmt, 0)
+        sqlite3_reset(matchRowidStmt)
+        return rowid
     }
 
     /// Returns the 0-based display row index for a given rowid.
@@ -266,7 +313,11 @@ final class ConsoleLogDB {
         sqlite3_reset(displayRowStmt)
         sqlite3_bind_int64(displayRowStmt, 1, rowid)
         sqlite3_step(displayRowStmt)
-        return Int(sqlite3_column_int64(displayRowStmt, 0))
+        let row = Int(sqlite3_column_int64(displayRowStmt, 0))
+        // Reset before returning — a statement parked on SQLITE_ROW holds a
+        // read transaction open and blocks VACUUM/WAL checkpointing.
+        sqlite3_reset(displayRowStmt)
+        return row
     }
 
     // MARK: - Cleanup

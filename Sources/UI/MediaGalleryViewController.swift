@@ -442,19 +442,37 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
         view.bringSubviewToFront(counterLabel)
     }
 
-    private var didInitialScroll = false
+    /// The page width the content offset was last anchored to. Every page lives
+    /// at `pageWidth * index`, so an offset computed for the old width points at
+    /// a page that no longer exists there after a rotation or a split-view
+    /// resize — the user was left on a black screen with the counter still
+    /// naming the page they cannot see.
+    private var lastLaidOutWidth: CGFloat = 0
 
     private func layoutPages() {
+        // Read before any geometry is touched: re-anchoring drives
+        // `scrollViewDidScroll`, which writes `startIndex`, and a transient
+        // clamp against the old contentSize would otherwise move the user.
+        let targetIndex = startIndex
         let pageWidth = view.bounds.width
         pageScroll.frame = view.bounds
         pageScroll.contentSize = CGSize(width: pageWidth * CGFloat(imageURLs.count),
                                         height: view.bounds.height)
 
         // Before building the window, so the window is centred on the page the
-        // caller asked for rather than on page 0.
-        if !didInitialScroll, pageWidth > 0 {
-            didInitialScroll = true
-            pageScroll.setContentOffset(CGPoint(x: pageWidth * CGFloat(startIndex), y: 0), animated: false)
+        // caller asked for rather than on page 0 — and re-anchored on every
+        // width change, since the offset is in points of the *old* width.
+        if pageWidth > 0, pageWidth != lastLaidOutWidth {
+            lastLaidOutWidth = pageWidth
+            startIndex = targetIndex
+            pageScroll.setContentOffset(CGPoint(x: pageWidth * CGFloat(targetIndex), y: 0), animated: false)
+            // Shrinking `contentSize` makes UIScrollView clamp the offset, which
+            // fires `scrollViewDidScroll` synchronously and leaves the counter
+            // reading the clamped page. Restoring `startIndex` above does not
+            // touch the label, and the offset set here is already correct so the
+            // delegate short-circuits — so the pill has to be refreshed here or
+            // it keeps showing "10 / 10" over page 6 until the next swipe.
+            updateCounter()
         }
 
         // A layout pass means the geometry changed (rotation, safe area), so the
@@ -501,8 +519,12 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
         guard imageURLs.indices.contains(index) else { return zoom }
         let maxPixel = Self.pageMaxPixel(forScreenSize: UIScreen.main.bounds.size,
                                          scale: UIScreen.main.scale)
+        // A full-screen page is one of the two surfaces that may animate: a
+        // captured GIF plays here, as it does in the request detail, instead of
+        // showing a motionless first frame. Grid thumbnails stay static.
         tokens[index] = ImageLoader.shared.loadImage(urlString: imageURLs[index],
-                                                     maxPixel: maxPixel) { [weak iv] image in
+                                                     maxPixel: maxPixel,
+                                                     animated: true) { [weak iv] image in
             iv?.image = image
         }
         return zoom

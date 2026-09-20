@@ -190,6 +190,18 @@ final class JSONDocument {
         (try? text(pretty: true, sortKeys: sortKeys)) ?? ""
     }
 
+    /// Pretty-printed text for the sub-tree at `path`, written through THIS
+    /// document's source index so the key order and number spelling are the ones
+    /// on screen. Re-wrapping the sub-value in a fresh `JSONDocument` has no
+    /// index at all, so it alphabetises the keys and re-spells `1250.00` as
+    /// `1250` — a clipboard that contradicts the body it was copied from.
+    /// Empty when the path does not resolve or the sub-tree cannot be written.
+    func prettyText(at path: JSONPath) -> String {
+        guard let value = value(at: path) else { return "" }
+        var writer = JSONTextWriter(pretty: true, sortKeys: false, index: sourceIndex, rootPath: path)
+        return (try? writer.string(from: value)) ?? ""
+    }
+
     func minifiedText() -> String {
         (try? text(pretty: false, sortKeys: false)) ?? ""
     }
@@ -239,6 +251,14 @@ final class JSONDocument {
         value(at: path).map { JSONValueKind.of($0) }
     }
 
+    /// The order the writer will emit this object's keys in. The tree editor
+    /// lists its rows in it, because sorting the rows alphabetically described
+    /// an object shape the save never produced — and hid the fact that an added
+    /// key lands at the END of the object, wherever the alphabet had put its row.
+    func orderedKeys(at path: JSONPath, of dict: [String: Any]) -> [String] {
+        JSONSourceIndex.orderedKeys(of: dict, recorded: sourceIndex.keys(at: path))
+    }
+
     // MARK: - Mutations
 
     /// Replaces the value at `path`. An empty path replaces the whole document.
@@ -255,6 +275,24 @@ final class JSONDocument {
             return false
         }
         root = updated
+        didChange()
+        return true
+    }
+
+    /// Replaces the whole document with a freshly parsed one, adopting ITS key
+    /// order and number spelling.
+    ///
+    /// Raw mode and Paste are the only places a user can reorder keys or change
+    /// how a number is spelled, and both arrive here as a parsed document.
+    /// Taking only its `root` left the ORIGINAL body's source index in place, so
+    /// the writer re-imposed the old key order and re-emitted the old literals
+    /// over the new tree: retyping `1.50` as `1.5` in Raw, or pasting a payload
+    /// wholesale, silently did nothing at all.
+    @discardableResult
+    func replaceAll(with other: JSONDocument) -> Bool {
+        pushUndo()
+        root = other.root
+        sourceIndex = other.sourceIndex
         didChange()
         return true
     }
@@ -817,6 +855,30 @@ struct JSONSourceIndex {
         guard var keys = keyOrder[source], let slot = keys.firstIndex(of: oldKey) else { return }
         keys[slot] = newKey
         keyOrder[source] = keys
+
+        // Every record below the renamed node is keyed by a path containing
+        // `.key(oldKey)`, and `sourcePath(for:)` only ever translates `.index`
+        // components — so unless the records move too, every lookup under the
+        // renamed key misses and the writer falls back to `keys.sorted()` and
+        // shortest round-trip numbers. Renaming `data` alphabetised and
+        // re-spelled a whole subtree the user never touched. `elementOrigins`
+        // has to move with them, or renaming an ancestor of an array that was
+        // reordered or had an element deleted re-introduces exactly the
+        // alphabetisation those origins exist to prevent.
+        let old = source + [.key(oldKey)]
+        let new = source + [.key(newKey)]
+        for (recordPath, value) in numberLiterals where recordPath.starts(with: old) {
+            numberLiterals[new + recordPath[old.count...]] = value
+            numberLiterals[recordPath] = nil
+        }
+        for (recordPath, value) in keyOrder where recordPath.starts(with: old) {
+            keyOrder[new + recordPath[old.count...]] = value
+            keyOrder[recordPath] = nil
+        }
+        for (recordPath, value) in elementOrigins where recordPath.starts(with: old) {
+            elementOrigins[new + recordPath[old.count...]] = value
+            elementOrigins[recordPath] = nil
+        }
     }
 
     mutating func appendKey(_ key: String, toObjectAt path: JSONPath) {
@@ -839,6 +901,28 @@ struct JSONSourceIndex {
     /// The author's original spelling for the number now at `path`, same rule.
     func literal(at path: JSONPath) -> String? {
         numberLiterals[sourcePath(for: path)]
+    }
+
+    /// Source order first (for the keys still present), then anything new,
+    /// sorted so the output is at least deterministic. Foundation's hash order
+    /// is neither stable across runs nor recognisable to whoever wrote the JSON.
+    ///
+    /// Shared with the tree editor rather than left inside the writer: the rows
+    /// on screen and the keys in the saved payload have to be in the same order,
+    /// or the editor describes an object shape the user is never going to get —
+    /// and the two cannot drift if there is only one rule.
+    static func orderedKeys(of dict: [String: Any], recorded: [String]?) -> [String] {
+        guard let recorded else { return dict.keys.sorted() }
+        var used = Set<String>()
+        var out: [String] = []
+        out.reserveCapacity(dict.count)
+        for key in recorded where dict.keys.contains(key) && used.insert(key).inserted {
+            out.append(key)
+        }
+        if out.count < dict.count {
+            for key in dict.keys.sorted() where !used.contains(key) { out.append(key) }
+        }
+        return out
     }
 
     func sourcePath(for path: JSONPath) -> JSONPath {
@@ -1099,10 +1183,15 @@ private struct JSONTextWriter {
 
     private var path: JSONPath = []
 
-    init(pretty: Bool, sortKeys: Bool, index: JSONSourceIndex) {
+    /// `rootPath` is where in the document the value being written actually
+    /// lives, so a sub-tree can be printed through the whole document's index.
+    /// It is the CURRENT path, not the source path: `index.keys(at:)` and
+    /// `index.literal(at:)` translate to source coordinates themselves.
+    init(pretty: Bool, sortKeys: Bool, index: JSONSourceIndex, rootPath: JSONPath = []) {
         self.pretty = pretty
         self.sortKeys = sortKeys
         self.index = index
+        self.path = rootPath
     }
 
     mutating func string(from root: Any) throws -> String {
@@ -1166,22 +1255,11 @@ private struct JSONTextWriter {
         out += String(repeating: "  ", count: level)
     }
 
-    /// Source order first (for the keys still present), then anything new,
-    /// sorted so the output is at least deterministic. Foundation's hash order
-    /// is neither stable across runs nor recognisable to whoever wrote the JSON.
+    /// The one ordering rule, shared with the tree editor so the rows on screen
+    /// and the keys in the written text can never disagree.
     private func orderedKeys(of dict: [String: Any]) -> [String] {
         if sortKeys { return dict.keys.sorted() }
-        guard let recorded = index.keys(at: path) else { return dict.keys.sorted() }
-        var used = Set<String>()
-        var out: [String] = []
-        out.reserveCapacity(dict.count)
-        for key in recorded where dict.keys.contains(key) && used.insert(key).inserted {
-            out.append(key)
-        }
-        if out.count < dict.count {
-            for key in dict.keys.sorted() where !used.contains(key) { out.append(key) }
-        }
-        return out
+        return JSONSourceIndex.orderedKeys(of: dict, recorded: index.keys(at: path))
     }
 
     // MARK: Scalars

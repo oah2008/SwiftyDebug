@@ -24,7 +24,17 @@ struct NetworkDetailSection {
     /// IS the raw content. (Property observers do not run during `init`, so the
     /// initialiser's own transformed assignment cannot clobber it.) (See COPY.)
     var content: String? {
-        didSet { rawContent = content }
+        didSet {
+            rawContent = content
+            // The truncation threshold has to follow the value, not the
+            // initialiser argument. Every section built as `init(content: nil)`
+            // and filled in afterwards (REQUEST PARAMETERS, JWT, ERROR DETAILS,
+            // REWRITES) kept the `false` that `init` computed from `nil`, so a
+            // 200 KB query string was syntax-highlighted and laid out whole in
+            // one cell with no "Show Full" way out of it. (Property observers do
+            // not run during `init`, so `init` must still compute it too.)
+            mustInPreview = (content?.count ?? 0) > 10000
+        }
     }
     var url: String?
     var image: UIImage?
@@ -36,7 +46,6 @@ struct NetworkDetailSection {
     var requestData: Data?
     var responseData: Data?
     var httpModel: NetworkTransaction?
-    var heigth:Double = 0
     var mustInPreview:Bool = false
     /// Show "Preview JSON" button for this section
     var showPreview: Bool = false
@@ -60,7 +69,6 @@ struct NetworkDetailSection {
         self.image = image
         self.httpModel = httpModel
 
-        mustInPreview = (content?.count ?? 0 > 10000)
-        self.heigth = mustInPreview ? 100 : Double((self.content as NSString?)?.heightWithFont(UIFont.systemFont(ofSize: 13), constraintToWidth: (UIScreen.main.bounds.size.width - 30)) ?? 0.0)
+        mustInPreview = (content?.count ?? 0) > 10000
     }
 }

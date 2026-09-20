@@ -357,7 +357,13 @@ class InterceptRuleStore {
         var incoming = rule.canonicalized()
         let key = incoming.storageKey
 
-        let previousKey = removeLocked(id: incoming.id)
+        // WITHOUT re-packing the survivors: this is a remove-then-re-insert of
+        // the SAME rule, so the siblings' `order` must mean exactly what it
+        // meant before the edit. Re-packing them to 0..n-1 here silently moved
+        // every other rule while the incoming one came back with the caller's
+        // old number, so toggling a rule's enable switch changed which rule's
+        // header reached the wire.
+        let previousKey = removeLocked(id: incoming.id, repackOrders: false)
 
         var list = rules[key] ?? []
         if previousKey == key {
@@ -367,8 +373,11 @@ class InterceptRuleStore {
             list.sort(by: Self.precedes)
         } else {
             // New bucket (new rule, or a re-keyed one): it goes last, and its old
-            // `order` meant a position in a bucket it no longer lives in.
-            incoming.order = list.count
+            // `order` meant a position in a bucket it no longer lives in. "Last"
+            // is one past the highest order present, not `list.count`: a bucket
+            // may hold gaps (nothing re-packs it any more) and cross-bucket
+            // positions written by `reorder(ids:for:)`.
+            incoming.order = (list.map(\.order).max() ?? -1) + 1
             list.append(incoming)
         }
         rules[key] = list
@@ -396,14 +405,21 @@ class InterceptRuleStore {
     /// Caller must already hold the lock and is responsible for
     /// `rebuildIndexes()` / `saveToDisk()` — this is the shared half of
     /// `remove(id:)` and the re-key step in `addOrUpdate`.
+    ///
+    /// - Parameter repackOrders: pass `false` when the rule is about to be put
+    ///   straight back (the re-key step in `addOrUpdate`). Re-packing there
+    ///   rewrites the position of every rule the user did not touch, while the
+    ///   incoming rule keeps the number the caller cached — which is how an
+    ///   enable-switch toggle ended up reordering its siblings and changing
+    ///   whose header override reached the wire.
     @discardableResult
-    private func removeLocked(id: String) -> String? {
+    private func removeLocked(id: String, repackOrders: Bool = true) -> String? {
         var foundKey: String?
         for (key, var list) in rules {
             guard list.contains(where: { $0.id == id }) else { continue }
             foundKey = key
             list.removeAll { $0.id == id }
-            for i in list.indices { list[i].order = i }
+            if repackOrders { for i in list.indices { list[i].order = i } }
             if list.isEmpty {
                 rules.removeValue(forKey: key)
             } else {
@@ -549,7 +565,14 @@ class InterceptRuleStore {
         objc_sync_enter(self)
         defer { objc_sync_exit(self) }
 
-        let enabled = rules.values.flatMap { $0 }.filter { $0.isEnabled }
+        // Sorted with the SAME total order the native path resolves with.
+        // `rules.values` enumerates in whatever sequence the dictionary's
+        // per-launch hash seed produces, and the injected matcher sorts by
+        // `order` alone with a stable sort — so two rules sharing an `order`
+        // (a global and an endpoint rule both start at 0) composed in a
+        // different sequence inside a web view on every launch, and disagreed
+        // with `resolvedRule(forURL:)`.
+        let enabled = rules.values.flatMap { $0 }.filter { $0.isEnabled }.sorted(by: Self.precedes)
         var jsRules: [[String: Any]] = []
         for rule in enabled {
             let dict: [String: Any] = [
