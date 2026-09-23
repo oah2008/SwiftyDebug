@@ -265,4 +265,42 @@ final class RequestBodyEndToEndTests: XCTestCase {
                        the defect this pins.
                        """)
     }
+
+    /// A body past the drain ceiling takes the forwarding path — and every byte
+    /// still has to arrive, in order, through CFNetwork and the pump.
+    func testABodyLargerThanTheDrainCapStillArrivesIntact() throws {
+        let payload = Data((0..<(CustomHTTPProtocol.maxDrainedRequestBodyBytes + 300_000))
+                            .map { UInt8($0 % 251) })
+        var request = URLRequest(url: url("/oversize"))
+        request.httpMethod = "POST"
+        request.httpBody = payload
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+
+        observedPath = "none"
+        observedBody = nil
+        let pumpsBefore = CustomHTTPProtocol.livePumpCountForTesting
+        let done = expectation(description: "request finished")
+        session().dataTask(with: request) { _, _, _ in done.fulfill() }.resume()
+        wait(for: [done], timeout: 30)
+
+        XCTAssertEqual(observedPath, "resumed",
+                       "Past the ceiling the body must be forwarded, not buffered.")
+        let arrived = try XCTUnwrap(server.waitForBody(timeout: 25),
+                                    "the server never received a request")
+        XCTAssertEqual(arrived.count, payload.count,
+                       "Every byte past the ceiling has to reach the server too.")
+        XCTAssertEqual(arrived, payload, "...and in the right order.")
+
+        XCTAssertLessThanOrEqual(observedBody?.count ?? 0,
+                                 CustomHTTPProtocol.maxDrainedRequestBodyBytes + 64 * 1024,
+                                 "Capture stays bounded; that is the point of the ceiling.")
+
+        // And the pump that carried it must not still be running.
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, CustomHTTPProtocol.livePumpCountForTesting > pumpsBefore {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        XCTAssertEqual(CustomHTTPProtocol.livePumpCountForTesting, pumpsBefore,
+                       "The pump must exit once the body is through.")
+    }
 }

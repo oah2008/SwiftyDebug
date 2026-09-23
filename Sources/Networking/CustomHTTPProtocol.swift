@@ -1119,31 +1119,52 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         //    used to do — sent the app's upload missing its head.
         if let stream = recursiveRequest.httpBodyStream, recursiveRequest.httpBody == nil {
             let drained = Self.drainBody(from: stream)
-            if drained.reachedEOF {
+            switch drained.outcome {
+            case .ended:
                 stream.close()
                 recursiveRequest.httpBody = drained.data
                 self.capturedRequestBody = drained.data
                 Self.requestBodyCaptureObserverForTesting?(drained.data, "eof")
-            } else if let resumed = Self.resumedBodyStream(prefix: drained.data, rest: stream) {
-                recursiveRequest.httpBodyStream = resumed.stream
-                self.bodyPumpToken = resumed.token
-                // What was captured is a prefix, not the body. Flagged so the
-                // detail screen says so and Replay refuses — showing a fragment
-                // as if it were the whole request is worse than showing none.
-                self.capturedRequestBody = drained.data.isEmpty ? nil : drained.data
-                self.capturedRequestBodyIsPartial = !drained.data.isEmpty
-                Self.requestBodyCaptureObserverForTesting?(self.capturedRequestBody, "resumed")
-            } else {
-                // Unreachable in practice: `getBoundStreams` does not fail. If
-                // it ever does, the bytes are already out of the stream and the
-                // only correct thing left is to finish the read, however long
-                // that takes, rather than send a truncated body.
-                var rest = drained.data
-                rest.append(Self.blockingDrainToEOF(from: stream))
+
+            case .more:
+                if let resumed = Self.resumedBodyStream(prefix: drained.data, rest: stream) {
+                    recursiveRequest.httpBodyStream = resumed.stream
+                    self.bodyPumpToken = resumed.token
+                    // PARTIAL regardless of how much was taken — including
+                    // nothing at all. What decides this is that the body is
+                    // longer than what was captured, not that a prefix happens
+                    // to be non-empty. Tying it to the prefix left a streamed
+                    // upload looking like a complete request with no body, which
+                    // Replay would then happily re-send bodyless.
+                    self.capturedRequestBody = drained.data.isEmpty ? nil : drained.data
+                    self.capturedRequestBodyIsPartial = true
+                    Self.requestBodyCaptureObserverForTesting?(self.capturedRequestBody, "resumed")
+                } else {
+                    // Unreachable in practice: `getBoundStreams` does not fail.
+                    // If it ever does, the bytes are already out of the stream
+                    // and the only correct thing left is to finish the read,
+                    // however long it takes, rather than send a truncated body.
+                    var whole = drained.data
+                    whole.append(Self.blockingDrainToEOF(from: stream))
+                    stream.close()
+                    recursiveRequest.httpBody = whole
+                    self.capturedRequestBody = whole
+                    Self.requestBodyCaptureObserverForTesting?(whole, "fallback")
+                }
+
+            case .failed:
+                // The app's own body stream is broken. Without the SDK in the
+                // middle, CFNetwork would hit the same error and fail the
+                // upload; forwarding the fragment already read would instead
+                // send a truncated body that the server answers 200, which is
+                // the one outcome nobody could debug.
                 stream.close()
-                recursiveRequest.httpBody = rest
-                self.capturedRequestBody = rest
-                Self.requestBodyCaptureObserverForTesting?(rest, "fallback")
+                Self.requestBodyCaptureObserverForTesting?(nil, "failed")
+                self.failLoad(NSError(domain: NSURLErrorDomain,
+                                      code: NSURLErrorCannotLoadFromNetwork,
+                                      userInfo: [NSLocalizedDescriptionKey:
+                                        "The request body stream could not be read."]))
+                return
             }
         } else {
             self.capturedRequestBody = recursiveRequest.httpBody
@@ -1313,7 +1334,16 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                         // and the cURL command copied from it — a method, URL,
                         // headers and body that were never sent.
                         self.interceptedRequest = edited.request
-                        self.capturedRequestBody = edited.request.httpBody
+                        // Only when the edited request actually CARRIES a body.
+                        // On the resumed path it carries a stream instead, so
+                        // `httpBody` is nil and assigning it unconditionally
+                        // wiped the captured prefix while leaving the row still
+                        // flagged partial: no body shown, and a truncation
+                        // warning about a body that was no longer there.
+                        if let editedBody = edited.request.httpBody {
+                            self.capturedRequestBody = editedBody
+                            self.capturedRequestBodyIsPartial = false
+                        }
                         self.sendUpstream(edited.request)
                     }
                 },
@@ -1434,37 +1464,62 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
         }
     }
 
-    /// Reads what the body stream has for us, reporting whether it ended.
+    /// How the drain ended.
+    enum BodyDrainOutcome: Equatable {
+        /// The stream is exhausted. The bytes ARE the body.
+        case ended
+        /// There is more to come — the producer has not finished, or the cap
+        /// was reached. The bytes taken must be handed back.
+        case more
+        /// The stream errored. No correct body can be produced from it.
+        case failed
+    }
+
+    /// Reads up to `maxDrainedRequestBodyBytes` from the body stream.
     ///
     /// EOF is decided by `read` returning 0, or by the stream reporting
     /// `.atEnd`; NEVER by `hasBytesAvailable` going false. That flag also goes
-    /// false for a stream that is merely starved, and treating starvation as
-    /// the end is what installed an empty or truncated buffer as a whole body.
+    /// false for a stream that is merely starved, and treating starvation as the
+    /// end is what installed an empty or truncated buffer as a whole body.
     ///
-    /// The bytes are returned either way. The caller is responsible for giving
-    /// back anything taken from a stream that has not finished — see
-    /// `resumedBodyStream(prefix:rest:)`. Static and pure so the EOF rule is
+    /// A read ERROR is reported as such rather than folded into "more to come":
+    /// a broken stream cannot produce a correct body, and quietly forwarding the
+    /// fragment already read would send a truncated upload that the server
+    /// answers 200.
+    ///
+    /// The bytes are returned in every case. The caller is responsible for
+    /// giving back anything taken from a stream that has not finished — see
+    /// `resumedBodyStream(prefix:rest:)`. Static and pure so the rules here are
     /// testable without a live request.
-    static func drainBody(from stream: InputStream) -> (data: Data, reachedEOF: Bool) {
+    static func drainBody(from stream: InputStream) -> (data: Data, outcome: BodyDrainOutcome) {
         let bodyData = NSMutableData()
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-        var reachedEOF = false
+        var outcome = BodyDrainOutcome.more
         if stream.streamStatus == .notOpen { stream.open() }
         while stream.hasBytesAvailable {
+            // The cap is what stops a 200 MB video upload from being made
+            // fully resident in the host app's memory just so a debugger can
+            // look at the first half-megabyte of it. Past this point the body
+            // is FORWARDED rather than buffered — see the `.more` branch in
+            // `startLoading` — so the ceiling costs capture nothing that the
+            // transaction would have stored anyway.
+            if bodyData.length >= Self.maxDrainedRequestBodyBytes { break }
             let bytesRead = stream.read(&buffer, maxLength: buffer.count)
             if bytesRead > 0 {
                 bodyData.append(buffer, length: bytesRead)
             } else {
-                // 0 is EOF; negative is a read error, and an errored stream
-                // never yielded a complete body to take over.
-                reachedEOF = (bytesRead == 0)
+                // 0 is EOF; negative is a read error.
+                outcome = (bytesRead == 0) ? .ended : .failed
                 break
             }
         }
         // A stream that hands over its whole buffer in one read leaves the loop
         // on `hasBytesAvailable`, not on a 0-read, so the status decides.
-        if !reachedEOF { reachedEOF = (stream.streamStatus == .atEnd) }
-        return (bodyData as Data, reachedEOF)
+        if outcome == .more {
+            if stream.streamStatus == .error { outcome = .failed }
+            else if stream.streamStatus == .atEnd { outcome = .ended }
+        }
+        return (bodyData as Data, outcome)
     }
 
     /// Blocks until the stream ends. Only for the unreachable fallback in
@@ -1538,30 +1593,38 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
                 rest.close()
                 Self.adjustLivePumpCount(-1)
             }
-            let deadline = Date().addingTimeInterval(Self.bodyPumpDeadline)
 
-            /// False once there is no point continuing: the request was
-            /// cancelled or never sent, the consumer closed its end, or the
-            /// backstop elapsed.
-            func stillWanted() -> Bool {
-                !token.isCancelled
-                    && Date() <= deadline
-                    && boundOutput.streamStatus != .error
-                    && boundOutput.streamStatus != .closed
+            // Every wait in this thread is a poll, and every poll re-checks
+            // this. There is deliberately NO deadline: a backstop that fires
+            // mid-body would close the pipe, and a closed pipe is a CLEAN end of
+            // body to the reader — so a legitimately slow upload would be
+            // silently truncated and answered 200. Cancellation is the only
+            // mechanism, and `stopLoading`/`deinit` run it on every path.
+            func stillWanted() -> Bool { !token.isCancelled }
+
+            /// Sleeps a little longer each time nothing happened, so a stalled
+            /// upload costs a handful of wakeups a second instead of hundreds,
+            /// while an active one still turns around in well under a
+            /// millisecond.
+            var idleNap: TimeInterval = 0.00025
+            func napAfterNoProgress() {
+                Thread.sleep(forTimeInterval: idleNap)
+                idleNap = min(idleNap * 2, 0.004)
             }
+            func madeProgress() { idleNap = 0.00025 }
 
             /// Writes every byte, waiting when the consumer has not drained the
-            /// pipe yet. Every wait is interruptible — that is the whole point.
+            /// pipe yet. Interruptible at every turn — that is the whole point.
             func writeAll(_ bytes: UnsafePointer<UInt8>, _ count: Int) -> Bool {
                 var offset = 0
                 while offset < count {
                     guard stillWanted() else { return false }
-                    if !boundOutput.hasSpaceAvailable {
-                        Thread.sleep(forTimeInterval: 0.002)
-                        continue
-                    }
+                    guard boundOutput.streamStatus != .error,
+                          boundOutput.streamStatus != .closed else { return false }
+                    if !boundOutput.hasSpaceAvailable { napAfterNoProgress(); continue }
                     let written = boundOutput.write(bytes + offset, maxLength: count - offset)
                     if written <= 0 { return false }
+                    madeProgress()
                     offset += written
                 }
                 return true
@@ -1575,16 +1638,27 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
 
             var buffer = [UInt8](repeating: 0, count: Self.bodyPumpBufferBytes)
             while stillWanted() {
-                // A BLOCKING read, deliberately. Polling `hasBytesAvailable`
-                // instead would never see EOF — a bound pair reports `.atEnd`
-                // only once a read has returned 0 — so the pipe would never be
-                // closed and CFNetwork would wait out the whole deadline for a
-                // body that had already finished. Blocking here is also exactly
-                // what CFNetwork itself would be doing on this stream if the SDK
-                // were not in the middle, so it costs the app nothing it was not
-                // already paying.
+                // NEVER park in a blocking read. `rest.read` on a starved bound
+                // pair returns only when the producer writes, and a thread
+                // parked inside it observes nothing: not the cancel token, not a
+                // close from another thread. Both measured — a parked read
+                // survived `close()` on the read end by more than three seconds.
+                // A producer that stalls and never closes (an upload the user
+                // cancelled, an asset export that gave up) would strand this
+                // thread for the life of the process.
+                //
+                // Polling sees EOF perfectly well, contrary to what the comment
+                // here used to claim: when the producer closes its end,
+                // `hasBytesAvailable` goes TRUE (the status stays `.open`) and
+                // the next read returns 0. Measured on a bound pair.
+                if !rest.hasBytesAvailable {
+                    if rest.streamStatus == .atEnd || rest.streamStatus == .error { return }
+                    napAfterNoProgress()
+                    continue
+                }
                 let bytesRead = rest.read(&buffer, maxLength: buffer.count)
                 if bytesRead <= 0 { return }   // EOF or error: `defer` closes the pipe
+                madeProgress()
                 if !writeAll(&buffer, bytesRead) { return }
             }
         }
@@ -1618,10 +1692,14 @@ private typealias TimeoutSetterFunc = @convention(c) (AnyObject, Selector, TimeI
     /// point is to forward, not to buffer the upload a second time.
     static let bodyPumpBufferBytes = 64 * 1024
 
-    /// Backstop so a pump thread cannot outlive its request forever if the
-    /// consumer goes away without closing. Generously longer than any request
-    /// this SDK would otherwise allow to run.
-    static let bodyPumpDeadline: TimeInterval = 10 * 60
+    /// The most of a request body the SDK will hold in memory.
+    ///
+    /// Four times what a transaction actually stores (512 KB, see
+    /// `stopLoading`), so the cap never costs capture anything; it exists so a
+    /// large upload is FORWARDED rather than made fully resident. Without one, a
+    /// 200 MB video upload was read into RAM in its entirety — on the loader
+    /// thread — purely so a debugger could look at the first half-megabyte.
+    static let maxDrainedRequestBodyBytes = 2 * 1024 * 1024
 
     /// Why an armed breakpoint never paused a request a mock answered. Pure and
     /// `static` so the wording is pinned by tests — this sentence IS the fix, so
@@ -2215,9 +2293,10 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
     /// Every request whose body is plain `httpBody` (which is effectively all
     /// of them) is one we do still hold, so those are answered properly.
     ///
-    /// A body the app supplied as a STREAM is one the SDK deliberately never
-    /// reads — see `startLoading` — so there is nothing to hand back and `nil`
-    /// is both the previous answer and the only honest one.
+    /// A body captured only in PART — a stream whose producer had not finished,
+    /// or one past the drain cap — is refused: replaying a fragment would send
+    /// a fraction of the upload and have it answered 200, which is worse than
+    /// the empty body `nil` produces, because it looks like it worked.
     func urlSession(_ session: URLSession,
                     task: URLSessionTask,
                     needNewBodyStream completionHandler: @escaping (InputStream?) -> Void) {
@@ -2609,9 +2688,15 @@ extension CustomHTTPProtocol: URLSessionDataDelegate {
     /// `static var` it replaces was a data race TSan flags in a host app.
     private static let skipNoticeLock = NSLock()
     private static var notedSkipMessages = Set<String>()
+    private static let maxNotedSkipMessages = 64
 
     static func noteSkipOnce(_ reason: String, for url: URL?) {
         skipNoticeLock.lock()
+        // Bounded: these are formatted strings and the oversize variant carries
+        // a byte count, so the set would otherwise grow one entry per distinct
+        // response size for the life of the process. Past the ceiling the
+        // suppression simply resets, which at worst re-posts a notice.
+        if notedSkipMessages.count >= Self.maxNotedSkipMessages { notedSkipMessages.removeAll() }
         let isNew = notedSkipMessages.insert(reason).inserted
         skipNoticeLock.unlock()
         guard isNew else { return }

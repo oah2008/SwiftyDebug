@@ -55,12 +55,12 @@ final class BodyStreamPumpTests: XCTestCase {
             CustomHTTPProtocol.resumedBodyStream(prefix: Data("prefix".utf8), rest: appStream),
             "the bound pair could not be created")
 
-        XCTAssertTrue(waitUntil { CustomHTTPProtocol.livePumpCountForTesting == before + 1 },
-                      "precondition: the pump started")
         // Nothing reads `resumed.stream` — this is the mocked/blocked request.
-        XCTAssertTrue(waitUntil({ CustomHTTPProtocol.livePumpCountForTesting == before + 1 },
-                                timeout: 0.4),
-                      "precondition: it is still running, i.e. genuinely parked")
+        // Wait long enough for the pump to have filled its pipe and parked in
+        // the write, rather than cancelling it before it ever got going.
+        Thread.sleep(forTimeInterval: 0.25)
+        XCTAssertEqual(CustomHTTPProtocol.livePumpCountForTesting, before + 1,
+                       "precondition: it is still running, i.e. genuinely parked on a full pipe")
 
         resumed.token.cancel()
 
@@ -112,5 +112,120 @@ final class BodyStreamPumpTests: XCTestCase {
                        "The prefix must come back first, then the rest, in order.")
         XCTAssertTrue(waitUntil { CustomHTTPProtocol.livePumpCountForTesting == before },
                       "A pump that reached EOF must exit without needing to be cancelled.")
+    }
+
+    /// The leak this design nearly shipped with.
+    ///
+    /// A producer that stops writing and never closes — an upload the user
+    /// cancelled, an asset export that gave up — leaves the pump waiting for
+    /// bytes that will never come. While the pump waited inside a BLOCKING
+    /// read, nothing could end it: not the token, not a close from another
+    /// thread (measured: still parked three seconds later), not any deadline.
+    /// One stranded thread, pipe and stream per abandoned upload, for the life
+    /// of the process.
+    ///
+    /// The test has to get the pump GENUINELY parked in the read before it
+    /// cancels, or it proves nothing: drain everything the pump forwards, so
+    /// the only thing left for it to do is wait on a producer that is finished
+    /// speaking. (An earlier version of this test cancelled so quickly that the
+    /// pump exited at its first `stillWanted()` check, and passed against the
+    /// blocking read it was written to catch.)
+    func testCancellingEndsAPumpWhoseProducerWentSilent() throws {
+        var input: InputStream?
+        var output: OutputStream?
+        Stream.getBoundStreams(withBufferSize: 8192, inputStream: &input, outputStream: &output)
+        let appStream = try XCTUnwrap(input)
+        let appProducer = try XCTUnwrap(output)
+        appProducer.open()
+
+        // A little data, then silence. Crucially: never closed.
+        let trickle = Array("still-writing".utf8)
+        _ = appProducer.write(trickle, maxLength: trickle.count)
+
+        let before = CustomHTTPProtocol.livePumpCountForTesting
+        let prefix = Data("head".utf8)
+        let resumed = try XCTUnwrap(
+            CustomHTTPProtocol.resumedBodyStream(prefix: prefix, rest: appStream))
+
+        // Drain the pump dry, the way CFNetwork would. Once we have every byte
+        // it can possibly have, it is by definition waiting on `appStream`.
+        resumed.stream.open()
+        var forwarded = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        let drainDeadline = Date().addingTimeInterval(5)
+        while forwarded.count < prefix.count + trickle.count, Date() < drainDeadline {
+            if !resumed.stream.hasBytesAvailable { Thread.sleep(forTimeInterval: 0.005); continue }
+            let n = resumed.stream.read(&buffer, maxLength: buffer.count)
+            if n <= 0 { break }
+            forwarded.append(buffer, count: n)
+        }
+        XCTAssertEqual(forwarded, prefix + Data(trickle),
+                       "precondition: the pump forwarded everything it had")
+
+        // Give it a moment to settle into the wait it can no longer leave.
+        Thread.sleep(forTimeInterval: 0.25)
+        XCTAssertEqual(CustomHTTPProtocol.livePumpCountForTesting, before + 1,
+                       "precondition: it is still running, i.e. genuinely parked on the producer")
+
+        resumed.token.cancel()
+
+        XCTAssertTrue(waitUntil { CustomHTTPProtocol.livePumpCountForTesting == before },
+                      """
+                      The pump is still running after cancellation, waiting on a producer that \
+                      has gone silent. Every abandoned upload strands a thread, a 64KB pipe and \
+                      the app's own stream — permanently.
+                      """)
+        resumed.stream.close()
+        appProducer.close()
+    }
+
+    // MARK: - The drain's ceiling
+
+    /// A body bigger than the cap is not buffered: the drain stops, and the
+    /// rest is forwarded. Without this a 200MB upload was made fully resident
+    /// in the host app just so a debugger could read its first half-megabyte.
+    func testABodyLargerThanTheCapStopsTheDrainInsteadOfBuffering() throws {
+        let oversize = Data(repeating: 0x5A, count: CustomHTTPProtocol.maxDrainedRequestBodyBytes + 256 * 1024)
+        let stream = InputStream(data: oversize)
+
+        let drained = CustomHTTPProtocol.drainBody(from: stream)
+
+        XCTAssertEqual(drained.outcome, .more,
+                       "Past the ceiling the body has to be FORWARDED, not swallowed.")
+        XCTAssertLessThanOrEqual(drained.data.count,
+                                 CustomHTTPProtocol.maxDrainedRequestBodyBytes + 64 * 1024,
+                                 "The drain must stop at the cap, give or take one read.")
+        stream.close()
+    }
+
+    /// And a body that fits is still drained whole — the ceiling must not
+    /// quietly turn ordinary requests into forwarded ones.
+    func testABodyWithinTheCapIsDrainedWhole() throws {
+        let payload = Data((0..<200_000).map { UInt8($0 % 251) })
+        let stream = InputStream(data: payload)
+
+        let drained = CustomHTTPProtocol.drainBody(from: stream)
+
+        XCTAssertEqual(drained.outcome, .ended)
+        XCTAssertEqual(drained.data, payload)
+        stream.close()
+    }
+
+    /// A stream that never opened reads like one at EOF. It must not be reported
+    /// as a clean end, or its zero bytes become "the body".
+    func testAnUnreadableStreamIsNotReportedAsACleanEnd() {
+        var input: InputStream?
+        var output: OutputStream?
+        Stream.getBoundStreams(withBufferSize: 512, inputStream: &input, outputStream: &output)
+        guard let appStream = input, let producer = output else { return XCTFail("no pair") }
+        producer.open()
+        let some = Array("partial".utf8)
+        _ = producer.write(some, maxLength: some.count)
+        // Producer still open and still working: this is "more", never "ended".
+        let drained = CustomHTTPProtocol.drainBody(from: appStream)
+        XCTAssertEqual(drained.outcome, .more,
+                       "A producer that has not finished must never be read as EOF.")
+        producer.close()
+        appStream.close()
     }
 }
