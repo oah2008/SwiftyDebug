@@ -188,20 +188,22 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
         hintLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(hintLabel)
 
+        // Safe area, not the view's edges: iPhone Duo's vertical bar takes 84 pt
+        // of one side.
         let guide = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
             breadcrumb.topAnchor.constraint(equalTo: guide.topAnchor, constant: 10),
-            breadcrumb.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            breadcrumb.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            breadcrumb.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 16),
+            breadcrumb.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -16),
 
             typeControl.topAnchor.constraint(equalTo: breadcrumb.bottomAnchor, constant: 10),
-            typeControl.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
-            typeControl.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+            typeControl.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 14),
+            typeControl.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -14),
             typeControl.heightAnchor.constraint(equalToConstant: 32),
 
             card.topAnchor.constraint(equalTo: typeControl.bottomAnchor, constant: 12),
-            card.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
-            card.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+            card.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 14),
+            card.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -14),
 
             textView.topAnchor.constraint(equalTo: card.topAnchor),
             textView.leadingAnchor.constraint(equalTo: card.leadingAnchor),
@@ -224,8 +226,8 @@ final class JSONValueEditorViewController: UIViewController, UITextViewDelegate 
             boolSwitch.centerYAnchor.constraint(equalTo: boolRow.centerYAnchor),
 
             hintLabel.topAnchor.constraint(equalTo: card.bottomAnchor, constant: 8),
-            hintLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            hintLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            hintLabel.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 16),
+            hintLabel.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -16),
             hintLabel.bottomAnchor.constraint(lessThanOrEqualTo: guide.bottomAnchor, constant: -6),
         ])
 

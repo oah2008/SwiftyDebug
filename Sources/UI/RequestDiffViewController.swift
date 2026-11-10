@@ -128,8 +128,8 @@ class RequestDiffViewController: UIViewController {
             headerBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
             stack.topAnchor.constraint(equalTo: headerBar.topAnchor, constant: 10),
-            stack.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -14),
+            stack.leadingAnchor.constraint(equalTo: headerBar.safeAreaLayoutGuide.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: headerBar.safeAreaLayoutGuide.trailingAnchor, constant: -14),
             stack.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: -10),
         ])
     }
@@ -201,10 +201,10 @@ class RequestDiffViewController: UIViewController {
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-            emptyLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            emptyLabel.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: tableView.centerYAnchor),
-            emptyLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
-            emptyLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
+            emptyLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 32),
+            emptyLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -32),
         ])
     }
 
@@ -310,10 +310,12 @@ extension RequestDiffViewController: UITableViewDelegate {
         countLabel.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(countLabel)
 
+        // Against the header's safe area: the table keeps its cells clear of
+        // iPhone Duo's 84 pt vertical bar, but not a custom header's content.
         NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
+            titleLabel.leadingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             titleLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -8),
-            countLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16),
+            countLabel.trailingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             countLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
         ])
         header.forceLTR()

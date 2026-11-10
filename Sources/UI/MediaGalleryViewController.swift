@@ -137,12 +137,16 @@ class MediaGalleryViewController: UIViewController {
         view.addSubview(emptyLabel)
 
         NSLayoutConstraint.activate([
+            // Safe area, not the view's edges: a vertical grid gets no sideways
+            // inset, so a column of tiles sat under iPhone Duo's 84 pt vertical
+            // bar. Pinning the view (not `.fromSafeArea` section insets) keeps the
+            // tile maths below, which divides this width by 3, correct.
             collectionView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            collectionView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            collectionView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
             collectionView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-            emptyLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            emptyLabel.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
         ])
 
@@ -273,7 +277,7 @@ private final class MediaThumbCell: UICollectionViewCell {
             return
         }
 
-        let maxPixel = max(160, bounds.width * UIScreen.main.scale)
+        let maxPixel = max(160, bounds.width * SceneGeometry.scale(for: self))
         if let cached = ImageLoader.shared.cachedImage(for: urlString, maxPixel: maxPixel) {
             imageView.image = cached
             setFallback(visible: false, item: item)
@@ -412,11 +416,11 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
 
         NSLayoutConstraint.activate([
             closeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-            closeButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            closeButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             closeButton.widthAnchor.constraint(equalToConstant: Self.closeButtonSize),
             closeButton.heightAnchor.constraint(equalToConstant: Self.closeButtonSize),
 
-            counterLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            counterLabel.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             counterLabel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
             counterLabel.heightAnchor.constraint(equalToConstant: 24),
             counterLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
@@ -454,10 +458,16 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
         // `scrollViewDidScroll`, which writes `startIndex`, and a transient
         // clamp against the old contentSize would otherwise move the user.
         let targetIndex = startIndex
-        let pageWidth = view.bounds.width
-        pageScroll.frame = view.bounds
+        // Inset left and right only: on iPhone Duo an 84 pt vertical bar takes
+        // one side, and a full-width page put the image under it. Top and bottom
+        // stay full-bleed, as they are on every other phone.
+        let insets = view.safeAreaInsets
+        let pagesFrame = view.bounds.inset(by: UIEdgeInsets(top: 0, left: insets.left,
+                                                            bottom: 0, right: insets.right))
+        let pageWidth = pagesFrame.width
+        pageScroll.frame = pagesFrame
         pageScroll.contentSize = CGSize(width: pageWidth * CGFloat(imageURLs.count),
-                                        height: view.bounds.height)
+                                        height: pagesFrame.height)
 
         // Before building the window, so the window is centred on the page the
         // caller asked for rather than on page 0 — and re-anchored on every
@@ -483,8 +493,8 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
     /// Builds the pages inside the window, throws away the ones outside it, and
     /// frames what is left. The single place that decides which bitmaps exist.
     private func refreshWindow(resettingZoom: Bool) {
-        let pageWidth = view.bounds.width
-        let pageHeight = view.bounds.height
+        let pageWidth = pageScroll.bounds.width
+        let pageHeight = pageScroll.bounds.height
         let wanted = Self.windowedIndices(around: startIndex, count: imageURLs.count)
 
         for index in Array(pages.keys) where !wanted.contains(index) { discardPage(at: index) }
@@ -517,8 +527,8 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
         zoom.forceLTR()
 
         guard imageURLs.indices.contains(index) else { return zoom }
-        let maxPixel = Self.pageMaxPixel(forScreenSize: UIScreen.main.bounds.size,
-                                         scale: UIScreen.main.scale)
+        let maxPixel = Self.pageMaxPixel(forScreenSize: SceneGeometry.bounds(for: view).size,
+                                         scale: SceneGeometry.scale(for: view))
         // A full-screen page is one of the two surfaces that may animate: a
         // captured GIF plays here, as it does in the request detail, instead of
         // showing a motionless first frame. Grid thumbnails stay static.
@@ -552,8 +562,8 @@ final class MediaPagerViewController: UIViewController, UIScrollViewDelegate, UI
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard scrollView === pageScroll, view.bounds.width > 0 else { return }
-        let page = Int((scrollView.contentOffset.x / view.bounds.width).rounded())
+        guard scrollView === pageScroll, pageScroll.bounds.width > 0 else { return }
+        let page = Int((scrollView.contentOffset.x / pageScroll.bounds.width).rounded())
         let clamped = max(0, min(page, max(0, imageURLs.count - 1)))
         if clamped != startIndex {
             startIndex = clamped

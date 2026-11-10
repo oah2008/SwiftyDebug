@@ -674,11 +674,13 @@ private final class InsightsSectionHeader: UIView {
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(detailLabel)
 
+        // Safe area, not the header's edges: a plain section header spans the
+        // table's full width, under iPhone Duo's 84 pt vertical bar.
         NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
+            titleLabel.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 18),
             titleLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
             detailLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 8),
-            detailLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
+            detailLabel.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -18),
             detailLabel.firstBaselineAnchor.constraint(equalTo: titleLabel.firstBaselineAnchor),
         ])
         forceLTR()

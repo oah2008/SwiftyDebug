@@ -110,9 +110,12 @@ final class MediaDetailViewController: UIViewController {
         let frame = scrollView.frameLayoutGuide
 
         NSLayoutConstraint.activate([
+            // Safe area, not the view's edges: the stack is as wide as the
+            // scroll view's frame, and a vertical scroll view takes no sideways
+            // inset, so every card ran under iPhone Duo's 84 pt vertical bar.
             scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
@@ -324,7 +327,7 @@ final class MediaDetailViewController: UIViewController {
         previewPlaceholder.isHidden = true
         previewSpinner.startAnimating()
 
-        let maxPixel = max(600, UIScreen.main.bounds.width * UIScreen.main.scale)
+        let maxPixel = max(600, SceneGeometry.bounds(for: view).width * SceneGeometry.scale(for: view))
         // `animated: true` so a GIF plays here as it does in the pager and in the
         // request detail. Without it this one screen decoded only frame 0 and the
         // same image was frozen here and animated everywhere else.
@@ -430,7 +433,7 @@ final class MediaDetailViewController: UIViewController {
         toast.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(toast)
         NSLayoutConstraint.activate([
-            toast.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            toast.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             toast.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
             toast.heightAnchor.constraint(equalToConstant: 24),
         ])

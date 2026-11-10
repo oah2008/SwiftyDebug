@@ -335,11 +335,12 @@ final class NetworkTimelineRowCell: UITableViewCell {
     static let minBarWidth: CGFloat = 4
     static let barHeight: CGFloat = 12
 
-    /// X of the bar track in the cell's (and the view controller's) coordinate
-    /// space — the ruler and grid overlay use this too so all three align.
+    /// X of the bar track measured from the leading edge of the safe area — the
+    /// cell's content view (which the table insets to the safe area), the ruler
+    /// and the grid overlay all start there, so all three align.
     static var trackOriginX: CGFloat { cardInset + cardPadding + gutterWidth + trackGap }
 
-    /// Trailing inset of the track from the right edge of the screen.
+    /// Trailing inset of the track from the trailing edge of the safe area.
     static var trackTrailingInset: CGFloat { cardInset + cardPadding }
 
     static func trackWidth(forWidth width: CGFloat) -> CGFloat {

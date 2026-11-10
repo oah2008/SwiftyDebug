@@ -824,12 +824,12 @@ class NetworkDetailViewController: UITableViewController {
             ClipboardFormatter.copyVerbatim(curl)
 
             let activity = UIActivityViewController(activityItems: [curl], applicationActivities: nil)
-            if UIDevice.current.userInterfaceIdiom == .pad {
-                activity.popoverPresentationController?.sourceView = self.view
-                activity.popoverPresentationController?.sourceRect = CGRect(
-                    x: self.view.bounds.midX, y: self.view.bounds.midY, width: 0, height: 0
-                )
-            }
+            // Anchored whatever the idiom: an unanchored popover throws, and a
+            // phone can show one — iPhone Duo's inner display is regular width.
+            activity.popoverPresentationController?.sourceView = self.view
+            activity.popoverPresentationController?.sourceRect = CGRect(
+                x: self.view.bounds.midX, y: self.view.bounds.midY, width: 0, height: 0
+            )
             self.present(activity, animated: true)
         }
 
@@ -1074,7 +1074,8 @@ class NetworkDetailViewController: UITableViewController {
 
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
 
-        // iPad anchor
+        // Popover anchor wherever the sheet presents as a popover (iPad, and any
+        // regular-width display such as iPhone Duo's inner one); ignored otherwise.
         alert.popoverPresentationController?.barButtonItem = sender
         present(alert, animated: true)
     }
@@ -1127,13 +1128,9 @@ class NetworkDetailViewController: UITableViewController {
         alert.addAction(UIAlertAction(title: "share", style: .default) { [weak self] _ in
             let items: [Any] = [self?.messageBody ?? ""]
             let activity = UIActivityViewController(activityItems: items, applicationActivities: nil)
-            if UIDevice.current.userInterfaceIdiom == .phone {
-                self?.present(activity, animated: true)
-            } else {
-                activity.popoverPresentationController?.sourceRect = .init(x: self?.view.bounds.midX ?? 0, y: self?.view.bounds.midY ?? 0, width: 0, height: 0)
-                activity.popoverPresentationController?.sourceView = self?.view
-                self?.present(activity, animated: true)
-            }
+            activity.popoverPresentationController?.sourceRect = .init(x: self?.view.bounds.midX ?? 0, y: self?.view.bounds.midY ?? 0, width: 0, height: 0)
+            activity.popoverPresentationController?.sourceView = self?.view
+            self?.present(activity, animated: true)
         })
 
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
@@ -1653,8 +1650,11 @@ final class JSONViewerViewController: UIViewController, WKNavigationDelegate {
 
         view.addSubview(webView)
         NSLayoutConstraint.activate([
-            webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            // Safe area, not the view's edges: the page is `viewport-fit=cover`
+            // and never reads `env(safe-area-inset-*)`, so nothing inside it
+            // moves the tree out from under iPhone Duo's 84 pt vertical bar.
+            webView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
             webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
@@ -1954,8 +1954,8 @@ final class CurlPreviewViewController: UIViewController {
             scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             cardView.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 12),
-            cardView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
-            cardView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            cardView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 8),
+            cardView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
             cardView.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
 
             titleLabel.topAnchor.constraint(equalTo: cardView.topAnchor, constant: 12),
@@ -1987,12 +1987,12 @@ final class CurlPreviewViewController: UIViewController {
 
     @objc private func shareTapped() {
         let activity = UIActivityViewController(activityItems: [curlString], applicationActivities: nil)
-        if UIDevice.current.userInterfaceIdiom == .pad {
-            activity.popoverPresentationController?.sourceView = view
-            activity.popoverPresentationController?.sourceRect = CGRect(
-                x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0
-            )
-        }
+        // Anchored whatever the idiom: an unanchored popover throws, and a
+        // phone can show one — iPhone Duo's inner display is regular width.
+        activity.popoverPresentationController?.sourceView = view
+        activity.popoverPresentationController?.sourceRect = CGRect(
+            x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0
+        )
         present(activity, animated: true)
     }
 

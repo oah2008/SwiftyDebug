@@ -807,10 +807,17 @@ final class KeychainBrowserViewController: UITableViewController {
     /// changed, otherwise this loops through `viewDidLayoutSubviews`.
     private func layoutHeader() {
         let width = max(tableView.bounds.width, 1)
+        // Safe area, each side on its own: iPhone Duo's 84 pt vertical bar is a left
+        // OR right inset by pose, and a flip keeps the width — hence the segment checks.
+        let insets = tableView.safeAreaInsets
+        let segmentX = insets.left + 12
+        let segmentWidth = max(width - insets.left - insets.right - 24, 1)
         guard abs(headerContainer.bounds.width - width) > 0.5
-                || headerContainer.bounds.height < 1 else { return }
+                || headerContainer.bounds.height < 1
+                || abs(segment.frame.minX - segmentX) > 0.5
+                || abs(segment.frame.width - segmentWidth) > 0.5 else { return }
         headerContainer.frame = CGRect(x: 0, y: 0, width: width, height: 54)
-        segment.frame = CGRect(x: 12, y: 11, width: max(width - 24, 1), height: 32)
+        segment.frame = CGRect(x: segmentX, y: 11, width: segmentWidth, height: 32)
         headerContainer.forceLTR()
         tableView.tableHeaderView = headerContainer
     }
@@ -870,20 +877,25 @@ final class KeychainBrowserViewController: UITableViewController {
     }
 
     private func layoutFooter() {
-        let width = max(tableView.bounds.width - 24, 1)
+        let insets = tableView.safeAreaInsets
+        let x = insets.left + 12
+        let width = max(tableView.bounds.width - insets.left - insets.right - 24, 1)
         // `viewDidLayoutSubviews` on a UITableViewController fires on every table
         // layout — including during scroll — so nothing expensive may run
         // unconditionally here. Rebuilding the string and re-measuring it through
         // TextKit every frame was per-frame work where the base did it once per
-        // appearance. Width unchanged means the measurement cannot have changed.
+        // appearance. Width unchanged means the measurement cannot have changed;
+        // the origin is compared too, because iPhone Duo's vertical bar can move
+        // to the other side without changing the width.
         let text = footerText
-        if abs(lastFooterWidth - width) < 0.5, lastFooterText == text { return }
+        if abs(lastFooterWidth - width) < 0.5, abs(footerLabel.frame.minX - x) < 0.5,
+           lastFooterText == text { return }
         lastFooterWidth = width
         lastFooterText = text
         footerLabel.text = text
         let height = ceil(footerLabel.sizeThatFits(CGSize(width: width,
                                                           height: .greatestFiniteMagnitude)).height)
-        footerLabel.frame = CGRect(x: 12, y: 16, width: width, height: height)
+        footerLabel.frame = CGRect(x: x, y: 16, width: width, height: height)
         let newHeight = height + 32
         guard abs(footerContainer.bounds.height - newHeight) > 0.5 else { return }
         footerContainer.frame = CGRect(x: 0, y: 0, width: tableView.bounds.width, height: newHeight)
@@ -1661,20 +1673,25 @@ final class KeychainItemDetailViewController: UITableViewController {
     /// actually changed — this runs from `viewDidLayoutSubviews`, and
     /// re-assigning unconditionally would loop.
     private func layoutFooter() {
-        let width = max(tableView.bounds.width - 24, 1)
+        // Safe area, each side on its own: iPhone Duo's 84 pt vertical bar is a left
+        // OR right inset by pose, and a flip keeps the width — hence the origin check.
+        let insets = tableView.safeAreaInsets
+        let x = insets.left + 12
+        let width = max(tableView.bounds.width - insets.left - insets.right - 24, 1)
         let text = item.itemClass.explainer
         // The height guard alone came too late: the TextKit measurement below
         // ran on every call, and because this is a `UITableViewController` the
         // controller's root view IS the table, so `viewDidLayoutSubviews` fires
         // on every layout pass — during scrolling included. The explainer only
         // changes when the item does, so measure once per (width, text).
-        if abs(lastFooterWidth - width) < 0.5, lastFooterText == text { return }
+        if abs(lastFooterWidth - width) < 0.5, abs(footerLabel.frame.minX - x) < 0.5,
+           lastFooterText == text { return }
         lastFooterWidth = width
         lastFooterText = text
         footerLabel.text = text
         let height = ceil(footerLabel.sizeThatFits(CGSize(width: width,
                                                           height: .greatestFiniteMagnitude)).height)
-        footerLabel.frame = CGRect(x: 12, y: 16, width: width, height: height)
+        footerLabel.frame = CGRect(x: x, y: 16, width: width, height: height)
         let newHeight = height + 32
         guard abs(footerContainer.bounds.height - newHeight) > 0.5 else { return }
         footerContainer.frame = CGRect(x: 0, y: 0, width: tableView.bounds.width, height: newHeight)

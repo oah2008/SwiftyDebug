@@ -121,14 +121,16 @@ class RequestDiffPickerViewController: UIViewController {
         tableView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(tableView)
 
+        // Safe area, not the view's edges: iPhone Duo's vertical bar takes 84 pt
+        // of one side. The table stays edge to edge — it insets its own cells.
         NSLayoutConstraint.activate([
             searchBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4),
-            searchBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
-            searchBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            searchBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 8),
+            searchBar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
 
             hintLabel.topAnchor.constraint(equalTo: searchBar.bottomAnchor, constant: 2),
-            hintLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            hintLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            hintLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            hintLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
 
             tableView.topAnchor.constraint(equalTo: hintLabel.bottomAnchor, constant: 6),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),

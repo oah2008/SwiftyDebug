@@ -266,15 +266,18 @@ final class WebViewStorageViewController: UITableViewController {
         row.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(row)
 
+        // Horizontally pinned to the header's SAFE AREA: a `tableHeaderView` spans
+        // the table's full width, under iPhone Duo's 84 pt vertical bar.
+        let safe = header.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
             segment.topAnchor.constraint(equalTo: header.topAnchor, constant: 10),
-            segment.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 12),
-            segment.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -12),
+            segment.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 12),
+            segment.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -12),
             segment.heightAnchor.constraint(equalToConstant: 32),
 
             row.topAnchor.constraint(equalTo: segment.bottomAnchor, constant: 10),
-            row.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 14),
-            row.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+            row.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -14),
             row.heightAnchor.constraint(equalToConstant: 36),
             // Pinned bottom so the header can size itself.
             row.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -10),

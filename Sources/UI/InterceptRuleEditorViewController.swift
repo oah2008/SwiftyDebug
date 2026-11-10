@@ -1584,10 +1584,20 @@ class InterceptRuleEditorViewController: UITableViewController {
         }
         header.addSubview(hint)
 
+        // Safe area, not the header's edges: the table insets cell content but not
+        // a plain header view, and iPhone Duo's vertical bar takes 84 pt of one side.
+        let safe = header.safeAreaLayoutGuide
+        // The title and the hint had nothing keeping them apart: "QUERY
+        // PARAMETERS (12 of 15 active)" + "only checked rows apply" needs ~390 pt,
+        // so they overlapped on narrow phones — and on iPhone Duo's outer display,
+        // where the hint is now in view instead of hidden under the vertical bar.
+        // The hint gives way first; the title is what the section is.
+        hint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+            label.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 18),
             label.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -6),
-            hint.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+            hint.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 8),
+            hint.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -18),
             hint.centerYAnchor.constraint(equalTo: label.centerYAnchor),
         ])
         header.forceLTR()
@@ -1702,8 +1712,8 @@ class InterceptRuleEditorViewController: UITableViewController {
         label.translatesAutoresizingMaskIntoConstraints = false
         footer.addSubview(label)
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 18),
-            label.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -18),
+            label.leadingAnchor.constraint(equalTo: footer.safeAreaLayoutGuide.leadingAnchor, constant: 18),
+            label.trailingAnchor.constraint(equalTo: footer.safeAreaLayoutGuide.trailingAnchor, constant: -18),
             label.topAnchor.constraint(equalTo: footer.topAnchor, constant: 6),
             label.bottomAnchor.constraint(lessThanOrEqualTo: footer.bottomAnchor, constant: -6),
         ])
@@ -1713,7 +1723,7 @@ class InterceptRuleEditorViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat {
         guard let s = Section(rawValue: section), let text = sectionFooterText(s) else { return 4 }
-        let width = max(tableView.bounds.width - 36, 80)
+        let width = max(tableView.bounds.inset(by: tableView.safeAreaInsets).width - 36, 80)
         let box = (text as NSString).boundingRect(
             with: CGSize(width: width, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
@@ -1762,7 +1772,7 @@ class InterceptRuleEditorViewController: UITableViewController {
             bottom = dismissKeyboardButton.bottomAnchor.constraint(equalTo: window.topAnchor, constant: f.origin.y - 12)
         }
         NSLayoutConstraint.activate([
-            dismissKeyboardButton.centerXAnchor.constraint(equalTo: window.centerXAnchor), bottom,
+            dismissKeyboardButton.centerXAnchor.constraint(equalTo: window.safeAreaLayoutGuide.centerXAnchor), bottom,
         ])
         UIView.animate(withDuration: 0.25) { self.dismissKeyboardButton.alpha = 1 }
     }

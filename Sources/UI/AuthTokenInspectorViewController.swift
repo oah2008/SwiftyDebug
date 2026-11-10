@@ -160,6 +160,7 @@ final class AuthTokenInspectorViewController: UIViewController {
     private let warningLabel = UILabel()
     private let hintLabel = UILabel()
     private var lastHeaderWidth: CGFloat = 0
+    private var lastHeaderMargins: UIEdgeInsets = .zero
 
     private lazy var emptyView = AuthEmptyStateView()
 
@@ -244,7 +245,9 @@ final class AuthTokenInspectorViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        if tableView.bounds.width != lastHeaderWidth {
+        let safeArea = view.safeAreaInsets
+        if tableView.bounds.width != lastHeaderWidth
+            || safeArea.left != lastHeaderMargins.left || safeArea.right != lastHeaderMargins.right {
             lastHeaderWidth = tableView.bounds.width
             sizeHeader()
         }
@@ -279,9 +282,10 @@ final class AuthTokenInspectorViewController: UIViewController {
         stack.translatesAutoresizingMaskIntoConstraints = false
         headerCard.addSubview(stack)
 
+        headerContainer.insetsLayoutMarginsFromSafeArea = false
         NSLayoutConstraint.activate([
-            headerCard.leadingAnchor.constraint(equalTo: headerContainer.leadingAnchor, constant: 12),
-            headerCard.trailingAnchor.constraint(equalTo: headerContainer.trailingAnchor, constant: -12),
+            headerCard.leadingAnchor.constraint(equalTo: headerContainer.layoutMarginsGuide.leadingAnchor, constant: 12),
+            headerCard.trailingAnchor.constraint(equalTo: headerContainer.layoutMarginsGuide.trailingAnchor, constant: -12),
             headerCard.topAnchor.constraint(equalTo: headerContainer.topAnchor, constant: 10),
             headerCard.bottomAnchor.constraint(equalTo: headerContainer.bottomAnchor, constant: -6),
 
@@ -329,8 +333,15 @@ final class AuthTokenInspectorViewController: UIViewController {
     }
 
     private func sizeHeader() {
-        let width = tableView.bounds.width > 0 ? tableView.bounds.width : UIScreen.main.bounds.width
+        let width = tableView.bounds.width > 0 ? tableView.bounds.width : SceneGeometry.bounds(for: view).width
         guard width > 0 else { return }
+        // Safe area, not the table's edges: iPhone Duo's vertical bar takes 84 pt
+        // of one side, and a table header is not inset like a cell. Set as margins
+        // because the header's own safe area reads zero while it is detached,
+        // which would measure the height below for too wide a card.
+        let safeArea = view.safeAreaInsets
+        lastHeaderMargins = UIEdgeInsets(top: 0, left: safeArea.left, bottom: 0, right: safeArea.right)
+        headerContainer.layoutMargins = lastHeaderMargins
         headerContainer.frame = CGRect(x: 0, y: 0, width: width, height: 1)
         headerContainer.setNeedsLayout()
         headerContainer.layoutIfNeeded()
@@ -560,8 +571,8 @@ private final class AuthEmptyStateView: UIView {
 
         NSLayoutConstraint.activate([
             stack.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -30),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 36),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -36),
+            stack.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 36),
+            stack.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -36),
         ])
         forceLTR()
     }
@@ -1085,6 +1096,7 @@ private final class AuthTokenCompareViewController: UITableViewController {
     private let segment = UISegmentedControl(items: ["Differences", "All claims"])
     private let headerContainer = UIView()
     private var lastHeaderWidth: CGFloat = 0
+    private var lastHeaderMargins: UIEdgeInsets = .zero
 
     init(left: AuthCredential, right: AuthCredential) {
         self.left = left
@@ -1147,9 +1159,10 @@ private final class AuthTokenCompareViewController: UITableViewController {
         segment.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(segment)
 
+        container.insetsLayoutMarginsFromSafeArea = false
         NSLayoutConstraint.activate([
-            card.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
-            card.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            card.leadingAnchor.constraint(equalTo: container.layoutMarginsGuide.leadingAnchor, constant: 12),
+            card.trailingAnchor.constraint(equalTo: container.layoutMarginsGuide.trailingAnchor, constant: -12),
             card.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
 
             stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
@@ -1157,8 +1170,8 @@ private final class AuthTokenCompareViewController: UITableViewController {
             stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
             stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
 
-            segment.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
-            segment.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            segment.leadingAnchor.constraint(equalTo: container.layoutMarginsGuide.leadingAnchor, constant: 12),
+            segment.trailingAnchor.constraint(equalTo: container.layoutMarginsGuide.trailingAnchor, constant: -12),
             segment.topAnchor.constraint(equalTo: card.bottomAnchor, constant: 10),
             segment.heightAnchor.constraint(equalToConstant: 32),
             segment.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10),
@@ -1174,8 +1187,12 @@ private final class AuthTokenCompareViewController: UITableViewController {
     /// control becomes unsatisfiable and UIKit breaks one, displacing the only
     /// control that switches between Differences and All claims.
     private func sizeHeader() {
-        let width = tableView.bounds.width > 0 ? tableView.bounds.width : UIScreen.main.bounds.width
+        let width = tableView.bounds.width > 0 ? tableView.bounds.width : SceneGeometry.bounds(for: view).width
         guard width > 0 else { return }
+        // Safe-area side margins, for the reason given in the inspector's `sizeHeader()`.
+        let safeArea = view.safeAreaInsets
+        lastHeaderMargins = UIEdgeInsets(top: 0, left: safeArea.left, bottom: 0, right: safeArea.right)
+        headerContainer.layoutMargins = lastHeaderMargins
         headerContainer.frame = CGRect(x: 0, y: 0, width: width, height: 1)
         headerContainer.setNeedsLayout()
         headerContainer.layoutIfNeeded()
@@ -1189,9 +1206,11 @@ private final class AuthTokenCompareViewController: UITableViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        // Re-measure on a width change only; re-assigning the header view every
-        // pass would loop the layout.
-        if tableView.bounds.width != lastHeaderWidth {
+        // Re-measure only when the width or the side insets change; re-assigning
+        // the header view every pass would loop the layout.
+        let safeArea = view.safeAreaInsets
+        if tableView.bounds.width != lastHeaderWidth
+            || safeArea.left != lastHeaderMargins.left || safeArea.right != lastHeaderMargins.right {
             lastHeaderWidth = tableView.bounds.width
             sizeHeader()
         }
@@ -1282,9 +1301,11 @@ private enum AuthSectionHeader {
         label.minimumScaleFactor = 0.8
         label.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
+        // Safe area: a plain header view spans the table and, unlike a cell's
+        // contentView, is not inset from iPhone Duo's 84 pt vertical bar.
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
-            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
+            label.leadingAnchor.constraint(equalTo: container.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            label.trailingAnchor.constraint(equalTo: container.safeAreaLayoutGuide.trailingAnchor, constant: -20),
             label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
         ])
         container.forceLTR()
@@ -1797,7 +1818,7 @@ private extension UIViewController {
         label.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(label)
         NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             label.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -28),
             label.heightAnchor.constraint(equalToConstant: 36),
             label.widthAnchor.constraint(greaterThanOrEqualToConstant: 130),

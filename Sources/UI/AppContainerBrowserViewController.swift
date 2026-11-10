@@ -308,9 +308,10 @@ final class AppContainerBrowserViewController: UITableViewController {
         emptyLabel.isHidden = true
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(emptyLabel)
+        // Safe area, not the view's edges: iPhone Duo's vertical bar takes 84 pt of one side.
         NSLayoutConstraint.activate([
-            emptyLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
-            emptyLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
+            emptyLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 32),
+            emptyLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -32),
             emptyLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
         ])
 

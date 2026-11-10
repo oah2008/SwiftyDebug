@@ -299,15 +299,21 @@ class JsonViewController: UIViewController {
         view.addSubview(imageView)
 
         NSLayoutConstraint.activate([
+            // Safe area on every edge, not the view's: the text view's inset
+            // adjustment is `.never`, so nothing else keeps its text out from
+            // under iPhone Duo's 84 pt vertical bar — or, at the bottom, out from
+            // under the inner display's 95 pt bottom bar in portrait, where the
+            // last lines of a long body could never be scrolled into view. The
+            // view behind is the same black, so there is no seam.
             textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            textView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            textView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            textView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            textView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            textView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
+            textView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
 
             imageView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            imageView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            imageView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            imageView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
+            imageView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
         ])
 
         naviItemTitleLabel = UILabel.init(frame: CGRect(x: 0, y: 0, width: 80, height: 40))

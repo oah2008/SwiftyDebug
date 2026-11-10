@@ -268,9 +268,11 @@ final class MediaAuditFixTests: XCTestCase {
     func testAFullScreenPageAsksForTheAnimatedDecode() {
         let uri = gifDataURI(frames: 3)
         // Warm the cache with exactly the key the pager asks for, so the page's
-        // load completes synchronously and the test needs no timing.
-        let maxPixel = MediaPagerViewController.pageMaxPixel(forScreenSize: UIScreen.main.bounds.size,
-                                                             scale: UIScreen.main.scale)
+        // load completes synchronously and the test needs no timing. The pager
+        // sizes pages from its scene, not `UIScreen.main` (which on iPhone Duo is
+        // always the outer panel); out of a window that is the current scene.
+        let maxPixel = MediaPagerViewController.pageMaxPixel(forScreenSize: SceneGeometry.currentBounds.size,
+                                                             scale: SceneGeometry.scale())
         XCTAssertEqual(load(uri, maxPixel: maxPixel, animated: true)?.images?.count, 3)
 
         let pager = MediaPagerViewController(imageURLs: [uri], startIndex: 0)

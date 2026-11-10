@@ -194,8 +194,10 @@ class RuleImportPreviewViewController: UITableViewController {
         label.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(label)
 
+        // Safe area, not the header's edges: the table insets cell content but not
+        // a plain header view, and iPhone Duo's vertical bar takes 84 pt of one side.
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
+            label.leadingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             label.centerYAnchor.constraint(equalTo: header.centerYAnchor),
         ])
         header.forceLTR()

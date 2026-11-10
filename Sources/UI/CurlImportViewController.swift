@@ -133,10 +133,12 @@ final class CurlImportViewController: UIViewController {
 
         buttonsBottomConstraint = buttons.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12)
 
+        // Safe area, not the view's edges: iPhone Duo's vertical bar takes 84 pt
+        // of one side.
         NSLayoutConstraint.activate([
             summaryCard.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            summaryCard.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            summaryCard.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            summaryCard.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            summaryCard.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
 
             summaryLabel.topAnchor.constraint(equalTo: summaryCard.topAnchor, constant: 10),
             summaryLabel.leadingAnchor.constraint(equalTo: summaryCard.leadingAnchor, constant: 12),
@@ -144,8 +146,8 @@ final class CurlImportViewController: UIViewController {
             summaryLabel.bottomAnchor.constraint(equalTo: summaryCard.bottomAnchor, constant: -10),
 
             editorCard.topAnchor.constraint(equalTo: summaryCard.bottomAnchor, constant: 12),
-            editorCard.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            editorCard.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            editorCard.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            editorCard.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             editorCard.bottomAnchor.constraint(equalTo: buttons.topAnchor, constant: -12),
 
             textView.topAnchor.constraint(equalTo: editorCard.topAnchor),
@@ -157,8 +159,8 @@ final class CurlImportViewController: UIViewController {
             placeholderLabel.leadingAnchor.constraint(equalTo: textView.leadingAnchor, constant: 13),
             placeholderLabel.trailingAnchor.constraint(equalTo: textView.trailingAnchor, constant: -13),
 
-            buttons.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            buttons.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            buttons.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            buttons.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             buttons.heightAnchor.constraint(equalToConstant: 48),
             buttonsBottomConstraint,
         ])

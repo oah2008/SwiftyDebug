@@ -188,27 +188,19 @@ class Settings: NSObject {
 
     private func updateBubblePresentation() {
         let presenter = DebugWindowPresenter.shared
-        let bubble = presenter.vc.bubble
-        // The SDK WINDOW's width, not the screen's. On iPad Split View / Slide
-        // Over the two differ, and hiding then showing the bubble parked it at a
-        // screen-derived x outside the window, where nothing could tap it.
-        let hostWidth = presenter.window.bounds.width > 0
-            ? presenter.window.bounds.width
-            : UIScreen.main.bounds.size.width
-        let screenWidth = hostWidth
-        let bubbleWidth = bubble.frame.size.width
-        let isOnRightSide = bubble.frame.origin.x > screenWidth / 2
-        let visibleOffset = bubbleWidth / 8 * 8.25
-
         if bubbleVisible {
-            bubble.frame.origin.x = isOnRightSide
-                ? screenWidth - visibleOffset
-                : -bubbleWidth + visibleOffset
             presenter.enable()
+            // Back on its edge for the window's size and safe area NOW. The
+            // device may have folded, unfolded or rotated while the bubble was
+            // hidden, and the dock it keeps (side + height) is what carries over —
+            // not a coordinate from the size the window had when it was hidden.
+            // The x used to be computed here from the window's width alone, which
+            // ignored the safe area and parked the bubble under iPhone Duo's
+            // vertical status bar whenever it was shown on that side.
+            presenter.vc.redockBubble()
         } else {
-            bubble.frame.origin.x = isOnRightSide
-                ? screenWidth
-                : -bubbleWidth
+            // The window is hidden, so where the bubble sits no longer matters;
+            // its dock is kept for when it is shown again.
             presenter.disable()
         }
     }

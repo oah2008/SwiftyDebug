@@ -825,9 +825,11 @@ class AppInfoViewController: UITableViewController {
         label.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(label)
 
+        // Safe area, not the header's edges: a section header spans the table's
+        // full width, and iPhone Duo's vertical bar takes 84 pt of one side.
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
-            label.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16),
+            label.leadingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            label.trailingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             label.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -4),
         ])
 

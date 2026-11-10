@@ -23,6 +23,7 @@ import ImageIO
 
         var images = [UIImage]()
         var duration: TimeInterval = 0.0
+        let scale = SceneGeometry.scale()
 
         for i in 0..<count {
             guard let cgImage = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
@@ -30,7 +31,7 @@ import ImageIO
             let frameDuration = UIImage.ssz_frameDurationAtIndex(i, source: source)
             duration += Double(frameDuration)
 
-            images.append(UIImage(cgImage: cgImage, scale: UIScreen.main.scale, orientation: .up))
+            images.append(UIImage(cgImage: cgImage, scale: scale, orientation: .up))
         }
 
         if duration == 0 {
@@ -43,7 +44,7 @@ import ImageIO
     /// Obtain the GIF image object according to the name of the local GIF image
     @objc static func imageWithGIFNamed(_ name: String?) -> UIImage? {
         guard let name = name else { return nil }
-        let scale = Int(UIScreen.main.scale)
+        let scale = Int(SceneGeometry.scale())
         return gifName(name, scale: scale)
     }
 

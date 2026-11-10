@@ -942,8 +942,10 @@ final class RequestReplayViewController: UITableViewController {
         l.textColor = DebugTheme.accentColor
         l.translatesAutoresizingMaskIntoConstraints = false
         v.addSubview(l)
+        // Against the header's safe area: the table keeps its cells clear of
+        // iPhone Duo's 84 pt vertical bar, but not a custom header's content.
         NSLayoutConstraint.activate([
-            l.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 18),
+            l.leadingAnchor.constraint(equalTo: v.safeAreaLayoutGuide.leadingAnchor, constant: 18),
             l.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -6),
         ])
         v.forceLTR()

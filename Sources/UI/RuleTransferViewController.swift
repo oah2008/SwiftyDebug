@@ -266,8 +266,10 @@ class RuleTransferViewController: UITableViewController {
         label.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(label)
 
+        // Safe area, not the header's edges: the table insets cell content but not
+        // a plain header view, and iPhone Duo's vertical bar takes 84 pt of one side.
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
+            label.leadingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             label.centerYAnchor.constraint(equalTo: header.centerYAnchor),
         ])
 
@@ -280,7 +282,7 @@ class RuleTransferViewController: UITableViewController {
             button.addTarget(self, action: #selector(toggleSelectAll), for: .touchUpInside)
             header.addSubview(button)
             NSLayoutConstraint.activate([
-                button.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16),
+                button.trailingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.trailingAnchor, constant: -16),
                 button.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             ])
         }
@@ -387,14 +389,17 @@ private class RulePasteViewController: UIViewController {
         hint.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(hint)
 
+        // Safe area, not the view's edges: iPhone Duo's vertical bar takes 84 pt of
+        // one side, and a text view does not inset its text for it on its own.
+        let safe = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
-            hint.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
-            hint.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            hint.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            hint.topAnchor.constraint(equalTo: safe.topAnchor, constant: 10),
+            hint.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 16),
+            hint.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -16),
 
             textView.topAnchor.constraint(equalTo: hint.bottomAnchor, constant: 10),
-            textView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            textView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            textView.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 12),
+            textView.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -12),
             textView.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor, constant: -12),
         ])
 

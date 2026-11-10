@@ -249,8 +249,10 @@ final class StorageValueEditorViewController: UIViewController, UITextViewDelega
             scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             stack.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 14),
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+            // The scroller stays full-bleed; its content keeps to the root view's
+            // safe area, since iPhone Duo's vertical bar takes 84 pt of one side.
+            stack.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -14),
             stack.bottomAnchor.constraint(equalTo: scroll.bottomAnchor, constant: -40),
         ])
     }

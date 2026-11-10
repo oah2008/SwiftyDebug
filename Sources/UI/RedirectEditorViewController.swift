@@ -86,8 +86,10 @@ final class RedirectEditorViewController: UIViewController, UITextViewDelegate {
             scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             stack.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 16),
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+            // Safe area, not the view's edges: iPhone Duo's vertical bar takes 84 pt
+            // of one side. The scroller stays full width; only its content moves in.
+            stack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -14),
             stack.bottomAnchor.constraint(equalTo: scroll.bottomAnchor, constant: -32),
         ])
 

@@ -171,12 +171,13 @@ final class NetworkTimelineViewController: UIViewController {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
 
-        grid.frame = CGRect(x: NetworkTimelineRowCell.trackOriginX,
+        let safeFrame = view.bounds.inset(by: view.safeAreaInsets)
+        grid.frame = CGRect(x: safeFrame.minX + NetworkTimelineRowCell.trackOriginX,
                             y: tableView.frame.minY,
-                            width: NetworkTimelineRowCell.trackWidth(forWidth: view.bounds.width),
+                            width: NetworkTimelineRowCell.trackWidth(forWidth: safeFrame.width),
                             height: tableView.frame.height)
 
-        let newTrackWidth = NetworkTimelineRowCell.trackWidth(forWidth: view.bounds.width)
+        let newTrackWidth = NetworkTimelineRowCell.trackWidth(forWidth: safeFrame.width)
         if abs(newTrackWidth - axis.trackWidth) > 0.5 {
             axis.trackWidth = newTrackWidth
             xOffset = clampedOffset(xOffset)
@@ -207,12 +208,12 @@ final class NetworkTimelineViewController: UIViewController {
         view.addSubview(summaryLabel)
 
         NSLayoutConstraint.activate([
-            chipsStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            chipsStack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             chipsStack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 6),
             chipsStack.heightAnchor.constraint(equalToConstant: Self.chipRowHeight - 6),
 
             summaryLabel.leadingAnchor.constraint(greaterThanOrEqualTo: chipsStack.trailingAnchor, constant: 8),
-            summaryLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            summaryLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             summaryLabel.centerYAnchor.constraint(equalTo: chipsStack.centerYAnchor),
         ])
         updateChips()
@@ -262,13 +263,13 @@ final class NetworkTimelineViewController: UIViewController {
         view.addSubview(zoomHint)
 
         NSLayoutConstraint.activate([
-            zoomControl.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            zoomControl.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             zoomControl.topAnchor.constraint(equalTo: chipsStack.bottomAnchor, constant: 8),
             zoomControl.heightAnchor.constraint(equalToConstant: Self.zoomRowHeight),
             zoomControl.widthAnchor.constraint(equalToConstant: 180),
 
             zoomHint.leadingAnchor.constraint(greaterThanOrEqualTo: zoomControl.trailingAnchor, constant: 8),
-            zoomHint.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            zoomHint.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             zoomHint.centerYAnchor.constraint(equalTo: zoomControl.centerYAnchor),
         ])
     }
@@ -290,12 +291,12 @@ final class NetworkTimelineViewController: UIViewController {
         rulerCaption.isHidden = true
 
         NSLayoutConstraint.activate([
-            rulerCaption.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 22),
+            rulerCaption.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 22),
             rulerCaption.bottomAnchor.constraint(equalTo: ruler.bottomAnchor, constant: -5),
 
-            ruler.leadingAnchor.constraint(equalTo: view.leadingAnchor,
+            ruler.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor,
                                            constant: NetworkTimelineRowCell.trackOriginX),
-            ruler.trailingAnchor.constraint(equalTo: view.trailingAnchor,
+            ruler.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor,
                                             constant: -NetworkTimelineRowCell.trackTrailingInset),
             ruler.topAnchor.constraint(equalTo: zoomControl.bottomAnchor, constant: 8),
             ruler.heightAnchor.constraint(equalToConstant: Self.rulerHeight),
@@ -312,9 +313,11 @@ final class NetworkTimelineViewController: UIViewController {
         tableView.rowHeight = NetworkTimelineRowCell.rowHeight
         tableView.estimatedRowHeight = NetworkTimelineRowCell.rowHeight
         tableView.contentInset.bottom = 24
-        // Cells must span the full width or the bars would drift out of
-        // alignment with the ruler on notched devices in landscape.
-        tableView.insetsContentViewsToSafeArea = false
+        // Cells' content views stay inset to the safe area (the default, set
+        // explicitly because the waterfall depends on it): the ruler, the grid and
+        // the pinch anchor use the same safe area, so the bars stay aligned with
+        // the ticks and clear of a notch or iPhone Duo's 84 pt vertical bar.
+        tableView.insetsContentViewsToSafeArea = true
         tableView.showsHorizontalScrollIndicator = false
         tableView.register(NetworkTimelineRowCell.self, forCellReuseIdentifier: NetworkTimelineRowCell.reuseID)
         tableView.translatesAutoresizingMaskIntoConstraints = false
@@ -360,10 +363,10 @@ final class NetworkTimelineViewController: UIViewController {
         view.addSubview(emptyStack)
 
         NSLayoutConstraint.activate([
-            emptyStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            emptyStack.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             emptyStack.centerYAnchor.constraint(equalTo: tableView.centerYAnchor, constant: -30),
-            emptyStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 36),
-            emptyStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -36),
+            emptyStack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 36),
+            emptyStack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -36),
         ])
     }
 
@@ -479,7 +482,7 @@ final class NetworkTimelineViewController: UIViewController {
         guard !allRows.isEmpty, start.isFinite, end.isFinite else {
             axis.sessionStart = 0
             axis.span = 1
-            axis.trackWidth = NetworkTimelineRowCell.trackWidth(forWidth: view.bounds.width)
+            axis.trackWidth = NetworkTimelineRowCell.trackWidth(forWidth: view.bounds.inset(by: view.safeAreaInsets).width)
             xOffset = 0
             return
         }
@@ -491,7 +494,7 @@ final class NetworkTimelineViewController: UIViewController {
 
         axis.sessionStart = start
         axis.span = span
-        axis.trackWidth = NetworkTimelineRowCell.trackWidth(forWidth: view.bounds.width)
+        axis.trackWidth = NetworkTimelineRowCell.trackWidth(forWidth: view.bounds.inset(by: view.safeAreaInsets).width)
         xOffset = clampedOffset(xOffset)
     }
 
@@ -654,7 +657,7 @@ final class NetworkTimelineViewController: UIViewController {
             stopDeceleration()
             pinchStartZoom = axis.zoom
         case .changed:
-            let anchor = gesture.location(in: view).x - NetworkTimelineRowCell.trackOriginX
+            let anchor = gesture.location(in: view).x - view.safeAreaInsets.left - NetworkTimelineRowCell.trackOriginX
             setZoom(pinchStartZoom * gesture.scale, anchorX: anchor)
         default:
             break
@@ -878,12 +881,15 @@ private final class NetworkTimelineDetailSheetViewController: UITableViewControl
         preview.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(preview)
 
+        // A table header view spans the table's full width; its safe area keeps
+        // the caption and preview clear of iPhone Duo's vertical bar.
+        let guide = header.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
-            caption.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 22),
+            caption.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 22),
             caption.topAnchor.constraint(equalTo: header.topAnchor, constant: 14),
 
-            preview.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 22),
-            preview.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -22),
+            preview.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 22),
+            preview.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -22),
             preview.topAnchor.constraint(equalTo: caption.bottomAnchor, constant: 8),
             preview.heightAnchor.constraint(equalToConstant: 12),
             preview.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -10),

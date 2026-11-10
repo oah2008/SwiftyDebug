@@ -264,8 +264,10 @@ class MockProfileListViewController: UITableViewController {
         label.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(label)
 
+        // Against the header's safe area: the table keeps its cells clear of
+        // iPhone Duo's 84 pt vertical bar, but not a custom header's content.
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
+            label.leadingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             label.centerYAnchor.constraint(equalTo: header.centerYAnchor),
         ])
         return header

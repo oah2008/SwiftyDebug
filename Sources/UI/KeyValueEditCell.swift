@@ -35,7 +35,7 @@ class KeyValueEditCell: UITableViewCell {
     var currentKeyText: (() -> String)?
 
     // Autocomplete accessory bar (shared; shows suggestions for the focused field)
-    private var suggestionBar: UIScrollView?
+    private var suggestionBar: UIView?
     private var suggestionStack: UIStackView?
     /// Which field the accessory bar is currently serving.
     private enum ActiveField { case key, value }
@@ -219,26 +219,38 @@ class KeyValueEditCell: UITableViewCell {
         guard keySuggestionsProvider != nil || valueSuggestionsProvider != nil else { return }
 
         if suggestionBar == nil {
-            let bar = UIScrollView()
+            // The bar spans the keyboard; its chips scroll inside the bar's SAFE
+            // area, because on iPhone Duo 84 pt of one side is the vertical bar.
+            let bar = UIView()
             bar.backgroundColor = UIColor(white: 0.14, alpha: 1)
-            bar.showsHorizontalScrollIndicator = false
-            bar.frame = CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 44)
+            bar.frame = CGRect(x: 0, y: 0, width: SceneGeometry.bounds(for: self).width, height: 44)
             bar.autoresizingMask = [.flexibleWidth]
+
+            let scroll = UIScrollView()
+            scroll.showsHorizontalScrollIndicator = false
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            bar.addSubview(scroll)
 
             let stack = UIStackView()
             stack.axis = .horizontal
             stack.spacing = 6
             stack.alignment = .center
             stack.translatesAutoresizingMaskIntoConstraints = false
-            bar.addSubview(stack)
+            scroll.addSubview(stack)
             NSLayoutConstraint.activate([
-                stack.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 10),
-                stack.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -10),
-                stack.topAnchor.constraint(equalTo: bar.topAnchor, constant: 6),
-                stack.bottomAnchor.constraint(equalTo: bar.bottomAnchor, constant: -6),
+                scroll.leadingAnchor.constraint(equalTo: bar.safeAreaLayoutGuide.leadingAnchor),
+                scroll.trailingAnchor.constraint(equalTo: bar.safeAreaLayoutGuide.trailingAnchor),
+                scroll.topAnchor.constraint(equalTo: bar.topAnchor),
+                scroll.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
+
+                stack.leadingAnchor.constraint(equalTo: scroll.leadingAnchor, constant: 10),
+                stack.trailingAnchor.constraint(equalTo: scroll.trailingAnchor, constant: -10),
+                stack.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 6),
+                stack.bottomAnchor.constraint(equalTo: scroll.bottomAnchor, constant: -6),
                 stack.heightAnchor.constraint(equalToConstant: 32),
             ])
             bar.semanticContentAttribute = .forceLeftToRight
+            scroll.semanticContentAttribute = .forceLeftToRight
             stack.semanticContentAttribute = .forceLeftToRight
             suggestionBar = bar
             suggestionStack = stack

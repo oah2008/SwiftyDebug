@@ -964,11 +964,14 @@ final class ResponseRewriteEditorViewController: UITableViewController {
         hint.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(hint)
 
+        // Safe area, not the header's edges: the table insets cell content but not
+        // a plain header view, and iPhone Duo's vertical bar takes 84 pt of one side.
+        let safe = header.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+            label.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 18),
             label.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -6),
             hint.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 8),
-            hint.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+            hint.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -18),
             hint.centerYAnchor.constraint(equalTo: label.centerYAnchor),
         ])
         header.forceLTR()

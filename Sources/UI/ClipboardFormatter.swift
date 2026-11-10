@@ -177,11 +177,13 @@ private final class FormattingOverlayView: UIView {
         stack.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(stack)
 
+        // Safe area, not the overlay's edges: a long message widens the card to
+        // these limits, and on iPhone Duo one side is the 84 pt vertical bar.
         NSLayoutConstraint.activate([
-            card.centerXAnchor.constraint(equalTo: centerXAnchor),
+            card.centerXAnchor.constraint(equalTo: safeAreaLayoutGuide.centerXAnchor),
             card.centerYAnchor.constraint(equalTo: centerYAnchor),
-            card.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 40),
-            card.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -40),
+            card.leadingAnchor.constraint(greaterThanOrEqualTo: safeAreaLayoutGuide.leadingAnchor, constant: 40),
+            card.trailingAnchor.constraint(lessThanOrEqualTo: safeAreaLayoutGuide.trailingAnchor, constant: -40),
 
             stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 24),
             stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -24),

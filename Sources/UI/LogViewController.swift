@@ -396,11 +396,13 @@ class LogViewController: UIViewController {
         separator.backgroundColor = UIColor(white: 0.2, alpha: 1)
         matchBar.addSubview(separator)
 
+        // The bar's fill and hairline span the screen; its label and buttons sit
+        // in the bar's safe area — iPhone Duo's vertical bar takes 84 pt of one side.
         NSLayoutConstraint.activate([
-            matchLabel.leadingAnchor.constraint(equalTo: matchBar.leadingAnchor, constant: 12),
+            matchLabel.leadingAnchor.constraint(equalTo: matchBar.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             matchLabel.centerYAnchor.constraint(equalTo: matchBar.centerYAnchor),
 
-            matchDownButton.trailingAnchor.constraint(equalTo: matchBar.trailingAnchor, constant: -8),
+            matchDownButton.trailingAnchor.constraint(equalTo: matchBar.safeAreaLayoutGuide.trailingAnchor, constant: -8),
             matchDownButton.centerYAnchor.constraint(equalTo: matchBar.centerYAnchor),
             matchDownButton.widthAnchor.constraint(equalToConstant: 36),
             matchDownButton.heightAnchor.constraint(equalToConstant: 36),
@@ -497,8 +499,8 @@ class LogViewController: UIViewController {
 
             // Glass header: floats at top
             glass.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4),
-            glass.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            glass.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            glass.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            glass.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
 
             // Segment inside glass
             segmentControl.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
@@ -520,12 +522,12 @@ class LogViewController: UIViewController {
             matchBar.heightAnchor.constraint(equalToConstant: 36),
 
             // Follow buttons
-            followButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            followButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             followButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
             followButton.widthAnchor.constraint(equalToConstant: btnSize),
             followButton.heightAnchor.constraint(equalToConstant: btnSize),
 
-            defaultFollowButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            defaultFollowButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             defaultFollowButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
             defaultFollowButton.widthAnchor.constraint(equalToConstant: btnSize),
             defaultFollowButton.heightAnchor.constraint(equalToConstant: btnSize),
@@ -550,13 +552,13 @@ class LogViewController: UIViewController {
         let btnSize = Self.followButtonSize
         NSLayoutConstraint.activate([
             segmentControl.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-            segmentControl.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            segmentControl.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            segmentControl.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            segmentControl.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             segmentControl.heightAnchor.constraint(equalToConstant: 32),
 
             defaultSearchBar.topAnchor.constraint(equalTo: segmentControl.bottomAnchor, constant: 8),
-            defaultSearchBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
-            defaultSearchBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+            defaultSearchBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 4),
+            defaultSearchBar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -4),
             defaultSearchBar.heightAnchor.constraint(equalToConstant: 48),
 
             // Match bar between search bar and console table
@@ -576,13 +578,13 @@ class LogViewController: UIViewController {
             defaultTableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             // Follow button (console): bottom-right, above safe area
-            followButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            followButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             followButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
             followButton.widthAnchor.constraint(equalToConstant: btnSize),
             followButton.heightAnchor.constraint(equalToConstant: btnSize),
 
             // Follow button (default table): same position
-            defaultFollowButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            defaultFollowButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             defaultFollowButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
             defaultFollowButton.widthAnchor.constraint(equalToConstant: btnSize),
             defaultFollowButton.heightAnchor.constraint(equalToConstant: btnSize),
@@ -1247,13 +1249,14 @@ class LogViewController: UIViewController {
         btn.sizeToFit()
 
         // Position above the first visible selected cell
+        let midX = view.bounds.inset(by: view.safeAreaInsets).midX
         if let firstIP = consoleTableView.indexPathsForVisibleRows?.first(where: { range.contains($0.row) }),
            let cell = consoleTableView.cellForRow(at: firstIP) {
             let cellFrame = consoleTableView.convert(cell.frame, to: view)
             let y = max(view.safeAreaInsets.top + 20, cellFrame.minY - 24)
-            btn.center = CGPoint(x: view.bounds.midX, y: y)
+            btn.center = CGPoint(x: midX, y: y)
         } else {
-            btn.center = CGPoint(x: view.bounds.midX, y: view.safeAreaInsets.top + 60)
+            btn.center = CGPoint(x: midX, y: view.safeAreaInsets.top + 60)
         }
 
         view.addSubview(btn)

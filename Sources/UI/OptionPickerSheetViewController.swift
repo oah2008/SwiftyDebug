@@ -38,6 +38,11 @@ final class OptionPickerSheetViewController: UITableViewController {
     private let options: [Option]
     /// Index of the currently-selected option, if any (gets a checkmark).
     private let selectedIndex: Int?
+    /// The message shown as the table header, when there is one.
+    private var messageLabel: UILabel?
+    /// The width `messageLabel` was last measured at, so the header is only
+    /// re-measured when the space its text wraps in actually changes.
+    private var measuredMessageWidth: CGFloat = 0
 
     init(title: String, message: String? = nil, options: [Option], selectedIndex: Int? = nil) {
         self.sheetTitle = title
@@ -93,8 +98,8 @@ final class OptionPickerSheetViewController: UITableViewController {
             l.translatesAutoresizingMaskIntoConstraints = false
             header.addSubview(l)
             NSLayoutConstraint.activate([
-                l.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 20),
-                l.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -20),
+                l.leadingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+                l.trailingAnchor.constraint(equalTo: header.safeAreaLayoutGuide.trailingAnchor, constant: -20),
                 l.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
                 l.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -8),
             ])
@@ -105,8 +110,28 @@ final class OptionPickerSheetViewController: UITableViewController {
                 withHorizontalFittingPriority: .required, verticalFittingPriority: .fittingSizeLevel).height
             header.frame.size.height = h
             tableView.tableHeaderView = header
+            messageLabel = l
         }
         view.forceLTR()
+    }
+
+    /// Re-measures the message header once the sheet's real width and safe area
+    /// are known. The text wraps inside the safe area — iPhone Duo's vertical
+    /// bar takes 84 pt of one side — and `viewDidLoad` measured before either
+    /// existed, so a header sized only there could cut off its last line.
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        guard let header = tableView.tableHeaderView, let label = messageLabel else { return }
+        // The label's width under its constraints: the safe area less 20 pt a side.
+        let width = tableView.bounds.inset(by: tableView.safeAreaInsets).width - 40
+        guard width > 0, width != measuredMessageWidth else { return }
+        measuredMessageWidth = width
+        let textHeight = label.sizeThatFits(
+            CGSize(width: width, height: .greatestFiniteMagnitude)).height
+        let height = textHeight + 12 + 8 // the label's top and bottom padding
+        guard header.frame.height != height else { return }
+        header.frame.size.height = height
+        tableView.tableHeaderView = header
     }
 
     @objc private func cancelTapped() { dismiss(animated: true) }

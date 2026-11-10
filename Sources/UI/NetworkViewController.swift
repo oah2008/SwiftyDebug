@@ -900,8 +900,8 @@ class NetworkViewController: UIViewController {
             created.onCancel = { [weak self] in self?.cancelActiveScan() }
             view.addSubview(created)
             NSLayoutConstraint.activate([
-                created.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-                created.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+                created.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+                created.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
                 created.bottomAnchor.constraint(
                     equalTo: view.safeAreaLayoutGuide.bottomAnchor,
                     constant: -(Self.followButtonSize + 20)
@@ -1425,10 +1425,12 @@ class NetworkViewController: UIViewController {
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-            // Glass header: floats at top
+            // Glass header: floats at top, inside the safe area rather than the
+            // view's edges — iPhone Duo's vertical bar takes 84 pt of one side.
+            // (The table stays full width: it insets its cells by the safe area.)
             glass.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4),
-            glass.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            glass.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            glass.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            glass.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
 
             // Segment inside glass
             segmentControl.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
@@ -1443,7 +1445,7 @@ class NetworkViewController: UIViewController {
             searchRow.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
 
             // Follow button
-            followButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            followButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             followButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
             followButton.widthAnchor.constraint(equalToConstant: btnSize),
             followButton.heightAnchor.constraint(equalToConstant: btnSize),
@@ -1464,14 +1466,14 @@ class NetworkViewController: UIViewController {
         NSLayoutConstraint.activate([
             // Segment control
             segmentControl.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-            segmentControl.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            segmentControl.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            segmentControl.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            segmentControl.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             segmentControl.heightAnchor.constraint(equalToConstant: 32),
 
             // Search row (height comes from the field + control row)
             searchRow.topAnchor.constraint(equalTo: segmentControl.bottomAnchor, constant: 8),
-            searchRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
-            searchRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+            searchRow.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 4),
+            searchRow.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -4),
 
             // Table view
             tableView.topAnchor.constraint(equalTo: searchRow.bottomAnchor, constant: 4),
@@ -1480,7 +1482,7 @@ class NetworkViewController: UIViewController {
             tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             // Follow button
-            followButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            followButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             followButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
             followButton.widthAnchor.constraint(equalToConstant: btnSize),
             followButton.heightAnchor.constraint(equalToConstant: btnSize),

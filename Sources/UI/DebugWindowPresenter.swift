@@ -15,9 +15,12 @@ public class DebugWindowPresenter: NSObject {
     lazy var vc = SwiftyDebugViewController() //must lazy init, otherwise crash
 
     private override init() {
-        window = SwiftyDebugWindow(frame: UIScreen.main.bounds)
-        // This is for making the window not to effect the StatusBarStyle
-        window.bounds.size.height = UIScreen.main.bounds.height.nextDown
+        // No size yet, on purpose. The window takes its size from the scene it is
+        // attached to (`SwiftyDebugWindow.fitToScene()`), and there is no scene
+        // when the host calls `enable()` from `didFinishLaunching`. Sizing it from
+        // `UIScreen.main` here is what made it the OUTER display's size on iPhone
+        // Duo for the whole session, wherever the app was actually running.
+        window = SwiftyDebugWindow(frame: .zero)
         super.init()
     }
 
@@ -30,12 +33,18 @@ public class DebugWindowPresenter: NSObject {
         // `bubbleVisible = true` — a silent no-op, with the debug UI unreachable
         // until the app was relaunched. Re-entry has to be able to re-attach.
         if window.rootViewController == vc, window.windowScene != nil {
+            // Already attached: just make sure it still fits its scene.
+            window.fitToScene()
             return
         }
 
         window.rootViewController = vc
         window.delegate = self
         window.isHidden = false
+        // Covers a window UIKit has already attached to a scene by itself (apps
+        // without a scene manifest), where the scene search below can come back
+        // empty. Otherwise a no-op until the scene is assigned.
+        window.fitToScene()
 
         var success: Bool = false
 

@@ -86,10 +86,15 @@ final class BreakpointOverlay {
             b.onTap = { [weak self] in self?.openInbox() }
             b.translatesAutoresizingMaskIntoConstraints = false
             host.view.addSubview(b)
+            // All three edges against the SAFE area. On iPhone Duo the status
+            // bar runs down the side of the screen as part of an 84 pt vertical
+            // bar — left or right depending on how the device is held — so a
+            // banner pinned to the raw leading/trailing edges ran underneath it.
+            let safe = host.view.safeAreaLayoutGuide
             NSLayoutConstraint.activate([
-                b.leadingAnchor.constraint(equalTo: host.view.leadingAnchor, constant: 12),
-                b.trailingAnchor.constraint(equalTo: host.view.trailingAnchor, constant: -12),
-                b.topAnchor.constraint(equalTo: host.view.safeAreaLayoutGuide.topAnchor, constant: 8),
+                b.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 12),
+                b.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -12),
+                b.topAnchor.constraint(equalTo: safe.topAnchor, constant: 8),
             ])
             w.passthroughExcept = b
             window = w
@@ -165,6 +170,10 @@ final class BreakpointOverlay {
             }
             return
         }
+
+        // Presented full-screen inside the overlay window, so it opens at the
+        // window's size: make sure that is the scene's size right now.
+        presenter.window.fitToScene()
 
         let tabs = SwiftyDebugTabBarController()
         tabs.modalPresentationStyle = .fullScreen

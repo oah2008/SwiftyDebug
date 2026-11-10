@@ -122,7 +122,7 @@ final class FileContentViewerViewController: UIViewController {
         spinner.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(spinner)
         NSLayoutConstraint.activate([
-            spinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            spinner.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             spinner.centerYAnchor.constraint(equalTo: view.centerYAnchor),
         ])
         spinner.startAnimating()
@@ -222,8 +222,11 @@ final class FileContentViewerViewController: UIViewController {
         imageScrollView.addSubview(imageView)
 
         NSLayoutConstraint.activate([
-            textView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            textView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            // Safe area, as the header card is: a text view that only scrolls
+            // vertically gets no sideways inset of its own, so on iPhone Duo its
+            // text ran under the 84 pt vertical bar.
+            textView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            textView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
             textView.topAnchor.constraint(equalTo: headerCard.bottomAnchor, constant: 8),
             textView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
@@ -254,7 +257,7 @@ final class FileContentViewerViewController: UIViewController {
         toast.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(toast)
         NSLayoutConstraint.activate([
-            toast.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            toast.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             toast.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -28),
             toast.widthAnchor.constraint(equalToConstant: 120),
             toast.heightAnchor.constraint(equalToConstant: 34),
@@ -313,7 +316,8 @@ final class FileContentViewerViewController: UIViewController {
     /// session can't serve `file://` URLs, so we fall back to a local decode of
     /// the same bytes when it returns nothing.
     private func loadImage() {
-        let maxPixel = max(UIScreen.main.bounds.width, UIScreen.main.bounds.height) * UIScreen.main.scale
+        let sceneBounds = SceneGeometry.bounds(for: view)
+        let maxPixel = max(sceneBounds.width, sceneBounds.height) * SceneGeometry.scale(for: view)
         let key = fileURL.absoluteString
         if let cached = ImageLoader.shared.cachedImage(for: key, maxPixel: maxPixel) {
             imageView.image = cached

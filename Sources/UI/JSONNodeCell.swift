@@ -258,7 +258,7 @@ final class JSONNodeCell: UITableViewCell {
     /// Keyboard bar: the second, unmissable route to the full-page editor, plus
     /// a Done that commits (Return types a newline — this is a multi-line field).
     private func makeAccessoryBar() -> UIToolbar {
-        let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 44))
+        let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: SceneGeometry.currentBounds.width, height: 44))
         bar.autoresizingMask = [.flexibleWidth]
         bar.barStyle = .black
         bar.isTranslucent = false

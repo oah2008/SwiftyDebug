@@ -126,9 +126,11 @@ final class NetworkMediaGridCell: UITableViewCell {
         showAllButton.isHidden = total <= Self.previewCount
 
         let shown = Array(imageURLs.prefix(Self.previewCount))
-        // Estimate tile size for downsampling (screen width / 3, in pixels).
-        let approxTile = (UIScreen.main.bounds.width - 24 - CGFloat(Self.columns - 1) * Self.tileSpacing) / CGFloat(Self.columns)
-        let maxPixel = max(120, approxTile * UIScreen.main.scale)
+        // Estimate tile size for downsampling (scene width / 3, in pixels). Not
+        // `UIScreen.main`: on iPhone Duo that is always the outer panel, about
+        // half the inner display's width. The cell is not laid out yet here.
+        let approxTile = (SceneGeometry.bounds(for: self).width - 24 - CGFloat(Self.columns - 1) * Self.tileSpacing) / CGFloat(Self.columns)
+        let maxPixel = max(120, approxTile * SceneGeometry.scale(for: self))
 
         var currentRow: UIStackView?
         for (i, urlString) in shown.enumerated() {

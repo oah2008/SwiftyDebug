@@ -100,13 +100,16 @@ class NetworkFilterSheetController: UIViewController, UITableViewDataSource, UIT
             topBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             topBar.heightAnchor.constraint(equalToConstant: 52),
 
-            leftButton.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 12),
+            // The bar's colour runs edge to edge; what is on it stays in the
+            // safe area — iPhone Duo's vertical bar takes 84 pt of one side, so
+            // the title is centred in what is visible, clear of Apply.
+            leftButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             leftButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
 
-            titleLabel.centerXAnchor.constraint(equalTo: topBar.centerXAnchor),
+            titleLabel.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             titleLabel.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
 
-            applyButton.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -12),
+            applyButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             applyButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
         ])
 

@@ -239,8 +239,8 @@ final class JSONEditorViewController: UIViewController {
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusBar.addSubview(statusLabel)
         NSLayoutConstraint.activate([
-            statusLabel.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 14),
-            statusLabel.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -14),
+            statusLabel.leadingAnchor.constraint(equalTo: statusBar.safeAreaLayoutGuide.leadingAnchor, constant: 14),
+            statusLabel.trailingAnchor.constraint(equalTo: statusBar.safeAreaLayoutGuide.trailingAnchor, constant: -14),
             statusLabel.topAnchor.constraint(equalTo: statusBar.topAnchor, constant: 6),
             statusLabel.bottomAnchor.constraint(equalTo: statusBar.bottomAnchor, constant: -6),
         ])
@@ -287,10 +287,13 @@ final class JSONEditorViewController: UIViewController {
 
     private func layout() {
         let guide = view.safeAreaLayoutGuide
+        // Safe area, not the view's edges: iPhone Duo's vertical bar takes 84 pt
+        // of one side. The status strip, table and toolbar still run edge to edge
+        // and keep their own content inside it.
         NSLayoutConstraint.activate([
             modeControl.topAnchor.constraint(equalTo: guide.topAnchor, constant: 8),
-            modeControl.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            modeControl.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            modeControl.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 12),
+            modeControl.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -12),
             modeControl.heightAnchor.constraint(equalToConstant: 32),
 
             statusBar.topAnchor.constraint(equalTo: modeControl.bottomAnchor, constant: 8),
@@ -303,8 +306,8 @@ final class JSONEditorViewController: UIViewController {
             tableView.bottomAnchor.constraint(equalTo: toolbar.topAnchor),
 
             rawTextView.topAnchor.constraint(equalTo: statusBar.bottomAnchor),
-            rawTextView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            rawTextView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            rawTextView.leadingAnchor.constraint(equalTo: guide.leadingAnchor),
+            rawTextView.trailingAnchor.constraint(equalTo: guide.trailingAnchor),
             rawTextView.bottomAnchor.constraint(equalTo: toolbar.topAnchor),
 
             toolbar.leadingAnchor.constraint(equalTo: view.leadingAnchor),

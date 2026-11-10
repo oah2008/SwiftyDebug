@@ -710,7 +710,10 @@ final class UserDefaultsBrowserViewController: UITableViewController {
         toast.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(toast)
         NSLayoutConstraint.activate([
-            toast.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            // Centred on the safe area, not the view: with iPhone Duo's 84 pt bar
+            // on ONE side, a toast as wide as the safe area allows but centred on
+            // the view ran 26 pt under the bar.
+            toast.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             toast.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -28),
             toast.heightAnchor.constraint(equalToConstant: 38),
             toast.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
@@ -1115,20 +1118,25 @@ final class UserDefaultsBrowserViewController: UITableViewController {
     /// that only happens when the height actually changed (this runs from
     /// `viewDidLayoutSubviews`, and re-assigning unconditionally would loop).
     private func layoutFooter() {
-        let width = max(tableView.bounds.width - 24, 1)
+        let insets = tableView.safeAreaInsets
+        let x = insets.left + 12
+        let width = max(tableView.bounds.width - insets.left - insets.right - 24, 1)
         // `viewDidLayoutSubviews` on a UITableViewController fires on every table
         // layout — including during scroll — so nothing expensive may run
         // unconditionally here. Rebuilding the string and re-measuring it through
         // TextKit every frame was per-frame work where the base did it once per
-        // appearance. Width unchanged means the measurement cannot have changed.
+        // appearance. Width unchanged means the measurement cannot have changed;
+        // the origin is compared too, because iPhone Duo's vertical bar can move
+        // to the other side without changing the width.
         let text = footerText
-        if abs(lastFooterWidth - width) < 0.5, lastFooterText == text { return }
+        if abs(lastFooterWidth - width) < 0.5, abs(footerLabel.frame.minX - x) < 0.5,
+           lastFooterText == text { return }
         lastFooterWidth = width
         lastFooterText = text
         footerLabel.text = text
         let height = ceil(footerLabel.sizeThatFits(CGSize(width: width,
                                                           height: .greatestFiniteMagnitude)).height)
-        footerLabel.frame = CGRect(x: 12, y: 16, width: width, height: height)
+        footerLabel.frame = CGRect(x: x, y: 16, width: width, height: height)
         let newHeight = height + 32
         guard abs(footerContainer.bounds.height - newHeight) > 0.5 else { return }
         footerContainer.frame = CGRect(x: 0, y: 0, width: tableView.bounds.width, height: newHeight)
